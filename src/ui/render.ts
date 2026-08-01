@@ -2,11 +2,61 @@
 import { c, cursor, cutToWidth, width } from "./ansi.js";
 import { PAD_LEFT, contentWidth, fmtDuration, fullWidth, indent, pad } from "./layout.js";
 
+// ── sticky footer ───────────────────────────────────────────────────────────
+
+/**
+ * A block pinned to the bottom of the screen that transcript output scrolls
+ * above: during a turn it holds the spinner, the input frame and the status
+ * rows, so the prompt never disappears while the model works. Every write goes
+ * through out()/line(), which erase it first and redraw it afterwards.
+ */
+type FooterFn = () => string[];
+let footerFn: FooterFn | null = null;
+let footerRows = 0;
+
+function eraseFooter(): void {
+  if (!footerRows) return;
+  cursor.toColumn(1);
+  cursor.up(footerRows - 1);
+  cursor.clearDown();
+  footerRows = 0;
+}
+
+function drawFooter(): void {
+  if (!footerFn || !process.stdout.isTTY) return;
+  const lines = footerFn();
+  if (!lines.length) return;
+  process.stdout.write(lines.join("\n"));
+  footerRows = lines.length;
+}
+
+/** Installs (or with null removes) the bottom bar. */
+export function setFooter(fn: FooterFn | null): void {
+  if (footerRows) eraseFooter();
+  footerFn = fn;
+  if (fn) drawFooter();
+}
+
+/** Redraws the bar in place — for the spinner tick and status updates. */
+export function refreshFooter(): void {
+  if (!footerFn) return;
+  eraseFooter();
+  drawFooter();
+}
+
 export function out(s = ""): void {
+  if (!footerFn) {
+    process.stdout.write(s);
+    return;
+  }
+  eraseFooter();
   process.stdout.write(s);
+  // A partial line would put the bar on the same row as the text; leave it to
+  // the write that finishes the line.
+  if (s.endsWith("\n")) drawFooter();
 }
 export function line(s = ""): void {
-  process.stdout.write(s + "\n");
+  out(s + "\n");
 }
 /** Writes a line inside the chat margins. */
 export function padded(s = ""): void {

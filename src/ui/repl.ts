@@ -23,6 +23,7 @@ import {
 import { contentWidth, fmtDuration } from "./layout.js";
 import { composeStatus, type StatusInfo } from "./inputbox.js";
 import { InputEditor, PipeReader, setExtraNewlineKeys } from "./editor.js";
+import { TurnBar } from "./turnbar.js";
 import { pushConsumer } from "./stdin.js";
 import { PermissionBroker } from "./permissions.js";
 import { loadConfig, VERSION, type Config, type Effort } from "../config.js";
@@ -61,6 +62,10 @@ export class App {
   private editor: InputEditor | null = null;
   private pipe: PipeReader | null = null;
   private history: string[] = [];
+  /** Messages queued from the turn bar while the model was working. */
+  private pending: string[] = [];
+  /** The bottom bar of the running turn, so prompts can step around it. */
+  private bar: TurnBar | null = null;
   /** Releases the turn-cancel key listener; null when no turn is running. */
   private turnKeys: (() => void) | null = null;
 
@@ -230,9 +235,15 @@ export class App {
     if (initialPrompt?.trim()) await this.turn(initialPrompt.trim());
 
     while (!this.quitting) {
-      const input = await this.readInput();
-      if (input === null) break;
-      const text = input.trim();
+      // Messages typed while the previous turn was running go first.
+      let text: string;
+      if (this.pending.length) {
+        text = (this.pending.shift() ?? "").trim();
+      } else {
+        const input = await this.readInput();
+        if (input === null) break;
+        text = input.trim();
+      }
       if (!text) continue;
       this.recordInput(text);
 
@@ -261,9 +272,14 @@ export class App {
   async exclusiveInput<T>(fn: () => Promise<T>): Promise<T> {
     const hadTurnKeys = Boolean(this.turnKeys);
     if (hadTurnKeys) this.detachTurnKeys();
+    // A permission prompt draws its own rows; the bar has to get out of the
+    // way or the two fight over the bottom of the screen.
+    const bar = this.bar;
+    bar?.pause();
     try {
       return await fn();
     } finally {
+      bar?.resume();
       if (hadTurnKeys && this.abort && !this.abort.signal.aborted) this.attachTurnKeys();
     }
   }
@@ -289,6 +305,9 @@ export class App {
       return;
     }
     this.quitting = true;
+    // Leaving the bar installed would keep repainting over the farewell.
+    this.bar?.stop();
+    this.bar = null;
     line();
     padded(c.gray("Bye."));
     this.session.save();
@@ -415,10 +434,21 @@ export class App {
     this.session.add({ role: "user", content: text });
 
     this.abort = new AbortController();
-    this.attachTurnKeys();
 
     const started = Date.now();
-    const spinner = new Spinner("thinking");
+    // The bar owns stdin for the duration of the turn: it interrupts on Esc
+    // and keeps the input frame on screen, so no separate key listener.
+    const bar = new TurnBar({
+      status: () => composeStatus({ ...this.status(), hint: "esc to interrupt · enter to queue" }),
+      onInterrupt: () => this.abort?.abort(),
+    });
+    this.bar = bar;
+    const spinner = {
+      setLabel: (l: string) => bar.setLabel(l),
+      setTokens: (i: number, o: number) => bar.setTokens(i, o),
+      start: () => {},
+      stop: () => {},
+    };
     let streaming = false;
     let md: MarkdownStream | null = null;
 
@@ -441,7 +471,7 @@ export class App {
       streaming = false;
     };
 
-    spinner.start();
+    bar.start();
 
     try {
       const result = await runAgent({
@@ -495,17 +525,20 @@ export class App {
         },
       });
 
-      spinner.stop();
       stopStream();
       this.session.save();
       this.statusLine(Date.now() - started, result.steps, result.stoppedBecause);
     } catch (err) {
-      spinner.stop();
       stopStream();
       error((err as Error).message);
       this.session.save();
     } finally {
-      this.detachTurnKeys();
+      // Take the bar down before anything else prints, then pick up whatever
+      // was typed while the model worked.
+      const { queued, draft } = bar.stop();
+      this.bar = null;
+      this.pending.push(...queued);
+      if (draft) this.editor?.prefill(draft);
       this.abort = null;
     }
   }

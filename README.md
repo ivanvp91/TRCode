@@ -122,12 +122,24 @@ Typing `/` opens the command list right under the frame:
        (1/25)  ↑↓ · Enter to pick · Esc to dismiss
 ```
 
-While the model thinks you see elapsed time and tokens — silence without numbers is
-indistinguishable from a hang:
+While the model works, the input frame stays where it is: the spinner sits above it and
+the transcript scrolls above that. A ten-minute run never leaves you looking at a bare
+spinner wondering whether the prompt is coming back.
 
 ```
-   ⠹ reasoning (6m 33s · ↑18k ↓11.4k)  esc to interrupt
+   ⏺ read(src/index.ts)
+     └ 45 of 45 lines
+   ⠹ reasoning (6m 33s · ↑18k ↓11.4k)  esc to interrupt · type to queue a message
+     ⎿ queued: and check the tests too
+   ╭────────────────────────────────────────────────────────────────╮
+   │ ❯                                                              │
+   ╰────────────────────────────────────────────────────────────────╯
+   moonshotai/kimi-k3  thinking: high  ~/proj      context: 3% (23k/1M)
 ```
+
+You can type while the model is busy. **Enter** queues the message and it is sent as soon
+as the current turn finishes; anything left unsent stays in the box for editing. **Esc**
+interrupts the turn and does not clear what you typed.
 
 After a turn, only that turn — nothing already shown under the input is repeated:
 
@@ -441,15 +453,15 @@ npm test
 PASS  protocol-test.mjs      36/36     PASS  repaint-test.mjs    5/5
 PASS  editor-harness.mjs     11/11     PASS  menu-test.mjs
 PASS  paste-test.mjs         9/9       PASS  resume-test.mjs     39/39
-PASS  newline-test.mjs       13/13     PASS  keyscan-test.mjs    6/6
-PASS  history-test.mjs       9/9       PASS  shutdown-test.mjs   8/8
-PASS  focus-test.mjs         8/8
+PASS  newline-test.mjs       13/13     PASS  turnbar-test.mjs    21/21
+PASS  history-test.mjs       9/9       PASS  keyscan-test.mjs    6/6
+PASS  focus-test.mjs         8/8       PASS  shutdown-test.mjs   8/8
 ```
 
 The suites cover the wire protocols and history trimming, plus the terminal behaviour that
 is otherwise painful to verify: paste in four delivery shapes, split escape sequences,
-focus events, frame repainting, multi-line input, prompt history, the resume flow on a
-virtual screen, and the process actually exiting instead of lingering.
+focus events, frame repainting, multi-line input, prompt history, the resume flow and the
+during-turn bar on a virtual screen, and the process actually exiting instead of lingering.
 
 `test/measure-tokens.mjs` measures request sizes at several `maxRequestTokens` thresholds
 and prints the table from the "Token spend" section.
@@ -499,6 +511,7 @@ src/
     picker.ts          list picker with tabs and sections
     choice.ts          button row for confirmations
     prompt.ts          one-line text prompt (rename)
+    turnbar.ts         the bottom bar shown while a turn runs
     keyscan.ts         /keys inspector
 ```
 

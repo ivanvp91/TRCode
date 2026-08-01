@@ -165,7 +165,7 @@ function logKeys(label: string, s: string): void {
 }
 
 /** Strips terminal noise from a pasted chunk while keeping newlines. */
-function cleanPaste(s: string): string {
+export function cleanPaste(s: string): string {
   return s
     .replace(new RegExp(ESC + "\\[[0-9;]*[~A-Za-z]", "g"), "")
     .replace(CONTROL_CHARS, "")
@@ -285,11 +285,23 @@ export class InputEditor {
 
   private abortRead: (() => void) | null = null;
 
+  /**
+   * Seeds the next read(). Used when a turn ends with unsent text still in the
+   * bar — throwing away what the user typed would be worse than anything else
+   * this class does.
+   */
+  prefill(text: string): void {
+    this.pendingPrefill = text;
+  }
+  /** Kept apart from `draft`, which history navigation owns during a read. */
+  private pendingPrefill = "";
+
   /** Resolves with the submitted line, or null on Ctrl+C / Ctrl+D. */
   read(): Promise<string | null> {
     const stdin = process.stdin;
-    this.buf = "";
-    this.pos = 0;
+    this.buf = this.pendingPrefill;
+    this.pendingPrefill = "";
+    this.pos = this.buf.length;
     this.historyIdx = -1;
     this.renderedRows = 0;
     this.cursorRow = 0;
