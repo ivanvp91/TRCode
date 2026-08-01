@@ -60,9 +60,10 @@ function stubFor(m: Message): Message {
 
 /**
  * Shortens tool output outside the recent tail once the request exceeds the
- * budget. The stub replaces the original message *in the stored history*, so
- * each next step starts from the trimmed state instead of re-trimming on every
- * request — the wire prefix stays stable and the cache stays warm.
+ * budget. Only the wire copy is shortened — the stored history keeps the full
+ * output, so /resume, /compact and replayHistory see what actually happened.
+ * The stub is deterministic (same input → same bytes), so the wire prefix
+ * stays stable between steps and a provider-side cache can match on it.
  */
 export function trimForRequest(messages: Message[], opts: TrimOptions): TrimResult {
   const before = sizeOf(messages);
@@ -73,23 +74,24 @@ export function trimForRequest(messages: Message[], opts: TrimOptions): TrimResu
   // Everything before the recent tail is fair game.
   const cutoff = Math.max(0, messages.length - keepRecent);
 
+  const out = messages.slice();
   let current = before;
   let trimmed = 0;
 
   // Oldest first: the further back a tool result is, the less it is needed.
   for (let i = 0; i < cutoff && current > opts.budget; i++) {
-    const m = messages[i];
+    const m = out[i];
     if (m.role !== "tool") continue;
     const body = String(m.content ?? "");
     if (body.length < minBytes) continue;
 
     const stub = stubFor(m);
     current -= estimateTokens(body) - estimateTokens(String(stub.content));
-    messages[i] = stub;
+    out[i] = stub;
     trimmed++;
   }
 
-  return { messages, saved: Math.max(0, before - current), trimmed };
+  return { messages: out, saved: Math.max(0, before - current), trimmed };
 }
 
 /** Size of a history, for callers that want to report it. */
