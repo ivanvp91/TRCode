@@ -1,0 +1,15 @@
+node_modules/
+dist/
+.test-home*/
+.tmp-home/
+mock-output.txt
+*.log
+
+.live-test/
+.probe.json
+.test-home/
+.measure/
+.live*/
+.chk/
+
+*.zip

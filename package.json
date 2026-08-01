@@ -1,0 +1,44 @@
+{
+  "name": "trcode",
+  "version": "0.1.0",
+  "description": "Agentic coding CLI for TokenRouter models — an open alternative to Claude Code",
+  "type": "module",
+  "bin": {
+    "trc": "dist/index.js",
+    "trcode": "dist/index.js"
+  },
+  "engines": {
+    "node": ">=20.10"
+  },
+  "files": [
+    "dist"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ivanvp91/tokenrouter-cli.git"
+  },
+  "homepage": "https://github.com/ivanvp91/tokenrouter-cli#readme",
+  "bugs": {
+    "url": "https://github.com/ivanvp91/tokenrouter-cli/issues"
+  },
+  "keywords": [
+    "cli",
+    "llm",
+    "agent",
+    "tokenrouter",
+    "coding-agent",
+    "terminal"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node test/run-all.mjs"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
+  }
+}
