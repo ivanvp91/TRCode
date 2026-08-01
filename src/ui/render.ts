@@ -77,7 +77,10 @@ export function banner(info: BannerInfo): void {
 
 export function userEcho(text: string): void {
   line();
-  for (const l of wrapText(text, contentWidth() - 2)) line(pad(c.brightYellow("✦ ") + c.bold(l)));
+  // The star marks the turn, not every line of it.
+  for (const [i, l] of wrapText(text, contentWidth() - 2).entries()) {
+    line(pad((i === 0 ? c.brightYellow("✦ ") : "  ") + c.bold(l)));
+  }
   line();
 }
 
@@ -132,14 +135,27 @@ export function clip(s: string, max: number): string {
 
 export function wrapText(text: string, w: number): string[] {
   const lines: string[] = [];
+  const width = Math.max(8, w);
   for (const raw of text.split("\n")) {
-    if (raw.length <= w) {
+    if (raw.length <= width) {
       lines.push(raw);
       continue;
     }
     let cur = "";
     for (const word of raw.split(" ")) {
-      if (cur && cur.length + word.length + 1 > w) {
+      // A single unbroken run — base64, minified JSON, a wall of one character
+      // — has no space to break at, so it has to be cut by force. Without this
+      // it lands on screen as one enormous line and the line cap never fires.
+      if (word.length > width) {
+        if (cur) {
+          lines.push(cur);
+          cur = "";
+        }
+        for (let i = 0; i < word.length; i += width) lines.push(word.slice(i, i + width));
+        cur = lines.pop() ?? "";
+        continue;
+      }
+      if (cur && cur.length + word.length + 1 > width) {
         lines.push(cur);
         cur = word;
       } else {
@@ -209,6 +225,144 @@ function inline(s: string): string {
   return s
     .replace(/`([^`]+)`/g, (_m, code) => c.brightYellow(code))
     .replace(/\*\*([^*]+)\*\*/g, (_m, t) => c.bold(t));
+}
+
+// ── static markdown ─────────────────────────────────────────────────────────
+
+export interface BlockOptions {
+  /** Wrap width; defaults to the chat content width. */
+  width?: number;
+  /** Cut off after this many rendered lines and say how many were dropped. */
+  maxLines?: number;
+  /** Render everything dimmed — used for replayed history. */
+  dim?: boolean;
+}
+
+const TABLE_ROW = /^\s*\|.*\|\s*$/;
+const TABLE_SEP = /^\s*\|[\s:|-]+\|\s*$/;
+
+/**
+ * Renders finished markdown into terminal lines. Unlike MarkdownStream this
+ * sees the whole text at once, so it can align tables — which is exactly what
+ * a replayed answer needs: `truncate()` used to flatten a table into one
+ * unreadable paragraph.
+ */
+export function renderMarkdownBlock(text: string, opts: BlockOptions = {}): string[] {
+  const w = opts.width ?? contentWidth();
+  const soft = (s: string) => (opts.dim ? c.dim(s) : s);
+  const raw = text.replace(/\r/g, "").split("\n");
+  const outLines: string[] = [];
+  let inFence = false;
+  let blanks = 0;
+
+  for (let i = 0; i < raw.length; i++) {
+    const l = raw[i];
+
+    if (/^\s*```/.test(l)) {
+      inFence = !inFence;
+      // The left bar already shows where the block runs, so the fence markers
+      // themselves are noise — only the language tag is worth keeping.
+      const lang = l.trim().replace(/^`+/, "").trim();
+      if (inFence && lang) outLines.push(c.gray("│ ") + c.gray(lang));
+      blanks = 0;
+      continue;
+    }
+    if (inFence) {
+      outLines.push(c.gray("│ ") + c.dim(clip(l, w - 2)));
+      blanks = 0;
+      continue;
+    }
+    if (!l.trim()) {
+      // Collapse runs of blank lines; a replay wastes screen height otherwise.
+      if (blanks === 0 && outLines.length) outLines.push("");
+      blanks++;
+      continue;
+    }
+    blanks = 0;
+
+    if (TABLE_ROW.test(l)) {
+      const rows: string[] = [];
+      while (i < raw.length && TABLE_ROW.test(raw[i])) rows.push(raw[i++]);
+      i--;
+      outLines.push(...renderTable(rows, w, opts.dim));
+      continue;
+    }
+    if (/^#{1,6}\s/.test(l)) {
+      outLines.push(c.bold(c.brightBlue(l.replace(/^#{1,6}\s*/, ""))));
+      continue;
+    }
+    if (/^\s*([-*_])\1{2,}\s*$/.test(l)) {
+      outLines.push(c.gray("─".repeat(Math.min(w, 40))));
+      continue;
+    }
+    const bullet = l.match(/^(\s*)[-*]\s+(.*)$/);
+    if (bullet) {
+      const body = wrapText(bullet[2], Math.max(10, w - bullet[1].length - 2));
+      body.forEach((part, n) =>
+        outLines.push(bullet[1] + (n === 0 ? c.brightCyan("• ") : "  ") + soft(inline(part))),
+      );
+      continue;
+    }
+    const numbered = l.match(/^(\s*)(\d+[.)])\s+(.*)$/);
+    if (numbered) {
+      const lead = numbered[1] + numbered[2] + " ";
+      const body = wrapText(numbered[3], Math.max(10, w - lead.length));
+      body.forEach((part, n) =>
+        outLines.push(n === 0 ? numbered[1] + c.brightCyan(numbered[2]) + " " + soft(inline(part)) : " ".repeat(lead.length) + soft(inline(part))),
+      );
+      continue;
+    }
+    for (const part of wrapText(l, w)) outLines.push(soft(inline(part)));
+  }
+
+  while (outLines.length && !outLines[outLines.length - 1]) outLines.pop();
+
+  const max = opts.maxLines ?? 0;
+  if (max > 0 && outLines.length > max) {
+    const hidden = outLines.length - max;
+    return [...outLines.slice(0, max), c.gray(`… ${hidden} more ${plural(hidden, "line", "lines")}`)];
+  }
+  return outLines;
+}
+
+/** Pipe-table → aligned columns. Falls back to plain rows when it does not fit. */
+function renderTable(rows: string[], w: number, dim?: boolean): string[] {
+  const cells = rows
+    .filter((r) => !TABLE_SEP.test(r))
+    .map((r) => r.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((x) => x.trim()));
+  if (!cells.length) return [];
+
+  const cols = Math.max(...cells.map((r) => r.length));
+  const widths = new Array(cols).fill(0);
+  for (const row of cells) {
+    row.forEach((cell, i) => (widths[i] = Math.max(widths[i], width(cell))));
+  }
+
+  // " │ " between columns; shrink the widest column until the row fits.
+  const gutters = (cols - 1) * 3;
+  let total = widths.reduce((a, b) => a + b, 0) + gutters;
+  while (total > w && Math.max(...widths) > 6) {
+    const widest = widths.indexOf(Math.max(...widths));
+    widths[widest]--;
+    total--;
+  }
+
+  const hadHeader = rows.some((r) => TABLE_SEP.test(r));
+  const soft = (s: string) => (dim ? c.dim(s) : s);
+  const outRows: string[] = [];
+  cells.forEach((row, r) => {
+    const parts = widths.map((cw, i) => padCell(row[i] ?? "", cw));
+    const text = parts.join(c.gray(" │ "));
+    outRows.push(hadHeader && r === 0 ? c.bold(text) : soft(text));
+    if (hadHeader && r === 0) outRows.push(c.gray(widths.map((cw) => "─".repeat(cw)).join("─┼─")));
+  });
+  return outRows;
+}
+
+function padCell(s: string, w: number): string {
+  const flat = s.replace(/`/g, "");
+  const shown = width(flat) > w ? clip(flat, w) : flat;
+  return shown + " ".repeat(Math.max(0, w - width(shown)));
 }
 
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];

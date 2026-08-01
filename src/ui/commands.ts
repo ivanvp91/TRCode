@@ -2,9 +2,10 @@
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { c } from "./ansi.js";
-import { contentWidth } from "./layout.js";
-import { error, info, line, padded, rule, Spinner, success, truncate, warn } from "./render.js";
-import { pick } from "./picker.js";
+import { contentWidth, fmtAgo } from "./layout.js";
+import { error, info, line, padded, renderMarkdownBlock, rule, Spinner, success, truncate, warn } from "./render.js";
+import { pick, type PickerItem } from "./picker.js";
+import { choose } from "./choice.js";
 import { pickModel } from "./modelpicker.js";
 import { askSecret } from "./secret.js";
 import { scanKeys } from "./keyscan.js";
@@ -17,12 +18,13 @@ import {
   usableModels,
   incompatibleReason,
   groupByVendor,
+  contextWindowFor,
   MODALITIES,
 } from "../provider/models.js";
 import { verifyKey, modelRejectsEffort, resetEffortLearning } from "../provider/client.js";
-import { Session } from "../session/session.js";
+import { Session, type SessionMeta } from "../session/session.js";
 import { compactSession, contextPressure } from "../session/compact.js";
-import { fmtTokens } from "../usage.js";
+import { fmtTokens, historyTokens } from "../usage.js";
 import { runSwarm } from "../agent/swarm.js";
 import { runOrchestration } from "../agent/orchestrator.js";
 import { createSkill } from "../skills/loader.js";
@@ -55,6 +57,96 @@ function warnIfIncompatible(app: App, id: string): void {
   const why = m ? incompatibleReason(m) : null;
   if (!why) return;
   warn(`${id} cannot be driven through /v1/chat/completions — ${why}. Requests to it will fail.`);
+}
+
+/** How full a saved session is, coloured by how close it is to the window. */
+function sessionFill(app: App, m: SessionMeta): { tokens: number; window: number; pct: number; tint: (s: string) => string } {
+  const window = contextWindowFor(m.model, app.catalog);
+  const tokens = m.tokens ?? 0;
+  const pct = Math.round((tokens / window) * 100);
+  const tint = pct >= 80 ? c.red : pct >= 50 ? c.yellow : c.gray;
+  return { tokens, window, pct, tint };
+}
+
+function sessionItem(app: App, m: SessionMeta): PickerItem {
+  const { tokens, window, pct, tint } = sessionFill(app, m);
+  // The row has to survive truncation at the terminal edge, so the size — the
+  // reason this list exists — goes first and the title takes what is left.
+  const size = tint(`~${fmtTokens(tokens)}`.padStart(7) + `/${fmtTokens(window)} ${String(pct).padStart(3)}%`);
+  return {
+    value: m.id,
+    label: truncate(m.title, 40).padEnd(41),
+    hint: size + c.gray(`  ${String(m.messageCount).padStart(3)} msgs  ${fmtAgo(m.updatedAt)}`),
+  };
+}
+
+/** The detail card shown between picking a session and deciding what to do. */
+function sessionCard(app: App, s: Session): void {
+  const meta: SessionMeta = {
+    id: s.id,
+    title: s.title,
+    cwd: s.cwd,
+    model: s.model,
+    createdAt: s.createdAt,
+    updatedAt: Date.now(),
+    messageCount: s.messages.length,
+    tokens: historyTokens(s.messages),
+  };
+  const { tokens, window, pct, tint } = sessionFill(app, meta);
+  const barWidth = Math.min(32, contentWidth() - 12);
+  const filled = Math.min(barWidth, Math.round((tokens / window) * barWidth));
+
+  line();
+  padded(c.bold(truncate(s.title || "(untitled)", contentWidth() - 2)));
+  padded(
+    c.gray(`${s.id} · ${s.model} · ${s.messages.length} messages`) +
+      (s.compactions ? c.gray(` · compacted ${s.compactions}×`) : ""),
+  );
+  padded(
+    tint("█".repeat(filled)) +
+      c.gray("░".repeat(barWidth - filled)) +
+      "  " +
+      tint(`~${fmtTokens(tokens)}`) +
+      c.gray(` of ${fmtTokens(window)} tokens (${pct}%)`),
+  );
+  if (pct >= 50) padded(c.gray("Compacting first frees room and cuts what every later turn costs."));
+  line();
+}
+
+/**
+ * Shared by /compact and "compact and continue" on resume. The resume path
+ * skips the digest here — the replay right below prints it anyway.
+ */
+async function compactNow(app: App, instructions: string, showDigest = true): Promise<void> {
+  if (app.session.messages.length < 4) {
+    info("The history is too short to compact.");
+    return;
+  }
+  const before = contextPressure(app.session, app.catalog);
+  const sp = new Spinner("compacting context");
+  sp.start();
+  try {
+    const res = await compactSession(app.session, {
+      instructions: instructions.trim() || undefined,
+      catalog: app.catalog,
+    });
+    sp.stop();
+    if (!res.summary) return info("Nothing to compact.");
+    const after = contextPressure(app.session, app.catalog);
+    success(
+      `Compacted ${res.droppedMessages} messages into a digest. ` +
+        `Context ${Math.round(before.ratio * 100)}% → ${Math.round(after.ratio * 100)}% ` +
+        `(~${fmtTokens(before.used)} → ~${fmtTokens(after.used)} tokens).`,
+    );
+    if (showDigest) {
+      line();
+      for (const l of renderMarkdownBlock(res.summary, { maxLines: 20, dim: true })) padded(l);
+      line();
+    }
+  } catch (err) {
+    sp.stop();
+    error((err as Error).message);
+  }
 }
 
 const COMMANDS: Command[] = [
@@ -204,30 +296,7 @@ const COMMANDS: Command[] = [
     args: "[what to focus on]",
     help: "compact the history into a digest",
     async run(app, rest) {
-      if (app.session.messages.length < 4) return info("The history is too short to compact.");
-      const before = contextPressure(app.session, app.catalog);
-      const sp = new Spinner("compacting context");
-      sp.start();
-      try {
-        const res = await compactSession(app.session, {
-          instructions: rest.trim() || undefined,
-          catalog: app.catalog,
-        });
-        sp.stop();
-        if (!res.summary) return info("Nothing to compact.");
-        const after = contextPressure(app.session, app.catalog);
-        success(
-          `Compacted ${res.droppedMessages} messages into a digest. ` +
-            `Context ${Math.round(before.ratio * 100)}% → ${Math.round(after.ratio * 100)}%.`,
-        );
-        line();
-        for (const l of res.summary.split("\n").slice(0, 20)) padded(c.dim(l));
-        if (res.summary.split("\n").length > 20) padded(c.gray("…"));
-        line();
-      } catch (err) {
-        sp.stop();
-        error((err as Error).message);
-      }
+      await compactNow(app, rest);
     },
   },
   {
@@ -258,13 +327,16 @@ const COMMANDS: Command[] = [
       line();
       for (const m of metas) {
         const cur = m.id === app.session.id ? c.brightCyan("❯ ") : "  ";
+        const { tokens, pct, tint } = sessionFill(app, m);
         padded(
           `${cur}${c.bold(m.id)}  ${c.gray(new Date(m.updatedAt).toLocaleString())}  ` +
-            `${c.dim(String(m.messageCount) + " msgs")}  ${truncate(m.title, 44)}`,
+            `${c.dim(String(m.messageCount).padStart(3) + " msgs")}  ` +
+            `${tint(`~${fmtTokens(tokens)}`.padStart(7) + ` ${String(pct).padStart(3)}%`)}  ` +
+            `${truncate(m.title, 40)}`,
         );
       }
       line();
-      padded(c.gray("Restore with: /resume <id>"));
+      padded(c.gray("Restore with: /resume <id>, or /resume to pick from the list"));
     },
   },
   {
@@ -273,33 +345,52 @@ const COMMANDS: Command[] = [
     args: "[id]",
     help: "restore a session",
     async run(app, rest) {
-      let id = rest.trim();
-      if (!id) {
-        const metas = Session.list(app.cwd);
-        if (!metas.length) return info("No saved sessions.");
-        const chosen = await app.exclusiveInput(() =>
-          pick({
-            title: "Pick a session",
-            items: metas.map((m) => ({
-              value: m.id,
-              label: truncate(m.title, 46).padEnd(48),
-              hint: c.gray(`${new Date(m.updatedAt).toLocaleString()} · ${m.messageCount} msgs`),
-            })),
-            initial: app.session.id,
-          }),
-        );
-        if (!chosen) return;
-        id = chosen;
-      }
-      const loaded = Session.load(app.cwd, id);
-      if (!loaded) return error(`Session not found: ${id}`);
-      app.session.save();
-      app.session = loaded;
-      app.usage = loaded.usage;
-      app.readFiles.clear();
-      app.rebuildTools();
-      success(`Restored ${loaded.id} — ${loaded.messages.length} messages, model ${loaded.model}`);
-      if (loaded.messages.length) app.replayHistory();
+      const explicit = rest.trim();
+      await app.exclusiveInput(async () => {
+        // Loops so "back to the list" from the action prompt really goes back.
+        for (;;) {
+          let id = explicit;
+          if (!id) {
+            const metas = Session.list(app.cwd);
+            if (!metas.length) return info("No saved sessions.");
+            const chosen = await pick({
+              title: "Pick a session",
+              items: metas.map((m) => sessionItem(app, m)),
+              initial: app.session.id,
+            });
+            if (!chosen) return;
+            id = chosen;
+          }
+
+          const loaded = Session.load(app.cwd, id);
+          if (!loaded) return error(`Session not found: ${id}`);
+
+          sessionCard(app, loaded);
+          const action = await choose<"open" | "compact" | "cancel">(
+            [
+              { value: "open", label: "Continue as is", key: "c" },
+              { value: "compact", label: "Compact and continue", key: "k", tone: "warn" },
+              { value: "cancel", label: explicit ? "Cancel" : "Back to the list", key: "b", tone: "danger" },
+            ],
+            { initial: "open", fallback: "cancel" },
+          );
+          if (action === "cancel") {
+            if (explicit) return;
+            continue;
+          }
+
+          app.session.save();
+          app.session = loaded;
+          app.usage = loaded.usage;
+          app.readFiles.clear();
+          app.rebuildTools();
+
+          if (action === "compact") await compactNow(app, "", false);
+          success(`Restored ${loaded.id} — ${loaded.messages.length} messages, model ${loaded.model}`);
+          if (loaded.messages.length) app.replayHistory();
+          return;
+        }
+      });
     },
   },
   {

@@ -47,6 +47,32 @@ export function stripAnsi(s: string): string {
   return s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
 }
 
+/**
+ * Cuts a styled string to a visible width. Plain `truncate()` counts escape
+ * bytes as characters, so a coloured row loses real text long before it
+ * reaches the edge of the terminal.
+ */
+export function clipAnsi(s: string, max: number): string {
+  if (max <= 1) return "";
+  if (width(s) <= max) return s;
+  let out = "";
+  let visible = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === "\x1b") {
+      const seq = /^\x1b\[[0-9;]*[A-Za-z]/.exec(s.slice(i));
+      if (seq) {
+        out += seq[0];
+        i += seq[0].length - 1;
+        continue;
+      }
+    }
+    if (visible >= max - 1) break;
+    out += s[i];
+    visible++;
+  }
+  return out + "…" + (noColor ? "" : "\x1b[0m");
+}
+
 export const cursor = {
   hide: () => process.stdout.write("\x1b[?25l"),
   show: () => process.stdout.write("\x1b[?25h"),

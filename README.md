@@ -138,6 +138,57 @@ After a turn, only that turn — nothing already shown under the input is repeat
 The chat area has margins (narrow on the left, wider on the right); on a narrow terminal
 the right margin collapses rather than squeezing the text.
 
+## Resuming a session
+
+Sessions are stored per project. `/sessions` lists them; `/resume` opens the picker, and
+every row says how much context that session carries — the number that decides what the
+next turn will cost. It turns yellow past half the window and red past 80%.
+
+```
+   Pick a session
+   ↑↓ move · Enter select · Esc cancel · type to filter
+   ❯ pricing analysis                        ~184k/1M  18%   64 msgs  2h ago
+     editor rewrite                           ~11k/1M   1%    5 msgs  3d ago
+```
+
+Choosing one does not commit you to it. A card shows the size, then three buttons:
+
+```
+   pricing analysis
+   202608011349-e115a0 · moonshotai/kimi-k3 · 64 messages
+   ██████░░░░░░░░░░░░░░░░░░░░░░░░░░  ~184k of 1M tokens (18%)
+
+    Continue as is   [Compact and continue]  [Back to the list]   ←/→ · Enter to confirm
+```
+
+**Compact and continue** runs the same digest as `/compact` before the session opens, so a
+bloated history does not cost full price on the very first turn. **Back to the list**
+returns to the picker rather than dropping you back at the prompt.
+
+Then the last few turns are replayed as real markdown — tables aligned into columns, code
+fences kept as blocks, long turns cut off with a line count. A compacted session shows its
+digest as a labelled block instead of raw XML:
+
+```
+   ───────────────  resumed · 202608011349-e115a0  ───────────────
+   12 messages · ~44k of 1M tokens (4%) · moonshotai/kimi-k3 · compacted 1×
+
+   ▍ compacted context
+   ▍ Task
+   ▍ Ship the pricing page.
+
+   ✦ analyse the fx monitor pricing
+
+   ● moonshotai/kimi-k3
+   Plan    │ $/mo  │ Accounts │ Sync
+   ────────┼───────┼──────────┼───────
+   Free    │ 0     │ 3        │ 5 min
+   Starter │ 9.99  │ 10       │ 30 sec
+```
+
+`-c/--continue` reopens the most recent session directly, `-r/--resume <id>` a specific
+one.
+
 ## Token spend
 
 An agent loop resends the whole history on every step, so a long session costs
@@ -369,17 +420,18 @@ npm test
 ```
 
 ```
-PASS  protocol-test.mjs      36/36     PASS  focus-test.mjs      8/8
-PASS  editor-harness.mjs     11/11     PASS  repaint-test.mjs    5/5
-PASS  paste-test.mjs         9/9       PASS  menu-test.mjs
+PASS  protocol-test.mjs      36/36     PASS  repaint-test.mjs    5/5
+PASS  editor-harness.mjs     11/11     PASS  menu-test.mjs
+PASS  paste-test.mjs         9/9       PASS  resume-test.mjs     26/26
 PASS  newline-test.mjs       13/13     PASS  keyscan-test.mjs    6/6
 PASS  history-test.mjs       9/9       PASS  shutdown-test.mjs   8/8
+PASS  focus-test.mjs         8/8
 ```
 
 The suites cover the wire protocols and history trimming, plus the terminal behaviour that
 is otherwise painful to verify: paste in four delivery shapes, split escape sequences,
-focus events, frame repainting, multi-line input, prompt history, and the process actually
-exiting instead of lingering.
+focus events, frame repainting, multi-line input, prompt history, the resume flow on a
+virtual screen, and the process actually exiting instead of lingering.
 
 `test/measure-tokens.mjs` measures request sizes at several `maxRequestTokens` thresholds
 and prints the table from the "Token spend" section.
@@ -424,7 +476,8 @@ src/
     stdin.ts           single owner of the input stream
     repl.ts            the loop, turns, transcript
     commands.ts        slash commands
-    render.ts          banner, markdown, spinner, diffs
+    render.ts          banner, markdown, tables, spinner, diffs
+    layout.ts          chat geometry and time formatting
     picker.ts          list picker with tabs and sections
     choice.ts          button row for confirmations
     keyscan.ts         /keys inspector

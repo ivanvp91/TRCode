@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { sessionsDir } from "../config.js";
-import { UsageTracker, type ModelUsage } from "../usage.js";
+import { UsageTracker, historyTokens, type ModelUsage } from "../usage.js";
 import type { Message } from "../types.js";
 
 export interface SessionMeta {
@@ -14,6 +14,10 @@ export interface SessionMeta {
   createdAt: number;
   updatedAt: number;
   messageCount: number;
+  /** Estimated history size. Recomputed on listing, so old files have it too. */
+  tokens?: number;
+  /** How many times this session has already been compacted. */
+  compactions?: number;
 }
 
 interface SessionFile {
@@ -73,6 +77,8 @@ export class Session {
         createdAt: this.createdAt,
         updatedAt: Date.now(),
         messageCount: this.messages.length,
+        tokens: historyTokens(this.messages),
+        compactions: this.compactions,
       },
       messages: this.messages,
       usage: this.usage.toJSON(),
@@ -97,6 +103,7 @@ export class Session {
       });
       s.messages = data.messages ?? [];
       s.usage = UsageTracker.fromJSON(data.usage);
+      s.compactions = data.meta.compactions ?? 0;
       return s;
     } catch {
       return null;
@@ -115,7 +122,9 @@ export class Session {
     for (const n of names) {
       try {
         const data = JSON.parse(fs.readFileSync(path.join(dir, n), "utf8")) as SessionFile;
-        if (data?.meta?.id) metas.push(data.meta);
+        // Recompute rather than trust the stored count: files written by an
+        // older build have no `tokens` field at all.
+        if (data?.meta?.id) metas.push({ ...data.meta, tokens: historyTokens(data.messages ?? []) });
       } catch {
         /* skip corrupt files */
       }

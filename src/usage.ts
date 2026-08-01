@@ -1,5 +1,5 @@
 /** Token and cost accounting for a session. */
-import type { ModelInfo, Usage } from "./types.js";
+import type { Message, ModelInfo, Usage } from "./types.js";
 
 export interface ModelUsage {
   model: string;
@@ -156,4 +156,17 @@ export function estimateTokens(text: string): number {
   if (!text) return 0;
   // ~3.6 chars/token for mixed code + Cyrillic prose.
   return Math.ceil(text.length / 3.6);
+}
+
+/**
+ * Size of a stored history. Used both for live context pressure and for the
+ * session list, so a session shows the same number before and after opening it.
+ */
+export function historyTokens(messages: Message[]): number {
+  let used = 0;
+  for (const m of messages) {
+    used += estimateTokens(String(m.content ?? ""));
+    for (const tc of m.tool_calls ?? []) used += estimateTokens(tc.function.arguments) + 12;
+  }
+  return used;
 }

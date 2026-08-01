@@ -18,6 +18,7 @@ const SUITES = [
   "focus-test.mjs",
   "repaint-test.mjs",
   "menu-test.mjs",
+  "resume-test.mjs",
   "keyscan-test.mjs",
   "shutdown-test.mjs",
 ];

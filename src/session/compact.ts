@@ -6,7 +6,7 @@
 import { complete } from "../provider/client.js";
 import { loadConfig } from "../config.js";
 import { contextWindowFor } from "../provider/models.js";
-import { estimateTokens } from "../usage.js";
+import { historyTokens } from "../usage.js";
 import type { Message, ModelInfo } from "../types.js";
 import type { Session } from "./session.js";
 
@@ -131,11 +131,7 @@ export async function compactSession(
 /** Fraction of the context window the history currently occupies. */
 export function contextPressure(session: Session, catalog: ModelInfo[]): { used: number; window: number; ratio: number } {
   const window = contextWindowFor(session.model, catalog);
-  let used = 0;
-  for (const m of session.messages) {
-    used += estimateTokens(String(m.content ?? ""));
-    for (const tc of m.tool_calls ?? []) used += estimateTokens(tc.function.arguments) + 12;
-  }
+  const used = historyTokens(session.messages);
   return { used, window, ratio: used / window };
 }
 

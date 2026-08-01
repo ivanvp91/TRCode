@@ -30,6 +30,19 @@ export function pad(s = ""): string {
   return indent + s;
 }
 
+/** "just now", "12m ago", "5h ago", "3d ago", then a plain date. */
+export function fmtAgo(ts: number, now = Date.now()): string {
+  const s = Math.max(0, Math.round((now - ts) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  if (d < 7) return `${d}d ago`;
+  return new Date(ts).toLocaleDateString();
+}
+
 /** "6m 33s", "42s", "1h 04m". */
 export function fmtDuration(ms: number): string {
   const total = Math.max(0, Math.round(ms / 1000));

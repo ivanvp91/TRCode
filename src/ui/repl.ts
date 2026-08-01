@@ -12,13 +12,13 @@ import {
   line,
   padded,
   plural,
+  renderMarkdownBlock,
   toolDone,
   rule,
   toolStart,
   truncate,
   userEcho,
   warn,
-  wrapText,
 } from "./render.js";
 import { contentWidth, fmtDuration } from "./layout.js";
 import { composeStatus, type StatusInfo } from "./inputbox.js";
@@ -301,7 +301,7 @@ export class App {
    * Prints a restored conversation. Without this a resumed session looks empty
    * and indistinguishable from a lost one, even though the history is loaded.
    */
-  replayHistory(maxTurns = 6): void {
+  replayHistory(maxTurns = 4): void {
     const msgs = this.session.messages;
     const userIdx: number[] = [];
     msgs.forEach((m, i) => {
@@ -309,28 +309,59 @@ export class App {
     });
     const from = userIdx.length > maxTurns ? userIdx[userIdx.length - maxTurns] : 0;
     const skipped = userIdx.filter((i) => i < from).length;
+    const { used, window } = contextPressure(this.session, this.catalog);
+    const w = contentWidth();
 
     line();
-    rule(c.gray(` session ${this.session.id} · ${msgs.length} messages `));
-    if (skipped) padded(c.gray(`… ${skipped} earlier ${plural(skipped, "prompt", "prompts")} not shown`));
+    rule(c.gray(` resumed · ${this.session.id} `));
+    padded(
+      c.gray(
+        `${msgs.length} ${plural(msgs.length, "message", "messages")} · ~${fmtTokens(used)} of ${fmtTokens(window)} tokens ` +
+          `(${Math.round((used / window) * 100)}%) · ${this.session.model}` +
+          (this.session.compactions
+            ? ` · compacted ${this.session.compactions}×`
+            : ""),
+      ),
+    );
+    if (skipped) padded(c.gray(`${skipped} earlier ${plural(skipped, "prompt", "prompts")} folded away`));
 
     for (const m of msgs.slice(from)) {
       if (m.meta?.hidden) continue;
+
       if (m.role === "user") {
         const text = String(m.content ?? "");
         line();
-        for (const l of wrapText(truncate(text, 600), contentWidth() - 2)) {
-          padded(c.brightYellow("✦ ") + c.bold(l));
+        const digest = text.match(/^<compacted-context>\n?([\s\S]*?)\n?<\/compacted-context>$/);
+        if (digest) {
+          // The digest is the whole earlier history — show it as a labelled
+          // block, not as a user prompt with XML tags around it.
+          padded(c.brightBlue("▍") + " " + c.bold(c.brightBlue("compacted context")));
+          const body = digest[1].replace(/^The earlier part of this session[^\n]*\n+/, "");
+          for (const l of renderMarkdownBlock(body, { width: w - 2, maxLines: 12, dim: true })) {
+            padded(c.gray("▍ ") + l);
+          }
+          continue;
+        }
+        for (const [i, l] of renderMarkdownBlock(text, { width: w - 2, maxLines: 8 }).entries()) {
+          padded((i === 0 ? c.brightYellow("✦ ") : "  ") + c.bold(l));
         }
         continue;
       }
+
       if (m.role === "assistant") {
         if (m.content) {
+          line();
           padded(c.brightMagenta("●") + " " + c.dim(m.meta?.model ?? this.session.model));
-          for (const l of wrapText(truncate(String(m.content), 800), contentWidth())) padded(c.dim(l));
+          for (const l of renderMarkdownBlock(String(m.content), { width: w, maxLines: 14, dim: true })) {
+            padded(l);
+          }
         }
-        for (const tc of m.tool_calls ?? []) {
-          padded(c.brightCyan("⏺ ") + c.dim(tc.function.name) + c.gray(`(${truncate(tc.function.arguments, 60)})`));
+        const calls = m.tool_calls ?? [];
+        for (const tc of calls.slice(0, 3)) {
+          padded(c.brightCyan("⏺ ") + c.dim(tc.function.name) + c.gray(`(${truncate(tc.function.arguments, 56)})`));
+        }
+        if (calls.length > 3) {
+          padded(c.gray(`  … ${calls.length - 3} more tool ${plural(calls.length - 3, "call", "calls")}`));
         }
         continue;
       }

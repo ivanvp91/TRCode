@@ -1,7 +1,7 @@
 /** Interactive list picker: arrow keys, type-to-filter, sections, tabs. */
-import { c, cursor } from "./ansi.js";
+import { c, clipAnsi, cursor } from "./ansi.js";
 import { contentWidth, indent } from "./layout.js";
-import { line, out, truncate } from "./render.js";
+import { line, out } from "./render.js";
 import { pushConsumer } from "./stdin.js";
 
 const CTRL_C = String.fromCharCode(3);
@@ -156,7 +156,7 @@ export function pick(opts: PickerOptions): Promise<string | null> {
         const name = active ? c.bold(c.brightCyan(item.label)) : item.label;
         const hint = item.hint ? c.dim(" " + item.hint) : "";
         const badge = item.badge ? c.gray(" " + item.badge) : "";
-        buf.push(`${marker}${truncate(name + hint + badge, w - 4)}`);
+        buf.push(`${marker}${clipAnsi(name + hint + badge, w - 4)}`);
       }
 
       const total = selectableIdx(rows).length;
