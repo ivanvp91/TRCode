@@ -87,6 +87,13 @@ export interface Config {
   maxSteps: number;
   /** Auto-compact once the context passes this fraction of the window. */
   autoCompactAt: number;
+  /**
+   * Ask the provider to cache the prompt prefix. On the OpenAI path caching is
+   * automatic and this changes nothing; on the Anthropic path nothing is
+   * cached without explicit breakpoints, so a long turn pays full price for
+   * the same history on every step. Set false if a host mishandles the field.
+   */
+  promptCache: boolean;
   /** Extra system prompt appended for every session. */
   instructions?: string;
 }
@@ -132,6 +139,7 @@ const DEFAULTS: Config = {
   maxRequestTokens: 40_000,
   maxSteps: 60,
   autoCompactAt: 0.82,
+  promptCache: true,
 };
 
 export function configDir(): string {

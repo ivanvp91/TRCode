@@ -44,6 +44,18 @@ export interface PromptOptions {
   subagent?: boolean;
 }
 
+/**
+ * The listing is the one volatile part of the prompt: creating a single file
+ * rewrites it, and since everything after a changed byte is a cache miss, one
+ * `write` used to invalidate the cached prefix for the whole rest of the
+ * session. Snapshot it per directory instead — the model can always `ls`.
+ */
+const listingSnapshots = new Map<string, string>();
+
+export function resetPromptSnapshots(): void {
+  listingSnapshots.clear();
+}
+
 export function buildSystemPrompt(opts: PromptOptions): string {
   const parts = [opts.subagent ? SUBAGENT_BASE : BASE];
 
@@ -56,7 +68,11 @@ Model: ${opts.model}
 Git repository: ${isGitRepo(opts.cwd) ? "yes" : "no"}
 </environment>`);
 
-  const tree = topLevelListing(opts.cwd);
+  let tree = listingSnapshots.get(opts.cwd);
+  if (tree === undefined) {
+    tree = topLevelListing(opts.cwd);
+    listingSnapshots.set(opts.cwd, tree);
+  }
   if (tree) parts.push(`<workspace>\n${tree}\n</workspace>`);
 
   const skillsSection = skillsPromptSection(opts.skills);

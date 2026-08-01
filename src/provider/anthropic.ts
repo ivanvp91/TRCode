@@ -5,6 +5,7 @@
  * results travel as `tool_result` blocks inside a *user* message, and
  * max_tokens is mandatory.
  */
+import { estimateTokens } from "../usage.js";
 import type { Message, StreamEvent, ToolCall, ToolDef, Usage } from "../types.js";
 import type { Effort } from "../config.js";
 
@@ -22,7 +23,21 @@ export interface AnthropicRequest {
    *  "none"     — do not ask for thinking at all
    */
   thinkingForm?: "adaptive" | "budget" | "none";
+  /**
+   * Marks cache breakpoints so the provider can reuse the prefix. Unlike the
+   * OpenAI path, where caching is automatic, Anthropic caches nothing unless
+   * asked — every step of an agent loop pays full price for the same history.
+   */
+  cache?: boolean;
 }
+
+const CACHE_CONTROL = { type: "ephemeral" as const };
+/**
+ * Anthropic ignores a breakpoint below ~1024 tokens (2048 on Haiku), and a
+ * cache write costs 25% more than plain input. Below this there is nothing to
+ * gain and something to lose, so we do not ask.
+ */
+const MIN_CACHEABLE_TOKENS = 2048;
 
 const DEFAULT_MAX_TOKENS = 8192;
 
@@ -91,19 +106,30 @@ export function buildAnthropicBody(req: AnthropicRequest, stream: boolean): Reco
   // With an explicit budget the answer needs room on top of it.
   const maxTokens = req.maxTokens ?? (budget ? budget + DEFAULT_MAX_TOKENS : DEFAULT_MAX_TOKENS);
 
+  const cache = req.cache !== false && estimateTokens(system) + sizeOfMessages(req.messages) >= MIN_CACHEABLE_TOKENS;
+
   const body: Record<string, unknown> = {
     model: req.model,
-    messages,
+    messages: cache ? withCacheBreakpoint(messages) : messages,
     max_tokens: maxTokens,
     stream,
   };
-  if (system) body.system = system;
+  // The system prompt and the tool schemas are identical on every step of a
+  // turn, so they are the cheapest thing to cache and the safest to mark.
+  if (system) {
+    body.system = cache ? [{ type: "text", text: system, cache_control: CACHE_CONTROL }] : system;
+  }
   if (req.tools?.length) {
-    body.tools = req.tools.map((t) => ({
+    const tools = req.tools.map((t) => ({
       name: t.name,
       description: t.description,
-      input_schema: t.parameters,
+      input_schema: t.parameters as unknown,
     }));
+    // A breakpoint on the last tool covers the whole block above it.
+    if (cache && tools.length) {
+      tools[tools.length - 1] = { ...tools[tools.length - 1], cache_control: CACHE_CONTROL } as typeof tools[number];
+    }
+    body.tools = tools;
   }
   if (wantsThinking && form === "adaptive") {
     // Claude 5 rejects {type:"enabled"} and wants the effort level instead.
@@ -116,6 +142,31 @@ export function buildAnthropicBody(req: AnthropicRequest, stream: boolean): Reco
     body.temperature = req.temperature;
   }
   return body;
+}
+
+/**
+ * Marks the end of the history so the next step reads it back instead of
+ * re-sending it at full price. The breakpoint moves forward every request:
+ * this one writes the cache, the next one hits it.
+ */
+function withCacheBreakpoint(messages: unknown[]): unknown[] {
+  if (!messages.length) return messages;
+  const out = messages.slice();
+  const last = out[out.length - 1] as { role: string; content: any[] };
+  if (!Array.isArray(last?.content) || !last.content.length) return messages;
+  const content = last.content.slice();
+  content[content.length - 1] = { ...content[content.length - 1], cache_control: CACHE_CONTROL };
+  out[out.length - 1] = { ...last, content };
+  return out;
+}
+
+function sizeOfMessages(messages: Message[]): number {
+  let n = 0;
+  for (const m of messages) {
+    n += estimateTokens(String(m.content ?? ""));
+    for (const tc of m.tool_calls ?? []) n += estimateTokens(tc.function.arguments) + 12;
+  }
+  return n;
 }
 
 interface Block {
@@ -211,7 +262,17 @@ export function parseAnthropicResult(json: any): {
   return {
     content,
     toolCalls,
-    usage: u.input_tokens !== undefined ? { prompt_tokens: input, completion_tokens: output, total_tokens: input + output } : undefined,
+    usage:
+      u.input_tokens !== undefined
+        ? {
+            prompt_tokens: input,
+            completion_tokens: output,
+            total_tokens: input + output,
+            // Reported like the streaming path does, or a non-streamed call
+            // (a compaction, a subagent) looks as if nothing was cached.
+            cached_tokens: Number(u.cache_read_input_tokens ?? 0) || undefined,
+          }
+        : undefined,
     finishReason: json?.stop_reason === "tool_use" ? "tool_calls" : json?.stop_reason === "max_tokens" ? "length" : "stop",
   };
 }

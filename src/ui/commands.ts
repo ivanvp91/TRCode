@@ -22,13 +22,15 @@ import {
   contextWindowFor,
   MODALITIES,
 } from "../provider/models.js";
-import { verifyKey, modelRejectsEffort, resetEffortLearning } from "../provider/client.js";
+import { protocolFor } from "../provider/protocol.js";
+import { verifyKey, modelRejectsEffort, modelRejectsCache, resetEffortLearning } from "../provider/client.js";
 import { Session, type SessionMeta } from "../session/session.js";
 import { compactSession, contextPressure } from "../session/compact.js";
 import { fmtTokens, historyTokens } from "../usage.js";
 import { runSwarm } from "../agent/swarm.js";
 import { runOrchestration } from "../agent/orchestrator.js";
 import { createSkill } from "../skills/loader.js";
+import { resetPromptSnapshots } from "../agent/prompt.js";
 import type { App } from "./repl.js";
 
 type Group = "main" | "session" | "settings" | "other";
@@ -517,21 +519,33 @@ const COMMANDS: Command[] = [
         line();
         return;
       }
+      const row = (model: string, u: { requests: number; input: number; cached: number; output: number; reasoning: number }) =>
+        `${model.padEnd(30)} ${String(u.requests).padStart(5)} ${fmtTokens(u.input).padStart(9)} ` +
+        `${fmtTokens(Math.round(u.input / Math.max(1, u.requests))).padStart(9)} ` +
+        `${(u.cached ? fmtTokens(u.cached) : "—").padStart(9)} ` +
+        `${fmtTokens(u.output).padStart(9)} ${(u.reasoning ? fmtTokens(u.reasoning) : "—").padStart(10)}`;
+
       padded(
-        `${c.gray("model".padEnd(34))} ${c.gray("reqs".padStart(6))} ${c.gray("input".padStart(10))} ` +
-          `${c.gray("output".padStart(10))} ${c.gray("reasoning".padStart(10))}`,
+        c.gray(
+          `${"model".padEnd(30)} ${"reqs".padStart(5)} ${"input".padStart(9)} ${"per req".padStart(9)} ` +
+            `${"cached".padStart(9)} ${"output".padStart(9)} ${"reasoning".padStart(10)}`,
+        ),
       );
-      for (const r of rows) {
+      for (const r of rows) padded(row(r.model, r));
+      padded(c.gray("─".repeat(Math.min(85, contentWidth()))));
+      padded(c.bold(row("total", t)));
+
+      // Caching is the difference between paying for the history once and
+      // paying for it on every step, so a flat zero is worth pointing at.
+      const anthropic = rows.some((r) => protocolFor(r.model) === "anthropic");
+      if (anthropic && !t.cached && t.requests > 1) {
         padded(
-          `${r.model.padEnd(34)} ${String(r.requests).padStart(6)} ${fmtTokens(r.input).padStart(10)} ` +
-            `${fmtTokens(r.output).padStart(10)} ${(r.reasoning ? fmtTokens(r.reasoning) : "—").padStart(10)}`,
+          c.gray(
+            "Nothing came back cached. Either the host drops cache_control, or the prefix keeps changing" +
+              (modelRejectsCache(app.session.model) ? " — this model rejected it and it is now off." : "."),
+          ),
         );
       }
-      padded(c.gray("─".repeat(Math.min(68, contentWidth()))));
-      padded(
-        `${c.bold("total".padEnd(34))} ${String(t.requests).padStart(6)} ${c.bold(fmtTokens(t.input).padStart(10))} ` +
-          `${c.bold(fmtTokens(t.output).padStart(10))} ${(t.reasoning ? fmtTokens(t.reasoning) : "—").padStart(10)}`,
-      );
       if (t.reasoning > t.output * 0.5) {
         line();
         padded(
@@ -695,6 +709,8 @@ const COMMANDS: Command[] = [
       app.readFiles.clear();
       app.reloadHistory();
       app.rebuildTools();
+      // The workspace listing is snapshotted per directory; a new one is due.
+      resetPromptSnapshots();
       success(`Working directory: ${next}`);
     },
   },

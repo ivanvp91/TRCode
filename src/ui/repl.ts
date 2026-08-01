@@ -436,6 +436,7 @@ export class App {
     this.session.add({ role: "user", content: text });
 
     this.abort = new AbortController();
+    this.usage.beginTurn();
 
     const started = Date.now();
     // The bar owns stdin for the duration of the turn: it interrupts on Esc
@@ -460,7 +461,6 @@ export class App {
     const promptEstimate = contextPressure(this.session, this.catalog).used;
     let liveIn = promptEstimate;
     let liveOut = 0;
-    let cumSent = 0;
     const bumpOut = (delta: string) => {
       liveOut += estimateTokens(delta);
       spinner.setTokens(liveIn, liveOut);
@@ -529,10 +529,6 @@ export class App {
             liveIn = usage.prompt_tokens;
             liveOut = usage.completion_tokens;
             spinner.setTokens(liveIn, liveOut);
-            // Cumulative estimate of what runAgent will have sent by the time
-            // this turn finishes, so the contrast with the sum below shows
-            // how much of the bill is re-sending vs. fresh content.
-            if (process.env.TRCODE_DEBUG) cumSent += usage.prompt_tokens;
           },
           onAssistantMessage: () => stopStream(),
         },
@@ -542,13 +538,13 @@ export class App {
       this.session.save();
       this.statusLine(Date.now() - started, result.steps, result.stoppedBecause);
       if (process.env.TRCODE_DEBUG) {
-        const t = this.usage.lastTurn;
+        const t = this.usage.turnTotals();
+        const per = t.requests ? Math.round(t.input / t.requests) : 0;
         padded(
           c.gray(
-            `debug: sent total ↑${fmtTokens(cumSent)} across ${result.steps} step(s) · ` +
-              `last request ↑${fmtTokens(t.input)} · history est. ${fmtTokens(
-                contextPressure(this.session, this.catalog).used,
-              )} (${this.session.messages.length} msgs)`,
+            `debug: ~${fmtTokens(per)} per request · last ↑${fmtTokens(this.usage.lastTurn.input)} · ` +
+              `history est. ${fmtTokens(contextPressure(this.session, this.catalog).used)} ` +
+              `(${this.session.messages.length} msgs)`,
           ),
         );
       }
@@ -585,14 +581,21 @@ export class App {
 
   /** Per-turn footer. Context share and session total live under the input. */
   statusLine(elapsedMs: number, steps: number, stopped: string): void {
-    const t = this.usage.lastTurn;
+    const t = this.usage.turnTotals();
     const effort = this.effort();
 
     const ignored = modelRejectsEffort(this.session.model);
+    // Input is the sum over every request of the turn, not the last one: with
+    // several steps the last request is a fraction of what was actually sent.
+    const sent =
+      `${c.gray("↑")}${fmtTokens(t.input)}` +
+      (t.requests > 1 ? c.gray(` in ${t.requests} requests`) : "") +
+      (t.cached ? c.gray(` · ${fmtTokens(t.cached)} cached`) : "");
+
     const bits = [
       c.brightYellow(this.session.model) +
         (effort === "off" || ignored ? "" : c.gray(":") + c.brightMagenta(effort)),
-      `${c.gray("↑")}${fmtTokens(t.input)} ${c.gray("↓")}${fmtTokens(t.output)}` +
+      `${sent} ${c.gray("↓")}${fmtTokens(t.output)}` +
         // Thinking is billed as output; without this the number looks absurd.
         (t.reasoning ? c.gray(` · ${fmtTokens(t.reasoning)} of it reasoning`) : ""),
       c.gray(`${steps} ${plural(steps, "step", "steps")}`),

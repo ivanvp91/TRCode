@@ -5,12 +5,15 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
+import fs from "node:fs";
+import os from "node:os";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const PORT = Number(process.env.MOCK_PORT || 8877);
 
 const SUITES = [
   "protocol-test.mjs",
+  "cache-test.mjs",
   "editor-harness.mjs",
   "paste-test.mjs",
   "newline-test.mjs",
@@ -40,9 +43,17 @@ function run(file, env) {
   });
 }
 
+// Suites that assert on what actually reached the wire read this back.
+const MOCK_LOG = path.join(os.tmpdir(), `trc-mock-${process.pid}.log`);
+try {
+  fs.rmSync(MOCK_LOG, { force: true });
+} catch {
+  /* nothing to clear */
+}
+
 const mock = spawn(process.execPath, [path.join(here, "mock-server.mjs")], {
   stdio: "ignore",
-  env: { ...process.env, MOCK_PORT: String(PORT) },
+  env: { ...process.env, MOCK_PORT: String(PORT), MOCK_LOG },
 });
 await new Promise((r) => setTimeout(r, 1200));
 
@@ -52,6 +63,7 @@ const env = {
   TOKENROUTER_BASE_URL: `http://127.0.0.1:${PORT}/v1`,
   TOKENROUTER_API_KEY: "sk-test",
   TRCODE_MODEL: "mock-smart",
+  MOCK_LOG,
 };
 
 let failed = 0;
@@ -64,5 +76,6 @@ for (const suite of SUITES) {
 }
 
 mock.kill("SIGKILL");
+try { fs.rmSync(MOCK_LOG, { force: true }); } catch {}
 console.log(failed ? `\n${failed} suite(s) failed` : `\nall ${SUITES.length} suites passed`);
 process.exit(failed ? 1 : 0);

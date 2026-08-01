@@ -3,11 +3,24 @@
  * and streams a two-step conversation: first a tool call, then a text answer.
  */
 import http from "node:http";
+import fs from "node:fs";
+
+/** Request log: to stdout, and to MOCK_LOG when a test needs to read it back. */
+function log(lineText) {
+  process.stdout.write(lineText);
+  if (process.env.MOCK_LOG) {
+    try { fs.appendFileSync(process.env.MOCK_LOG, lineText); } catch {}
+  }
+}
 
 const MODELS = [
   { id: "mock-smart", owned_by: "mock", context_window: 200000, pricing: { input: 1.5, output: 6 } },
   { id: "mock-fast", owned_by: "mock", context_window: 128000, pricing: { input: 0.2, output: 0.8 } },
   { id: "mock-noeffort", owned_by: "mock", context_window: 64000 },
+  // Speaks /v1/messages: exercises the Anthropic adapter and prompt caching.
+  { id: "mock-claude", owned_by: "mock", context_window: 200000, supported_endpoint_types: ["anthropic"] },
+  // Same, but its host strips cache_control and 400s on it.
+  { id: "mock-nocache", owned_by: "mock", context_window: 200000, supported_endpoint_types: ["anthropic"] },
 ];
 
 function sse(res, obj) {
@@ -41,8 +54,10 @@ const server = http.createServer((req, res) => {
     const payload = JSON.parse(body || "{}");
     const messages = payload.messages ?? [];
 
+    if (req.url.endsWith("/messages")) return anthropic(payload, res);
+
     // Visible to the test: what reasoning params actually arrived.
-    process.stdout.write(
+    log(
       `REQ model=${payload.model} reasoning_effort=${payload.reasoning_effort ?? "-"} ` +
         `reasoning=${payload.reasoning ? JSON.stringify(payload.reasoning) : "-"}\n`,
     );
@@ -139,6 +154,50 @@ const server = http.createServer((req, res) => {
     res.end();
   });
 });
+
+/**
+ * Anthropic Messages endpoint. Reports what it saw so the test can assert on
+ * caching, and lets `mock-nocache` reject cache_control the way a proxy that
+ * does not forward the field would.
+ */
+function anthropic(payload, res) {
+  const raw = JSON.stringify(payload);
+  const asked = raw.includes('"cache_control"');
+  log(`ANTHROPIC model=${payload.model} cache=${asked ? "yes" : "no"}\n`);
+
+  if (asked && payload.model === "mock-nocache") {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "Unexpected field: cache_control" } }));
+    return;
+  }
+
+  const cached = asked ? 900 : 0;
+  if (payload.stream === false) {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(
+      JSON.stringify({
+        type: "message",
+        role: "assistant",
+        content: [{ type: "text", text: "Готово." }],
+        stop_reason: "end_turn",
+        usage: { input_tokens: 1000, cache_read_input_tokens: cached, output_tokens: 12 },
+      }),
+    );
+    return;
+  }
+
+  const events = [
+    ["message_start", { type: "message_start", message: { usage: { input_tokens: 1000, cache_read_input_tokens: cached } } }],
+    ["content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text" } }],
+    ["content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Готово." } }],
+    ["content_block_stop", { type: "content_block_stop", index: 0 }],
+    ["message_delta", { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 12 } }],
+    ["message_stop", { type: "message_stop" }],
+  ];
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+  for (const [name, data] of events) res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
+  res.end();
+}
 
 const port = Number(process.env.MOCK_PORT || 8787);
 server.listen(port, "127.0.0.1", () => {

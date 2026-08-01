@@ -75,6 +75,43 @@ ok("anthropic: max_tokens больше бюджета", aBudget.max_tokens > aBu
 const aOff = buildAnthropicBody({ model: "anthropic/claude-opus-5", messages: history, effort: "high", thinkingForm: "none" }, true);
 ok("anthropic: форма none снимает thinking", aOff.thinking === undefined && aOff.output_config === undefined);
 
+// ── prompt caching (anthropic asks for it explicitly or gets nothing) ─────
+{
+  // Small history: a breakpoint below the provider minimum only costs the 25%
+  // cache-write surcharge, so it must not be sent at all.
+  const small = buildAnthropicBody(
+    { model: "anthropic/claude-opus-5", messages: history, tools: [{ name: "read", description: "d", parameters: {} }] },
+    true,
+  );
+  ok("кэш: короткая история — без breakpoint", typeof small.system === "string" && !JSON.stringify(small).includes("cache_control"));
+
+  const long = [
+    { role: "system", content: "СИСТЕМА " + "и".repeat(4000) },
+    { role: "user", content: "прочитай файл" },
+    { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c1", name: "read", content: "x".repeat(9000) },
+    { role: "user", content: "продолжай" },
+  ];
+  const cached = buildAnthropicBody(
+    { model: "anthropic/claude-opus-5", messages: long, tools: [{ name: "read", description: "d", parameters: {} }, { name: "edit", description: "d", parameters: {} }] },
+    true,
+  );
+  ok("кэш: system блоком с cache_control", Array.isArray(cached.system) && cached.system[0]?.cache_control?.type === "ephemeral", JSON.stringify(cached.system).slice(0, 80));
+  ok("кэш: breakpoint на последнем инструменте", cached.tools.at(-1)?.cache_control?.type === "ephemeral" && cached.tools[0]?.cache_control === undefined);
+  const lastMsg = cached.messages.at(-1);
+  ok("кэш: breakpoint в конце истории", lastMsg.content.at(-1)?.cache_control?.type === "ephemeral", JSON.stringify(lastMsg).slice(0, 90));
+  ok("кэш: ранние сообщения не помечены", cached.messages[0].content.every((b) => b.cache_control === undefined));
+  ok("кэш: cache:false отключает", !JSON.stringify(buildAnthropicBody({ model: "anthropic/claude-opus-5", messages: long, cache: false }, true)).includes("cache_control"));
+  // The breakpoint must be the only difference, or the prefix it caches moves.
+  const a1 = buildAnthropicBody({ model: "anthropic/claude-opus-5", messages: long, cache: false }, true);
+  const a2 = buildAnthropicBody({ model: "anthropic/claude-opus-5", messages: long }, true);
+  ok(
+    "кэш: тело не меняется, кроме пометок",
+    JSON.stringify(a2).replace(/,?"cache_control":\{"type":"ephemeral"\}/g, "").replace(/"system":\[\{"type":"text","text":(".*?")\}\]/, '"system":$1') ===
+      JSON.stringify(a1),
+  );
+}
+
 const ap = new AnthropicStreamParser();
 ap.handle({ type: "message_start", message: { usage: { input_tokens: 250 } } });
 ap.handle({ type: "content_block_start", index: 0, content_block: { type: "text" } });
@@ -107,9 +144,16 @@ ok("трим: сообщения не потеряны", trimmed.messages.length
 ok("трим: роли и id сохранены", trimmed.messages.every((m, i) => m.role === big[i].role && m.tool_call_id === big[i].tool_call_id));
 const lastTool = trimmed.messages.filter((m) => m.role === "tool").at(-1);
 ok("трим: свежий результат не тронут", lastTool.content.length === 20000, `${lastTool.content.length}`);
-// Trimming persists into the stored history on purpose: stubbing only the wire
-// copy would rebuild a different request on every step and defeat the cache.
-ok("трим: история обновлена in-place", big.filter((m) => m.role === "tool")[0].content.length < 20000);
+// Only the wire copy is shortened; the session keeps the full output so
+// /resume and /compact still see what actually happened.
+ok("трим: сохранённая история не тронута", big.filter((m) => m.role === "tool")[0].content.length === 20000);
+ok("трим: на проводе — заглушка", trimmed.messages.filter((m) => m.role === "tool")[0].content.length < 20000);
+// The stub must be byte-identical between steps, or the cached prefix moves.
+const again = trimForRequest(big, { budget: 20000, keepRecent: 8 });
+ok(
+  "трим: заглушка детерминированна",
+  JSON.stringify(again.messages) === JSON.stringify(trimmed.messages),
+);
 
 let failed = 0;
 for (const t of results) {

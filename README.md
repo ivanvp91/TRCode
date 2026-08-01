@@ -154,10 +154,11 @@ opening the group, so calls never read as another paragraph of the message:
        └ ok
 ```
 
-After a turn, only that turn — nothing already shown under the input is repeated:
+After a turn, only that turn — nothing already shown under the input is repeated. The
+input figure covers every request the turn made, not just the last one:
 
 ```
-   moonshotai/kimi-k3:high · ↑1.5k ↓40 · 2 steps · 12s
+   moonshotai/kimi-k3:high · ↑48k in 4 requests · 31k cached ↓1.2k · 4 steps · 1m 12s
 ```
 
 The chat area has margins (narrow on the left, wider on the right); on a narrow terminal
@@ -264,9 +265,38 @@ So compaction also triggers on an absolute threshold: twice `maxRequestTokens`.
 
 `/compact` compacts on demand; `/cost` shows where the tokens went.
 
+The third safeguard is the provider's prompt cache. On the OpenAI path it applies by
+itself; on the **Anthropic** path nothing is cached unless the request says where, so
+`trcode` marks the system prompt, the tool schemas and the end of the history as cache
+breakpoints. Measured against the live API with a 4.8k-token prompt:
+
+| Request | Input | Of it cached |
+|---|---|---|
+| first | 4834 | 0 |
+| identical repeat, `promptCache: false` | 4834 | 0 |
+| identical repeat, default | 4834 | **4832** |
+
+Two things follow from that, and both are implemented: the workspace listing in the
+system prompt is snapshotted per directory (creating one file used to rewrite the prefix
+and miss the cache for the rest of the session), and trimming shortens only the copy that
+goes on the wire, byte-for-byte the same on every step. If a host rejects `cache_control`,
+the first 400 is caught, the field is dropped and the request is retried once — set
+`"promptCache": false` to skip even that probe.
+
 Reasoning tokens are counted separately, because they bill as **output**: a three-line
 answer can carry 25k tokens of thinking at `high`. If more than half the output is
 reasoning, `/cost` says so and suggests lowering `/effort`.
+
+The per-turn line reports what the **whole turn** sent, not the last request — with ten
+tool rounds the last request is a fraction of the bill:
+
+```
+   moonshotai/kimi-k3:high · ↑61k in 4 requests · 48k cached ↓3.8k · 1.4k of it reasoning · 4 steps · 18m 42s
+```
+
+`/cost` breaks the same numbers down per model, with an average per request and a cached
+column — a flat zero there on an Anthropic model means the prefix keeps moving or the
+host is dropping the field.
 
 ## Models
 
@@ -450,6 +480,7 @@ Prices are not published either, so no money is shown anywhere — only tokens.
   "requestTimeoutMs": 300000,
   "maxSteps": 60,
   "autoCompactAt": 0.82,
+  "promptCache": true,
   "temperature": 0.2
 }
 ```
@@ -463,13 +494,13 @@ npm test
 ```
 
 ```
-PASS  protocol-test.mjs      36/36     PASS  repaint-test.mjs    5/5
-PASS  editor-harness.mjs     11/11     PASS  menu-test.mjs
-PASS  paste-test.mjs         9/9       PASS  resume-test.mjs     39/39
-PASS  newline-test.mjs       13/13     PASS  turnbar-test.mjs    21/21
-PASS  history-test.mjs       9/9       PASS  transcript-test.mjs 8/8
-PASS  focus-test.mjs         8/8       PASS  keyscan-test.mjs    6/6
-                                       PASS  shutdown-test.mjs   8/8
+PASS  protocol-test.mjs      45/45     PASS  repaint-test.mjs    5/5
+PASS  cache-test.mjs         8/8       PASS  menu-test.mjs
+PASS  editor-harness.mjs     11/11     PASS  resume-test.mjs     39/39
+PASS  paste-test.mjs         9/9       PASS  turnbar-test.mjs    21/21
+PASS  newline-test.mjs       13/13     PASS  transcript-test.mjs 8/8
+PASS  history-test.mjs       9/9       PASS  keyscan-test.mjs    6/6
+PASS  focus-test.mjs         8/8       PASS  shutdown-test.mjs   8/8
 ```
 
 The suites cover the wire protocols and history trimming, plus the terminal behaviour that

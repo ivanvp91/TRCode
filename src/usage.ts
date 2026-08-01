@@ -13,8 +13,24 @@ export interface ModelUsage {
   priceUnknown: boolean;
 }
 
+export interface TurnTotals {
+  requests: number;
+  input: number;
+  cached: number;
+  output: number;
+  reasoning: number;
+}
+
+const zeroTurn = (): TurnTotals => ({ requests: 0, input: 0, cached: 0, output: 0, reasoning: 0 });
+
 export class UsageTracker {
   private byModel = new Map<string, ModelUsage>();
+  /**
+   * Everything sent since beginTurn(). An agent loop re-sends the history on
+   * every step, so the last request says almost nothing about what a turn
+   * cost — with ten steps the real bill is an order of magnitude larger.
+   */
+  private turn: TurnTotals = zeroTurn();
   /** Last request only — what the status line shows after each turn. */
   lastTurn: { input: number; output: number; reasoning: number; costUsd: number; priceUnknown: boolean } = {
     input: 0,
@@ -61,10 +77,33 @@ export class UsageTracker {
       costUsd: cost,
       priceUnknown: !price,
     };
+
+    this.turn.requests++;
+    this.turn.input += usage.prompt_tokens;
+    this.turn.cached += cached;
+    this.turn.output += usage.completion_tokens;
+    this.turn.reasoning += usage.reasoning_tokens ?? 0;
+  }
+
+  /** Starts a new per-turn tally. */
+  beginTurn(): void {
+    this.turn = zeroTurn();
+  }
+
+  turnTotals(): TurnTotals {
+    return { ...this.turn };
   }
 
   /** Merges a subagent's tracker into this one. */
   absorb(other: UsageTracker): void {
+    // A subagent's requests are part of this turn's bill too.
+    const t = other.turnTotals();
+    this.turn.requests += t.requests;
+    this.turn.input += t.input;
+    this.turn.cached += t.cached;
+    this.turn.output += t.output;
+    this.turn.reasoning += t.reasoning;
+
     for (const u of other.all()) {
       const entry = this.byModel.get(u.model) ?? {
         model: u.model,

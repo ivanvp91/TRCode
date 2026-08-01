@@ -42,6 +42,22 @@ export function modelRejectsEffort(model: string): boolean {
   return effortForm.get(model) === "none";
 }
 
+/**
+ * Hosts that answer 400 to `cache_control`. A proxy in front of Anthropic may
+ * not pass the field through, and one rejected request is enough to learn it —
+ * for the rest of the process we send the same body without breakpoints.
+ */
+const cacheRejected = new Set<string>();
+
+export function modelRejectsCache(model: string): boolean {
+  return cacheRejected.has(model);
+}
+
+/** True when the failure is specifically about the cache field. */
+function isCacheComplaint(err: ApiError): boolean {
+  return err.status === 400 && /cache_control|cache_creation|ephemeral/i.test(err.body ?? err.message);
+}
+
 /** Current form for a model, defaulting to the first one we try. */
 function ladderFor(model: string): EffortForm[] {
   return EFFORT_LADDER[protocolFor(model)] ?? EFFORT_LADDER.openai;
@@ -237,6 +253,12 @@ async function postChat(req: ChatRequest, stream: boolean): Promise<Response> {
     try {
       return await postWithRetry(path, buildBodyFor(req, stream), req.signal);
     } catch (err) {
+      // A host that does not understand cache breakpoints: drop them and go
+      // on. Costs one round-trip once per model, never a failed turn.
+      if (err instanceof ApiError && isCacheComplaint(err) && !cacheRejected.has(req.model)) {
+        cacheRejected.add(req.model);
+        continue;
+      }
       const form = formFor(req.model);
       const worthRetrying =
         err instanceof ApiError &&
@@ -284,6 +306,7 @@ function buildBodyFor(req: ChatRequest, stream: boolean): Record<string, unknown
         thinkingForm: form === "budget" ? "budget" : form === "none" ? "none" : "adaptive",
         maxTokens: req.maxTokens ?? cfg.maxTokens,
         temperature: req.temperature ?? cfg.temperature,
+        cache: cfg.promptCache !== false && !cacheRejected.has(req.model),
       },
       stream,
     );
