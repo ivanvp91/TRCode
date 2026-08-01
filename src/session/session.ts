@@ -67,7 +67,17 @@ export class Session {
     return path.join(sessionsDir(this.cwd), `${this.id}.json`);
   }
 
+  /** Renames the session; an empty title falls back to the derived one. */
+  rename(title: string): void {
+    this.title = title.trim().slice(0, 120);
+    if (this.messages.length) this.save();
+  }
+
   save(): void {
+    // A session with nothing in it is not worth a file: /new, a start with no
+    // prompt and every exit used to leave one behind, and the list filled up
+    // with dead entries nobody could tell apart.
+    if (!this.messages.length) return;
     const payload: SessionFile = {
       meta: {
         id: this.id,
@@ -122,14 +132,53 @@ export class Session {
     for (const n of names) {
       try {
         const data = JSON.parse(fs.readFileSync(path.join(dir, n), "utf8")) as SessionFile;
+        const messages = data.messages ?? [];
         // Recompute rather than trust the stored count: files written by an
         // older build have no `tokens` field at all.
-        if (data?.meta?.id) metas.push({ ...data.meta, tokens: historyTokens(data.messages ?? []) });
+        if (!data?.meta?.id || !messages.length) continue;
+        metas.push({ ...data.meta, messageCount: messages.length, tokens: historyTokens(messages) });
       } catch {
         /* skip corrupt files */
       }
     }
     return metas.sort((a, b) => b.updatedAt - a.updatedAt).slice(0, limit);
+  }
+
+  /** Removes a session file. Returns false when there was nothing to remove. */
+  static remove(cwd: string, id: string): boolean {
+    try {
+      fs.unlinkSync(path.join(sessionsDir(cwd), `${id}.json`));
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Deletes files left behind by earlier builds that saved empty sessions.
+   * Only files with no messages at all — there is nothing in them to lose.
+   */
+  static pruneEmpty(cwd: string): number {
+    const dir = sessionsDir(cwd);
+    let removed = 0;
+    let names: string[];
+    try {
+      names = fs.readdirSync(dir).filter((n) => n.endsWith(".json"));
+    } catch {
+      return 0;
+    }
+    for (const n of names) {
+      const file = path.join(dir, n);
+      try {
+        const data = JSON.parse(fs.readFileSync(file, "utf8")) as SessionFile;
+        if ((data.messages ?? []).length) continue;
+        fs.unlinkSync(file);
+        removed++;
+      } catch {
+        /* leave anything unreadable alone */
+      }
+    }
+    return removed;
   }
 
   static latest(cwd: string): Session | null {

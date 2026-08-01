@@ -76,7 +76,7 @@ insert, Esc to dismiss. `/help` prints the full reference.
 | `/yolo [on\|off]` | skip confirmations — tools run immediately |
 | `/new` | start a new session |
 
-**Session** — `/sessions`, `/resume [id]`, `/context`, `/cost`
+**Session** — `/sessions`, `/resume [id]`, `/rename [title]`, `/context`, `/cost`
 
 **Settings** — `/default [name]`, `/models [all]`, `/aliases`, `/permissions`, `/login`, `/config`, `/cwd`
 
@@ -140,9 +140,9 @@ the right margin collapses rather than squeezing the text.
 
 ## Resuming a session
 
-Sessions are stored per project. `/sessions` lists them; `/resume` opens the picker, and
-every row says how much context that session carries — the number that decides what the
-next turn will cost. It turns yellow past half the window and red past 80%.
+Sessions are stored per project. `/resume` opens the picker, and every row says how much
+context that session carries — the number that decides what the next turn will cost. It
+turns yellow past half the window and red past 80%.
 
 ```
    Pick a session
@@ -150,6 +150,9 @@ next turn will cost. It turns yellow past half the window and red past 80%.
    ❯ pricing analysis                        ~184k/1M  18%   64 msgs  2h ago
      editor rewrite                           ~11k/1M   1%    5 msgs  3d ago
 ```
+
+A session with no messages is never written and never listed; files left by earlier
+builds are cleaned up at startup.
 
 Choosing one does not commit you to it. A card shows the size, then three buttons:
 
@@ -185,6 +188,21 @@ digest as a labelled block instead of raw XML:
    Free    │ 0     │ 3        │ 5 min
    Starter │ 9.99  │ 10       │ 30 sec
 ```
+
+`/sessions` is the same list with four actions instead of two — **Continue · Rename ·
+Delete · Compact**, Esc to go back:
+
+```
+   quick question
+   202608011429-557db8 · moonshotai/kimi-k3 · 12 messages
+   ░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░  ~2.1k of 1M tokens (0%)
+
+    Continue   [Rename]  [Delete]  [Compact]   ←/→ · Enter to confirm · Esc back to the list
+```
+
+Deleting asks for confirmation and refuses to remove the session you are currently in.
+`/rename [title]` renames the open session — without an argument it prompts, prefilled
+with the current title.
 
 `-c/--continue` reopens the most recent session directly, `-r/--resume <id>` a specific
 one.
@@ -422,7 +440,7 @@ npm test
 ```
 PASS  protocol-test.mjs      36/36     PASS  repaint-test.mjs    5/5
 PASS  editor-harness.mjs     11/11     PASS  menu-test.mjs
-PASS  paste-test.mjs         9/9       PASS  resume-test.mjs     26/26
+PASS  paste-test.mjs         9/9       PASS  resume-test.mjs     39/39
 PASS  newline-test.mjs       13/13     PASS  keyscan-test.mjs    6/6
 PASS  history-test.mjs       9/9       PASS  shutdown-test.mjs   8/8
 PASS  focus-test.mjs         8/8
@@ -480,6 +498,7 @@ src/
     layout.ts          chat geometry and time formatting
     picker.ts          list picker with tabs and sections
     choice.ts          button row for confirmations
+    prompt.ts          one-line text prompt (rename)
     keyscan.ts         /keys inspector
 ```
 

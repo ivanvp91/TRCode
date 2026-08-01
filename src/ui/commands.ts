@@ -3,11 +3,12 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { c } from "./ansi.js";
 import { contentWidth, fmtAgo } from "./layout.js";
-import { error, info, line, padded, renderMarkdownBlock, rule, Spinner, success, truncate, warn } from "./render.js";
+import { error, info, line, padded, plural, renderMarkdownBlock, rule, Spinner, success, truncate, warn } from "./render.js";
 import { pick, type PickerItem } from "./picker.js";
 import { choose } from "./choice.js";
 import { pickModel } from "./modelpicker.js";
 import { askSecret } from "./secret.js";
+import { askLine } from "./prompt.js";
 import { scanKeys } from "./keyscan.js";
 import { setExtraNewlineKeys } from "./editor.js";
 import { loadConfig, saveConfig, configPath, VERSION, EFFORT_LEVELS, type Effort } from "../config.js";
@@ -99,7 +100,7 @@ function sessionCard(app: App, s: Session): void {
   line();
   padded(c.bold(truncate(s.title || "(untitled)", contentWidth() - 2)));
   padded(
-    c.gray(`${s.id} · ${s.model} · ${s.messages.length} messages`) +
+    c.gray(`${s.id} · ${s.model} · ${s.messages.length} ${plural(s.messages.length, "message", "messages")}`) +
       (s.compactions ? c.gray(` · compacted ${s.compactions}×`) : ""),
   );
   padded(
@@ -111,6 +112,136 @@ function sessionCard(app: App, s: Session): void {
   );
   if (pct >= 50) padded(c.gray("Compacting first frees room and cuts what every later turn costs."));
   line();
+}
+
+/** Adopts a loaded session as the current one. */
+function adoptSession(app: App, loaded: Session): void {
+  app.session.save();
+  app.session = loaded;
+  app.usage = loaded.usage;
+  app.readFiles.clear();
+  app.rebuildTools();
+}
+
+type SessionAction = "open" | "compact" | "rename" | "delete" | "cancel";
+
+/** `/resume <id>`: card, three buttons, no list to fall back to. */
+async function openSession(app: App, id: string): Promise<void> {
+  const loaded = Session.load(app.cwd, id);
+  if (!loaded) return error(`Session not found: ${id}`);
+  sessionCard(app, loaded);
+  const action = await choose<SessionAction>(
+    [
+      { value: "open", label: "Continue as is", key: "c" },
+      { value: "compact", label: "Compact and continue", key: "k", tone: "warn" },
+      { value: "cancel", label: "Cancel", key: "b", tone: "danger" },
+    ],
+    { initial: "open", fallback: "cancel" },
+  );
+  if (action === "cancel") return;
+  adoptSession(app, loaded);
+  if (action === "compact") await compactNow(app, "", false);
+  success(`Restored ${loaded.id} — ${loaded.messages.length} ${plural(loaded.messages.length, "message", "messages")}, model ${loaded.model}`);
+  app.replayHistory();
+}
+
+/**
+ * The session list. `resume` mode is about getting back into one; `manage` mode
+ * adds renaming and deleting. Both loop, so every "no" lands back on the list
+ * instead of dropping the user at the prompt.
+ */
+async function browseSessions(app: App, mode: "resume" | "manage"): Promise<void> {
+  for (;;) {
+    const metas = Session.list(app.cwd);
+    if (!metas.length) return info("No saved sessions.");
+
+    // Nothing to interact with when input is piped — print and be done.
+    if (!process.stdin.isTTY) {
+      line();
+      for (const m of metas) {
+        const { tokens, pct, tint } = sessionFill(app, m);
+        padded(
+          `${m.id === app.session.id ? c.brightCyan("❯ ") : "  "}${c.bold(m.id)}  ` +
+            `${c.gray(new Date(m.updatedAt).toLocaleString())}  ${c.dim(String(m.messageCount).padStart(3) + " msgs")}  ` +
+            `${tint(`~${fmtTokens(tokens)}`.padStart(7) + ` ${String(pct).padStart(3)}%`)}  ${truncate(m.title, 40)}`,
+        );
+      }
+      line();
+      return;
+    }
+
+    const chosen = await pick({
+      title: mode === "manage" ? "Sessions" : "Pick a session",
+      items: metas.map((m) => sessionItem(app, m)),
+      initial: app.session.id,
+    });
+    if (!chosen) return;
+
+    const loaded = Session.load(app.cwd, chosen);
+    if (!loaded) {
+      error(`Session not found: ${chosen}`);
+      continue;
+    }
+    sessionCard(app, loaded);
+
+    const action =
+      mode === "manage"
+        ? await choose<SessionAction>(
+            [
+              { value: "open", label: "Continue", key: "c" },
+              { value: "rename", label: "Rename", key: "r" },
+              { value: "delete", label: "Delete", key: "d", tone: "danger" },
+              { value: "compact", label: "Compact", key: "k", tone: "warn" },
+            ],
+            { initial: "open", fallback: "cancel", hint: "←/→ · Enter to confirm · Esc back to the list" },
+          )
+        : await choose<SessionAction>(
+            [
+              { value: "open", label: "Continue as is", key: "c" },
+              { value: "compact", label: "Compact and continue", key: "k", tone: "warn" },
+              { value: "cancel", label: "Back to the list", key: "b", tone: "danger" },
+            ],
+            { initial: "open", fallback: "cancel" },
+          );
+
+    if (action === "cancel") continue;
+
+    if (action === "rename") {
+      const title = await askLine("New title:", loaded.title);
+      if (title !== null) {
+        loaded.rename(title);
+        // The same session may be open right now; keep both copies in step.
+        if (loaded.id === app.session.id) app.session.title = loaded.title;
+        success(`Renamed to: ${loaded.title || "(untitled)"}`);
+      }
+      continue;
+    }
+
+    if (action === "delete") {
+      if (loaded.id === app.session.id) {
+        warn("This is the session you are in — switch with /new first.");
+        continue;
+      }
+      const sure = await choose<"yes" | "no">(
+        [
+          { value: "no", label: "Keep", key: "n" },
+          { value: "yes", label: `Delete ${loaded.messages.length} ${plural(loaded.messages.length, "message", "messages")}`, key: "y", tone: "danger" },
+        ],
+        { initial: "no", fallback: "no" },
+      );
+      if (sure === "yes") {
+        if (Session.remove(app.cwd, loaded.id)) success(`Deleted ${loaded.id}`);
+        else error(`Could not delete ${loaded.id}`);
+      }
+      continue;
+    }
+
+    adoptSession(app, loaded);
+    if (action === "compact") await compactNow(app, "", false);
+    success(`Restored ${loaded.id} — ${loaded.messages.length} ${plural(loaded.messages.length, "message", "messages")}, model ${loaded.model}`);
+    app.replayHistory();
+    return;
+  }
 }
 
 /**
@@ -320,23 +451,10 @@ const COMMANDS: Command[] = [
   {
     name: "/sessions",
     group: "session",
-    help: "sessions for this project",
+    args: "",
+    help: "browse, rename, delete or compact saved sessions",
     async run(app) {
-      const metas = Session.list(app.cwd);
-      if (!metas.length) return info("No saved sessions.");
-      line();
-      for (const m of metas) {
-        const cur = m.id === app.session.id ? c.brightCyan("❯ ") : "  ";
-        const { tokens, pct, tint } = sessionFill(app, m);
-        padded(
-          `${cur}${c.bold(m.id)}  ${c.gray(new Date(m.updatedAt).toLocaleString())}  ` +
-            `${c.dim(String(m.messageCount).padStart(3) + " msgs")}  ` +
-            `${tint(`~${fmtTokens(tokens)}`.padStart(7) + ` ${String(pct).padStart(3)}%`)}  ` +
-            `${truncate(m.title, 40)}`,
-        );
-      }
-      line();
-      padded(c.gray("Restore with: /resume <id>, or /resume to pick from the list"));
+      await app.exclusiveInput(() => browseSessions(app, "manage"));
     },
   },
   {
@@ -345,52 +463,21 @@ const COMMANDS: Command[] = [
     args: "[id]",
     help: "restore a session",
     async run(app, rest) {
-      const explicit = rest.trim();
-      await app.exclusiveInput(async () => {
-        // Loops so "back to the list" from the action prompt really goes back.
-        for (;;) {
-          let id = explicit;
-          if (!id) {
-            const metas = Session.list(app.cwd);
-            if (!metas.length) return info("No saved sessions.");
-            const chosen = await pick({
-              title: "Pick a session",
-              items: metas.map((m) => sessionItem(app, m)),
-              initial: app.session.id,
-            });
-            if (!chosen) return;
-            id = chosen;
-          }
-
-          const loaded = Session.load(app.cwd, id);
-          if (!loaded) return error(`Session not found: ${id}`);
-
-          sessionCard(app, loaded);
-          const action = await choose<"open" | "compact" | "cancel">(
-            [
-              { value: "open", label: "Continue as is", key: "c" },
-              { value: "compact", label: "Compact and continue", key: "k", tone: "warn" },
-              { value: "cancel", label: explicit ? "Cancel" : "Back to the list", key: "b", tone: "danger" },
-            ],
-            { initial: "open", fallback: "cancel" },
-          );
-          if (action === "cancel") {
-            if (explicit) return;
-            continue;
-          }
-
-          app.session.save();
-          app.session = loaded;
-          app.usage = loaded.usage;
-          app.readFiles.clear();
-          app.rebuildTools();
-
-          if (action === "compact") await compactNow(app, "", false);
-          success(`Restored ${loaded.id} — ${loaded.messages.length} messages, model ${loaded.model}`);
-          if (loaded.messages.length) app.replayHistory();
-          return;
-        }
-      });
+      const id = rest.trim();
+      await app.exclusiveInput(() => (id ? openSession(app, id) : browseSessions(app, "resume")));
+    },
+  },
+  {
+    name: "/rename",
+    group: "session",
+    args: "[title]",
+    help: "rename the current session",
+    async run(app, rest) {
+      const given = rest.trim();
+      const title = given || (await app.exclusiveInput(() => askLine("New title:", app.session.title)));
+      if (title === null) return;
+      app.session.rename(title);
+      success(`Renamed to: ${app.session.title || "(untitled)"}`);
     },
   },
   {
@@ -406,7 +493,7 @@ const COMMANDS: Command[] = [
       padded(c.brightCyan("█".repeat(filled)) + c.gray("░".repeat(barWidth - filled)) + ` ${Math.round(ratio * 100)}%`);
       padded(
         c.gray(
-          `~${fmtTokens(used)} of ${fmtTokens(window)} tokens · ${app.session.messages.length} messages` +
+          `~${fmtTokens(used)} of ${fmtTokens(window)} tokens · ${app.session.messages.length} ${plural(app.session.messages.length, "message", "messages")}` +
             (app.session.compactions ? ` · compactions: ${app.session.compactions}` : ""),
         ),
       );

@@ -81,6 +81,7 @@ export class App {
   }
 
   async init(): Promise<void> {
+    Session.pruneEmpty(this.cwd);
     this.catalog = await fetchModels();
     this.reconcileModel();
     this.rebuildTools();
@@ -325,7 +326,12 @@ export class App {
     );
     if (skipped) padded(c.gray(`${skipped} earlier ${plural(skipped, "prompt", "prompts")} folded away`));
 
-    for (const m of msgs.slice(from)) {
+    // The last answer is the one being continued from, so it is shown whole;
+    // earlier ones are capped only to keep the scrollback usable.
+    const lastAnswer = msgs.reduce((at, m, i) => (m.role === "assistant" && m.content ? i : at), -1);
+
+    for (const [at, m] of msgs.slice(from).entries()) {
+      const idx = from + at;
       if (m.meta?.hidden) continue;
 
       if (m.role === "user") {
@@ -342,7 +348,7 @@ export class App {
           }
           continue;
         }
-        for (const [i, l] of renderMarkdownBlock(text, { width: w - 2, maxLines: 8 }).entries()) {
+        for (const [i, l] of renderMarkdownBlock(text, { width: w - 2, maxLines: 12 }).entries()) {
           padded((i === 0 ? c.brightYellow("✦ ") : "  ") + c.bold(l));
         }
         continue;
@@ -352,7 +358,12 @@ export class App {
         if (m.content) {
           line();
           padded(c.brightMagenta("●") + " " + c.dim(m.meta?.model ?? this.session.model));
-          for (const l of renderMarkdownBlock(String(m.content), { width: w, maxLines: 14, dim: true })) {
+          // Same styling as a live answer — a replay that dims everything
+          // reads as if the formatting had been thrown away.
+          for (const l of renderMarkdownBlock(String(m.content), {
+            width: w,
+            maxLines: idx === lastAnswer ? 200 : 24,
+          })) {
             padded(l);
           }
         }

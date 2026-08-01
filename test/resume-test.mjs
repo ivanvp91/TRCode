@@ -88,6 +88,9 @@ const say = (s = "") => realWrite(s + "\n");
 const { Session } = await import("../dist/session/session.js");
 const { App } = await import("../dist/ui/repl.js");
 const { runCommand } = await import("../dist/ui/commands.js");
+const { renderMarkdownBlock } = await import("../dist/ui/render.js");
+const { width } = await import("../dist/ui/ansi.js");
+const { sessionsDir } = await import("../dist/config.js");
 
 const CWD = process.cwd();
 
@@ -97,7 +100,7 @@ const TABLE_ANSWER = `# Pricing review
 |---|---|---|---|
 | Free | 0 | 3 | 5 min |
 | Starter | 9.99 | 10 | 30 sec |
-| Trader | 19.99 | 25 | 15 sec |
+| Trader ⭐ | 19.99 | 25 | 15 sec |
 
 - The gap between Starter and Trader is too small.
 - **Prop vertical** is the only real differentiator.
@@ -269,6 +272,86 @@ function check(name, cond, detail = "") {
   check("history actually shrank", app.session.messages.length < 5, String(app.session.messages.length));
   check("session is marked compacted", app.session.compactions === 1, String(app.session.compactions));
   check("digest replaces the head", /compacted context/.test(text), text);
+}
+
+// ── 6. dead sessions never reach the list ───────────────────────────────────
+{
+  const dir = sessionsDir(CWD);
+  const ghost = new Session({ cwd: CWD, model: "moonshotai/kimi-k3", title: "ghost" });
+  ghost.save();
+  check("an empty session writes no file", !fs.existsSync(path.join(dir, `${ghost.id}.json`)));
+
+  // What older builds left behind: a file with a meta block and no messages.
+  const stale = path.join(dir, "20260101-dead01.json");
+  fs.writeFileSync(
+    stale,
+    JSON.stringify({
+      meta: { id: "20260101-dead01", title: "", cwd: CWD, model: "moonshotai/kimi-k3", createdAt: 1, updatedAt: 2, messageCount: 0 },
+      messages: [],
+      usage: [],
+    }),
+  );
+  check("list hides an empty session", !Session.list(CWD).some((m) => m.id === "20260101-dead01"));
+  const removed = Session.pruneEmpty(CWD);
+  check("pruneEmpty deletes it", removed >= 1 && !fs.existsSync(stale), String(removed));
+  check("pruneEmpty spares real sessions", fs.existsSync(path.join(dir, `${big.id}.json`)));
+}
+
+// ── 7. /sessions renames and deletes ────────────────────────────────────────
+{
+  const app = makeApp();
+  screen.reset();
+  const done = runCommand(app, "/sessions");
+  await sleep(60);
+  const list = screen.lines().map(strip).join("\n");
+  check("manage mode has its own title", /Sessions/.test(list), list);
+
+  for (const ch of "quick") await key(ch);
+  await key("\r");
+  const card = screen.lines().map(strip).join("\n");
+  check(
+    "four actions are offered",
+    /Continue/.test(card) && /Rename/.test(card) && /Delete/.test(card) && /Compact/.test(card),
+    card,
+  );
+
+  await key(ESC + "[C"); // → Rename
+  await key("\r");
+  await key(String.fromCharCode(21)); // Ctrl+U clears the prefilled title
+  for (const ch of "renamed session") await key(ch);
+  await key("\r");
+  await sleep(60);
+  check("rename lands on disk", Session.load(CWD, small.id)?.title === "renamed session", Session.load(CWD, small.id)?.title);
+
+  // Back on the list: pick it again and delete it.
+  for (const ch of "renamed") await key(ch);
+  await key("\r");
+  await key(ESC + "[C");
+  await key(ESC + "[C"); // → Delete
+  await key("\r");
+  const confirm = screen.lines().map(strip).join("\n");
+  check("delete asks first", /Keep/.test(confirm) && /Delete \d+ messages?/.test(confirm), confirm);
+  await key(ESC + "[C"); // → Delete N messages (Keep is preselected)
+  await key("\r");
+  await sleep(60);
+  check("delete removes the file", !fs.existsSync(path.join(sessionsDir(CWD), `${small.id}.json`)));
+
+  await key(ESC); // leave the list
+  await done;
+}
+
+// ── 8. wide characters do not shift columns ─────────────────────────────────
+{
+  check("an emoji counts as two cells", width("⭐") === 2, String(width("⭐")));
+  check("CJK counts as two cells", width("日本") === 4, String(width("日本")));
+  check("a variation selector counts as none", width("★️") === 1, String(width("★️")));
+
+  const rows = renderMarkdownBlock(
+    "| Plan | Note |\n|---|---|\n| Free | plain |\n| Trader ⭐ | starred |\n",
+    { width: 60 },
+  ).map(strip);
+  const bars = rows.filter((r) => r.includes("│")).map((r) => width(r.slice(0, r.indexOf("│"))));
+  check("every table row puts its bar in the same column", new Set(bars).size === 1, JSON.stringify(rows));
 }
 
 mock?.kill("SIGKILL");

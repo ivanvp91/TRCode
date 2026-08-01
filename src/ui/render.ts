@@ -1,5 +1,5 @@
 /** Transcript rendering: markdown-ish streaming, banners, spinners, diffs. */
-import { c, cursor, width } from "./ansi.js";
+import { c, cursor, cutToWidth, width } from "./ansi.js";
 import { PAD_LEFT, contentWidth, fmtDuration, fullWidth, indent, pad } from "./layout.js";
 
 export function out(s = ""): void {
@@ -130,7 +130,8 @@ export function truncate(s: string, max: number): string {
 export function clip(s: string, max: number): string {
   if (max <= 1) return "";
   const flat = s.replace(/\t/g, "  ").replace(/\r/g, "");
-  return width(flat) <= max ? flat : flat.slice(0, max - 1) + "…";
+  if (width(flat) <= max) return flat;
+  return cutToWidth(flat, max - 1).text + "…";
 }
 
 export function wrapText(text: string, w: number): string[] {
@@ -325,11 +326,15 @@ export function renderMarkdownBlock(text: string, opts: BlockOptions = {}): stri
   return outLines;
 }
 
-/** Pipe-table → aligned columns. Falls back to plain rows when it does not fit. */
+/**
+ * Pipe-table → aligned columns. Cells that do not fit wrap onto extra lines
+ * rather than being cut: in a replay the clipped-off half of a cell is content
+ * the user cannot get back by scrolling.
+ */
 function renderTable(rows: string[], w: number, dim?: boolean): string[] {
   const cells = rows
     .filter((r) => !TABLE_SEP.test(r))
-    .map((r) => r.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((x) => x.trim()));
+    .map((r) => r.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((x) => x.trim().replace(/`/g, "")));
   if (!cells.length) return [];
 
   const cols = Math.max(...cells.map((r) => r.length));
@@ -341,7 +346,7 @@ function renderTable(rows: string[], w: number, dim?: boolean): string[] {
   // " │ " between columns; shrink the widest column until the row fits.
   const gutters = (cols - 1) * 3;
   let total = widths.reduce((a, b) => a + b, 0) + gutters;
-  while (total > w && Math.max(...widths) > 6) {
+  while (total > w && Math.max(...widths) > 8) {
     const widest = widths.indexOf(Math.max(...widths));
     widths[widest]--;
     total--;
@@ -351,17 +356,20 @@ function renderTable(rows: string[], w: number, dim?: boolean): string[] {
   const soft = (s: string) => (dim ? c.dim(s) : s);
   const outRows: string[] = [];
   cells.forEach((row, r) => {
-    const parts = widths.map((cw, i) => padCell(row[i] ?? "", cw));
-    const text = parts.join(c.gray(" │ "));
-    outRows.push(hadHeader && r === 0 ? c.bold(text) : soft(text));
+    // Wrap every cell, then read the block off line by line.
+    const parts = widths.map((cw, i) => wrapText(row[i] ?? "", cw));
+    const height = Math.max(...parts.map((p) => p.length), 1);
+    for (let ln = 0; ln < height; ln++) {
+      const text = widths.map((cw, i) => padCell(parts[i][ln] ?? "", cw)).join(c.gray(" │ "));
+      outRows.push(hadHeader && r === 0 ? c.bold(text) : soft(text));
+    }
     if (hadHeader && r === 0) outRows.push(c.gray(widths.map((cw) => "─".repeat(cw)).join("─┼─")));
   });
   return outRows;
 }
 
 function padCell(s: string, w: number): string {
-  const flat = s.replace(/`/g, "");
-  const shown = width(flat) > w ? clip(flat, w) : flat;
+  const shown = width(s) > w ? clip(s, w) : s;
   return shown + " ".repeat(Math.max(0, w - width(shown)));
 }
 

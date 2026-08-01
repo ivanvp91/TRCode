@@ -38,9 +38,75 @@ export const c = {
 
 export const hasColor = !noColor;
 
-/** Visible width, ignoring ANSI escapes. */
+/**
+ * Cells a code point occupies. Emoji and CJK take two, combining marks and
+ * variation selectors take none — counting them all as one shifts every
+ * column after them, which is what turns an aligned table into a ragged one.
+ */
+function charWidth(cp: number): number {
+  if (cp === 0) return 0;
+  if (cp < 32 || (cp >= 0x7f && cp < 0xa0)) return 0;
+  if (
+    (cp >= 0x300 && cp <= 0x36f) ||
+    (cp >= 0x200b && cp <= 0x200f) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe00 && cp <= 0xfe0f) ||
+    (cp >= 0xfe20 && cp <= 0xfe2f)
+  ) {
+    return 0;
+  }
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    cp === 0x2329 ||
+    cp === 0x232a ||
+    (cp >= 0x2e80 && cp <= 0xa4cf && cp !== 0x303f) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe10 && cp <= 0xfe19) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1f64f) ||
+    (cp >= 0x1f680 && cp <= 0x1f6ff) ||
+    (cp >= 0x1f900 && cp <= 0x1f9ff) ||
+    (cp >= 0x20000 && cp <= 0x3fffd)
+  ) {
+    return 2;
+  }
+  // Scattered symbols that terminals still render double-width: ⌚ ⭐ ✅ ❌ …
+  const WIDE_SYMBOLS = [
+    [0x231a, 0x231b], [0x23e9, 0x23ec], [0x23f0, 0x23f0], [0x23f3, 0x23f3],
+    [0x25fd, 0x25fe], [0x2614, 0x2615], [0x2648, 0x2653], [0x267f, 0x267f],
+    [0x2693, 0x2693], [0x26a1, 0x26a1], [0x26aa, 0x26ab], [0x26bd, 0x26be],
+    [0x26c4, 0x26c5], [0x26ce, 0x26ce], [0x26d4, 0x26d4], [0x26ea, 0x26ea],
+    [0x26f2, 0x26f3], [0x26f5, 0x26f5], [0x26fa, 0x26fa], [0x26fd, 0x26fd],
+    [0x2705, 0x2705], [0x270a, 0x270b], [0x2728, 0x2728], [0x274c, 0x274c],
+    [0x274e, 0x274e], [0x2753, 0x2755], [0x2757, 0x2757], [0x2795, 0x2797],
+    [0x27b0, 0x27b0], [0x27bf, 0x27bf], [0x2b1b, 0x2b1c], [0x2b50, 0x2b50],
+    [0x2b55, 0x2b55],
+  ];
+  for (const [lo, hi] of WIDE_SYMBOLS) if (cp >= lo && cp <= hi) return 2;
+  return 1;
+}
+
+/** Visible width in terminal cells, ignoring ANSI escapes. */
 export function width(s: string): number {
-  return stripAnsi(s).length;
+  let total = 0;
+  for (const ch of stripAnsi(s)) total += charWidth(ch.codePointAt(0) ?? 0);
+  return total;
+}
+
+/** Cuts plain text to a cell width, never splitting a surrogate pair. */
+export function cutToWidth(s: string, max: number): { text: string; width: number } {
+  let text = "";
+  let used = 0;
+  for (const ch of s) {
+    const cw = charWidth(ch.codePointAt(0) ?? 0);
+    if (used + cw > max) break;
+    text += ch;
+    used += cw;
+  }
+  return { text, width: used };
 }
 
 export function stripAnsi(s: string): string {
@@ -66,9 +132,13 @@ export function clipAnsi(s: string, max: number): string {
         continue;
       }
     }
-    if (visible >= max - 1) break;
-    out += s[i];
-    visible++;
+    const cp = s.codePointAt(i) ?? 0;
+    const ch = String.fromCodePoint(cp);
+    const cw = charWidth(cp);
+    if (visible + cw > max - 1) break;
+    out += ch;
+    visible += cw;
+    i += ch.length - 1;
   }
   return out + "…" + (noColor ? "" : "\x1b[0m");
 }

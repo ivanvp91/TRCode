@@ -26,7 +26,7 @@ export interface Choice<T extends string> {
  */
 export function choose<T extends string>(
   choices: Choice<T>[],
-  opts: { initial?: T; fallback: T } = { fallback: choices[0].value },
+  opts: { initial?: T; fallback: T; hint?: string } = { fallback: choices[0].value },
 ): Promise<T> {
   const stdin = process.stdin;
   if (!stdin.isTTY) return Promise.resolve(opts.fallback);
@@ -47,7 +47,7 @@ export function choose<T extends string>(
           return i === index ? c.inverse(c.bold(tone(text))) : c.gray("[") + tone(ch.label) + c.gray("]");
         })
         .join("  ");
-      out(indent + buttons + c.gray("   ←/→ · Enter to confirm"));
+      out(indent + buttons + c.gray("   " + (opts.hint ?? "←/→ · Enter to confirm")));
       drawn = true;
     };
 
