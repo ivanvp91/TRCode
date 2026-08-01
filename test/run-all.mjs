@@ -20,6 +20,7 @@ const SUITES = [
   "menu-test.mjs",
   "resume-test.mjs",
   "turnbar-test.mjs",
+  "transcript-test.mjs",
   "keyscan-test.mjs",
   "shutdown-test.mjs",
 ];

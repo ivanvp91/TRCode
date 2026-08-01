@@ -107,7 +107,9 @@ ok("трим: сообщения не потеряны", trimmed.messages.length
 ok("трим: роли и id сохранены", trimmed.messages.every((m, i) => m.role === big[i].role && m.tool_call_id === big[i].tool_call_id));
 const lastTool = trimmed.messages.filter((m) => m.role === "tool").at(-1);
 ok("трим: свежий результат не тронут", lastTool.content.length === 20000, `${lastTool.content.length}`);
-ok("трим: исходный массив не изменён", big.filter((m) => m.role === "tool")[0].content.length === 20000);
+// Trimming persists into the stored history on purpose: stubbing only the wire
+// copy would rebuild a different request on every step and defeat the cache.
+ok("трим: история обновлена in-place", big.filter((m) => m.role === "tool")[0].content.length < 20000);
 
 let failed = 0;
 for (const t of results) {

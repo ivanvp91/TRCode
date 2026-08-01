@@ -7,6 +7,7 @@ import {
   Spinner,
   assistantPrefix,
   banner,
+  ensureBlank,
   error,
   info,
   line,
@@ -387,11 +388,12 @@ export class App {
           }
         }
         const calls = m.tool_calls ?? [];
+        if (calls.length) ensureBlank();
         for (const tc of calls.slice(0, 3)) {
-          padded(c.brightCyan("⏺ ") + c.dim(tc.function.name) + c.gray(`(${truncate(tc.function.arguments, 56)})`));
+          padded("  " + c.brightCyan("⏺ ") + c.dim(tc.function.name) + c.gray(`(${truncate(tc.function.arguments, 54)})`));
         }
         if (calls.length > 3) {
-          padded(c.gray(`  … ${calls.length - 3} more tool ${plural(calls.length - 3, "call", "calls")}`));
+          padded("    " + c.gray(`… ${calls.length - 3} more tool ${plural(calls.length - 3, "call", "calls")}`));
         }
         continue;
       }
@@ -450,6 +452,7 @@ export class App {
       stop: () => {},
     };
     let streaming = false;
+    let inToolGroup = false;
     let md: MarkdownStream | null = null;
 
     // Live counters: input is known once the first usage lands, output grows
@@ -457,6 +460,7 @@ export class App {
     const promptEstimate = contextPressure(this.session, this.catalog).used;
     let liveIn = promptEstimate;
     let liveOut = 0;
+    let cumSent = 0;
     const bumpOut = (delta: string) => {
       liveOut += estimateTokens(delta);
       spinner.setTokens(liveIn, liveOut);
@@ -499,15 +503,20 @@ export class App {
             bumpOut(delta);
             if (!streaming) {
               spinner.stop();
+              ensureBlank();
               assistantPrefix(this.session.model);
               md = new MarkdownStream();
               streaming = true;
+              inToolGroup = false;
             }
             md?.push(delta);
           },
           onToolStart: (tool, args) => {
             stopStream();
             spinner.stop();
+            // One blank line opens the group; calls inside it stay together.
+            if (!inToolGroup) ensureBlank();
+            inToolGroup = true;
             toolStart(tool.name, tool.summarize?.(args) ?? "");
           },
           onToolEnd: (tool, ok, display) => {
@@ -520,6 +529,10 @@ export class App {
             liveIn = usage.prompt_tokens;
             liveOut = usage.completion_tokens;
             spinner.setTokens(liveIn, liveOut);
+            // Cumulative estimate of what runAgent will have sent by the time
+            // this turn finishes, so the contrast with the sum below shows
+            // how much of the bill is re-sending vs. fresh content.
+            if (process.env.TRCODE_DEBUG) cumSent += usage.prompt_tokens;
           },
           onAssistantMessage: () => stopStream(),
         },
@@ -528,6 +541,17 @@ export class App {
       stopStream();
       this.session.save();
       this.statusLine(Date.now() - started, result.steps, result.stoppedBecause);
+      if (process.env.TRCODE_DEBUG) {
+        const t = this.usage.lastTurn;
+        padded(
+          c.gray(
+            `debug: sent total ↑${fmtTokens(cumSent)} across ${result.steps} step(s) · ` +
+              `last request ↑${fmtTokens(t.input)} · history est. ${fmtTokens(
+                contextPressure(this.session, this.catalog).used,
+              )} (${this.session.messages.length} msgs)`,
+          ),
+        );
+      }
     } catch (err) {
       stopStream();
       error((err as Error).message);

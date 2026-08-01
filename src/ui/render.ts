@@ -1,5 +1,5 @@
 /** Transcript rendering: markdown-ish streaming, banners, spinners, diffs. */
-import { c, cursor, cutToWidth, width } from "./ansi.js";
+import { c, cursor, cutToWidth, stripAnsi, width } from "./ansi.js";
 import { PAD_LEFT, contentWidth, fmtDuration, fullWidth, indent, pad } from "./layout.js";
 
 // ── sticky footer ───────────────────────────────────────────────────────────
@@ -44,7 +44,11 @@ export function refreshFooter(): void {
   drawFooter();
 }
 
+/** Whether the last thing written was an empty line — see ensureBlank(). */
+let lastBlank = true;
+
 export function out(s = ""): void {
+  if (s) lastBlank = /\n[ \t]*\n$/.test(s);
   if (!footerFn) {
     process.stdout.write(s);
     return;
@@ -57,6 +61,15 @@ export function out(s = ""): void {
 }
 export function line(s = ""): void {
   out(s + "\n");
+  lastBlank = !stripAnsi(s).trim();
+}
+
+/**
+ * One blank line before a new block, and never two. Tool calls printed right
+ * under the last sentence of an answer read as part of it.
+ */
+export function ensureBlank(): void {
+  if (!lastBlank) line();
 }
 /** Writes a line inside the chat margins. */
 export function padded(s = ""): void {
@@ -138,9 +151,20 @@ export function assistantPrefix(model: string): void {
   padded(c.brightMagenta("●") + " " + c.dim(model));
 }
 
+/**
+ * Tool activity is indented one step further than the message it belongs to.
+ * Flush against the text it read as a continuation of the answer.
+ */
+const TOOL_INDENT = "  ";
+
 export function toolStart(name: string, summary: string): void {
   padded(
-    c.brightCyan("⏺ ") + c.bold(name) + c.gray("(") + c.dim(truncate(summary, contentWidth() - 12)) + c.gray(")"),
+    TOOL_INDENT +
+      c.brightCyan("⏺ ") +
+      c.bold(name) +
+      c.gray("(") +
+      c.dim(truncate(summary, contentWidth() - 14)) +
+      c.gray(")"),
   );
 }
 
@@ -148,8 +172,8 @@ export function toolDone(ok: boolean, detail: string): void {
   const mark = ok ? c.green("  └ ") : c.red("  └ ");
   const all = detail.split("\n");
   // Diffs live here, so indentation is preserved — only the length is clipped.
-  for (const l of all.slice(0, 12)) line(pad(mark + c.dim(clip(l, contentWidth() - 6))));
-  if (all.length > 12) padded(c.gray(`    … ${all.length - 12} more lines`));
+  for (const l of all.slice(0, 12)) line(pad(TOOL_INDENT + mark + c.dim(clip(l, contentWidth() - 8))));
+  if (all.length > 12) padded(TOOL_INDENT + c.gray(`    … ${all.length - 12} more lines`));
 }
 
 export function info(s: string): void {

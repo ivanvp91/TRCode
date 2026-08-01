@@ -9,6 +9,10 @@
  * So: keep every message, but shorten the *old* tool results. Nothing is
  * dropped, message pairing stays intact, and the recent turns — the ones the
  * model is actually still working from — are left untouched.
+ *
+ * Trimming is incremental: a stub made for step N is reused on step N+1, so
+ * the old part of the history is byte-identical between steps — that is what
+ * a provider-side prompt cache matches on.
  */
 import { estimateTokens } from "../usage.js";
 import type { Message } from "../types.js";
@@ -43,6 +47,23 @@ function sizeOf(messages: Message[]): number {
   return n;
 }
 
+function stubFor(m: Message): Message {
+  const body = String(m.content ?? "");
+  const head = body.slice(0, 200).trimEnd();
+  return {
+    ...m,
+    content:
+      `${head}\n… [${body.length - head.length} more characters omitted — this result was already acted on in later steps. ` +
+      `Call the tool again if you need it in full.]`,
+  };
+}
+
+/**
+ * Shortens tool output outside the recent tail once the request exceeds the
+ * budget. The stub replaces the original message *in the stored history*, so
+ * each next step starts from the trimmed state instead of re-trimming on every
+ * request — the wire prefix stays stable and the cache stays warm.
+ */
 export function trimForRequest(messages: Message[], opts: TrimOptions): TrimResult {
   const before = sizeOf(messages);
   if (before <= opts.budget) return { messages, saved: 0, trimmed: 0 };
@@ -52,28 +73,23 @@ export function trimForRequest(messages: Message[], opts: TrimOptions): TrimResu
   // Everything before the recent tail is fair game.
   const cutoff = Math.max(0, messages.length - keepRecent);
 
-  const out = messages.slice();
   let current = before;
   let trimmed = 0;
 
   // Oldest first: the further back a tool result is, the less it is needed.
   for (let i = 0; i < cutoff && current > opts.budget; i++) {
-    const m = out[i];
+    const m = messages[i];
     if (m.role !== "tool") continue;
     const body = String(m.content ?? "");
     if (body.length < minBytes) continue;
 
-    const head = body.slice(0, 200).trimEnd();
-    const stub =
-      `${head}\n… [${body.length - head.length} more characters omitted — this result was already acted on in later steps. ` +
-      `Call the tool again if you need it in full.]`;
-
-    current -= estimateTokens(body) - estimateTokens(stub);
-    out[i] = { ...m, content: stub };
+    const stub = stubFor(m);
+    current -= estimateTokens(body) - estimateTokens(String(stub.content));
+    messages[i] = stub;
     trimmed++;
   }
 
-  return { messages: out, saved: Math.max(0, before - current), trimmed };
+  return { messages, saved: Math.max(0, before - current), trimmed };
 }
 
 /** Size of a history, for callers that want to report it. */

@@ -141,6 +141,19 @@ You can type while the model is busy. **Enter** queues the message and it is sen
 as the current turn finishes; anything left unsent stays in the box for editing. **Esc**
 interrupts the turn and does not clear what you typed.
 
+Tool activity is indented one step past the answer that triggered it, with a blank line
+opening the group, so calls never read as another paragraph of the message:
+
+```
+   ● moonshotai/kimi-k3
+   Логика tap-tap работает через pointerdown, переписываю тест.
+
+     ⏺ edit({"new_string":"// подсветка после tap"})
+       └ 3 lines changed
+     ⏺ shell({"command":"node tests/ui.test.js"})
+       └ ok
+```
+
 After a turn, only that turn — nothing already shown under the input is repeated:
 
 ```
@@ -454,8 +467,9 @@ PASS  protocol-test.mjs      36/36     PASS  repaint-test.mjs    5/5
 PASS  editor-harness.mjs     11/11     PASS  menu-test.mjs
 PASS  paste-test.mjs         9/9       PASS  resume-test.mjs     39/39
 PASS  newline-test.mjs       13/13     PASS  turnbar-test.mjs    21/21
-PASS  history-test.mjs       9/9       PASS  keyscan-test.mjs    6/6
-PASS  focus-test.mjs         8/8       PASS  shutdown-test.mjs   8/8
+PASS  history-test.mjs       9/9       PASS  transcript-test.mjs 8/8
+PASS  focus-test.mjs         8/8       PASS  keyscan-test.mjs    6/6
+                                       PASS  shutdown-test.mjs   8/8
 ```
 
 The suites cover the wire protocols and history trimming, plus the terminal behaviour that
