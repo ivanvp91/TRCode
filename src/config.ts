@@ -104,6 +104,16 @@ export interface Config {
    * the same history on every step. Set false if a host mishandles the field.
    */
   promptCache: boolean;
+  /**
+   * Report turn status to Orca when running inside one of its panes. Detected
+   * from the environment; set false to stay silent.
+   */
+  orca: boolean;
+  /**
+   * Which of Orca's known agent routes to speak. It answers 404 to an id it
+   * does not know, and "trcode" is not one of them.
+   */
+  orcaAgent: string;
   /** Extra system prompt appended for every session. */
   instructions?: string;
 }
@@ -153,6 +163,8 @@ const DEFAULTS: Config = {
   maxSteps: 60,
   autoCompactAt: 0.82,
   promptCache: true,
+  orca: true,
+  orcaAgent: "opencode",
 };
 
 export function configDir(): string {

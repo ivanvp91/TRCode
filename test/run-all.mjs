@@ -16,6 +16,7 @@ const SUITES = [
   "cache-test.mjs",
   "shell-output-test.mjs",
   "prompt-test.mjs",
+  "orca-test.mjs",
   "editor-harness.mjs",
   "paste-test.mjs",
   "newline-test.mjs",

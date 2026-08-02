@@ -25,6 +25,7 @@ import { contentWidth, fmtDuration } from "./layout.js";
 import { composeStatus, type StatusInfo } from "./inputbox.js";
 import { InputEditor, PipeReader, setExtraNewlineKeys } from "./editor.js";
 import { TurnBar } from "./turnbar.js";
+import { OrcaReporter } from "./orca.js";
 import { pushConsumer } from "./stdin.js";
 import { PermissionBroker } from "./permissions.js";
 import { loadConfig, VERSION, type Config, type Effort } from "../config.js";
@@ -70,6 +71,8 @@ export class App {
   /** Highest context threshold already mentioned, so it is said once. */
   private nudgedAt = 0;
   private nudgeKey = "";
+  /** Pane status reporting, when this process runs inside Orca. */
+  private orca = OrcaReporter.detect();
   /** Releases the turn-cancel key listener; null when no turn is running. */
   private turnKeys: (() => void) | null = null;
 
@@ -82,6 +85,8 @@ export class App {
       interactive: process.stdin.isTTY,
       exclusive: (fn) => this.exclusiveInput(fn),
     });
+    this.broker.onWaiting = (tool, detail) => this.orca?.waiting(tool, detail);
+    this.broker.onAnswered = () => this.orca?.busy(this.session.id);
     this.history = loadInputHistory(this.cwd);
     setExtraNewlineKeys(this.cfg.newlineKeys ?? []);
     this.session = opts.session ?? new Session({ cwd: this.cwd, model: opts.model ?? this.cfg.model });
@@ -440,6 +445,8 @@ export class App {
 
     this.abort = new AbortController();
     this.usage.beginTurn();
+    this.orca?.busy(this.session.id);
+    this.orca?.userPrompt(text, this.session.id);
 
     const started = Date.now();
     // The bar owns stdin for the duration of the turn: it interrupts on Esc
@@ -458,6 +465,8 @@ export class App {
     let streaming = false;
     let inToolGroup = false;
     let md: MarkdownStream | null = null;
+    /** The answer so far, for Orca's pane preview. */
+    let answer = "";
 
     // Live counters: input is known once the first usage lands, output grows
     // with the stream so a long silence still shows movement.
@@ -511,8 +520,11 @@ export class App {
               md = new MarkdownStream();
               streaming = true;
               inToolGroup = false;
+              answer = "";
             }
             md?.push(delta);
+            answer += delta;
+            this.orca?.assistantText(answer, this.session.id);
           },
           onToolStart: (tool, args) => {
             stopStream();
@@ -563,6 +575,9 @@ export class App {
       this.pending.push(...queued);
       if (draft) this.editor?.prefill(draft);
       this.abort = null;
+      // Only "done" once nothing else is queued, or the pane would flash
+      // finished between two messages of the same batch.
+      if (!this.pending.length) await this.orca?.idle(this.session.id);
     }
   }
 

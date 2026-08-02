@@ -23,6 +23,10 @@ export class PermissionBroker {
   interactive = true;
   /** Hands the prompt sole ownership of stdin; set by the REPL. */
   private exclusive: <T>(fn: () => Promise<T>) => Promise<T> = (fn) => fn();
+  /** Told when a prompt is up, so a pane can show "needs attention". */
+  onWaiting: ((tool: string, detail: string) => void) | null = null;
+  /** Told when it has been answered, so the pane goes back to working. */
+  onAnswered: (() => void) | null = null;
 
   constructor(
     opts: {
@@ -81,6 +85,9 @@ export class PermissionBroker {
     rule(c.brightYellow(" permission required "));
     line(`  ${c.bold(title)}  ${c.gray(tool.name)}`);
     const target = args.path ?? args.command ?? tool.summarize?.(args) ?? "";
+    // A prompt nobody sees is a turn that never finishes: tell the host that
+    // this pane is blocked on a human.
+    this.onWaiting?.(tool.name, String(target || title));
     if (target) line(`  ${c.dim(truncate(String(target), 100))}`);
     if (preview) {
       line();
@@ -101,6 +108,7 @@ export class PermissionBroker {
       ),
     );
     line();
+    this.onAnswered?.();
 
     if (answer === "always") {
       this.sessionAllow.add(tool.name);

@@ -520,6 +520,8 @@ Prices are not published either, so no money is shown anywhere — only tokens.
   "maxSteps": 60,
   "autoCompactAt": 0.82,
   "promptCache": true,
+  "orca": true,
+  "orcaAgent": "opencode",
   "temperature": 0.2
 }
 ```
@@ -533,14 +535,15 @@ npm test
 ```
 
 ```
-PASS  protocol-test.mjs      52/52     PASS  repaint-test.mjs    5/5
+PASS  protocol-test.mjs      52/52     PASS  shutdown-test.mjs   8/8
 PASS  cache-test.mjs         8/8       PASS  resume-test.mjs     39/39
 PASS  shell-output-test.mjs  6/6       PASS  turnbar-test.mjs    21/21
 PASS  prompt-test.mjs        18/18     PASS  menu-test.mjs
+PASS  orca-test.mjs          18/18     PASS  repaint-test.mjs    5/5
 PASS  editor-harness.mjs     11/11     PASS  transcript-test.mjs 8/8
 PASS  paste-test.mjs         9/9       PASS  keyscan-test.mjs    6/6
-PASS  newline-test.mjs       13/13     PASS  shutdown-test.mjs   8/8
-PASS  history-test.mjs       9/9       PASS  focus-test.mjs      8/8
+PASS  newline-test.mjs       13/13     PASS  focus-test.mjs      8/8
+PASS  history-test.mjs       9/9
 ```
 
 The suites cover the wire protocols and history trimming, plus the terminal behaviour that
@@ -560,6 +563,32 @@ TOKENROUTER_BASE_URL=http://127.0.0.1:8799/v1 \
 TOKENROUTER_API_KEY=sk-test TRCODE_MODEL=mock-smart \
   node dist/index.js -p "read package.json" --json
 ```
+
+## Running inside Orca
+
+[Orca](https://orcaterm.com) runs several agents in split panes and colours each one by
+what it is doing. It learns that over a loopback HTTP server: an agent POSTs its state to
+`http://127.0.0.1:<port>/hook/<agent>`, and the pane turns **working**, **needs attention**
+or **done** — the last one is what raises the notification when a long turn finishes.
+
+`trcode` speaks that protocol when it finds itself in an Orca pane. Nothing to configure:
+`ORCA_PANE_KEY` in the environment is the switch. It reports the prompt, a throttled
+preview of the answer, permission requests (the pane goes red until you answer) and the
+end of the turn.
+
+One wrinkle worth knowing: Orca answers **404** to an agent id it does not know, and
+`trcode` is not on its list — the routes are `claude`, `codex`, `cursor`, `gemini`, `grok`,
+`kimi`, `opencode` and ten more. So the reports go out as `opencode`, whose contract is
+public (Orca ships the plugin that speaks it). The pane will show an opencode icon; the
+status, the preview and the notifications are the real ones.
+
+```json
+{ "orca": true, "orcaAgent": "opencode" }
+```
+
+`"orca": false` stays silent; `orcaAgent` switches the route (`"claude"` also works). If
+Orca is closed, slow or missing, the reports fail open — a post has a 1.5 s timeout and its
+failure never reaches the turn.
 
 ## Layout
 
@@ -597,6 +626,7 @@ src/
     choice.ts          button row for confirmations
     prompt.ts          one-line text prompt (rename)
     turnbar.ts         the bottom bar shown while a turn runs
+    orca.ts            pane status reporting for the Orca terminal
     keyscan.ts         /keys inspector
 ```
 
