@@ -590,6 +590,32 @@ status, the preview and the notifications are the real ones.
 Orca is closed, slow or missing, the reports fail open — a post has a 1.5 s timeout and its
 failure never reaches the turn.
 
+### Making Orca call it trcode
+
+The status works as described above, but the pane is labelled after whichever agent's
+route is used. Orca's agent list lives inside `resources/app.asar`, and adding an entry
+means repacking the archive — asar is a header of offsets followed by concatenated files,
+so inserting one byte shifts everything after it. Replacing bytes with the *same number*
+of bytes is safe, which leaves one move: take over the slot of an agent you do not use.
+
+`scripts/orca-agent-patch.mjs` takes `cursor`, whose binary name (`cursor-agent`) and
+label (`Cursor`) are exactly as long as ours:
+
+```bash
+npm link                                   # provides the trcode-agent command
+node scripts/orca-agent-patch.mjs --check   # what it would do, changes nothing
+node scripts/orca-agent-patch.mjs           # apply, then restart Orca
+node scripts/orca-agent-patch.mjs --revert  # back to the backup it made
+```
+
+Four strings change: the three that name the binary Orca looks for and launches, and the
+display name. The internal id stays `cursor`, so the hook route and the pane icon still
+belong to it — the icon will be Cursor's, the label will read Trcode. Orca stops offering
+Cursor, and every Orca update replaces `app.asar` and undoes this, so run it again after
+one. The script refuses to write if Electron's ASAR integrity fuse is on (a patched file
+would stop the app from starting), asserts the file size is unchanged before writing, and
+refreshes its backup from whatever the current build is.
+
 ## Layout
 
 ```

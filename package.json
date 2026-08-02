@@ -5,7 +5,8 @@
   "type": "module",
   "bin": {
     "trc": "dist/index.js",
-    "trcode": "dist/index.js"
+    "trcode": "dist/index.js",
+    "trcode-agent": "dist/index.js"
   },
   "engines": {
     "node": ">=20.10"
