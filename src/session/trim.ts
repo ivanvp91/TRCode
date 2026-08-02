@@ -28,6 +28,13 @@ export interface TrimOptions {
   keepRecent?: number;
   /** Tool results shorter than this are never touched. */
   minTrimBytes?: number;
+  /**
+   * Hard ceiling for a single old tool result, applied whether or not the
+   * request is over budget. Without it one 400KB file read rides along on
+   * every step until the *whole history* finally crosses the threshold.
+   * 0 disables the cap.
+   */
+  maxResultBytes?: number;
 }
 
 export interface TrimResult {
@@ -47,9 +54,14 @@ function sizeOf(messages: Message[]): number {
   return n;
 }
 
-function stubFor(m: Message): Message {
+/**
+ * `headBytes` is how much of the result survives. The budget pass keeps a
+ * token or two of context; the size cap keeps enough to still be useful,
+ * since it fires on results the model may not have finished with.
+ */
+function stubFor(m: Message, headBytes = 200): Message {
   const body = String(m.content ?? "");
-  const head = body.slice(0, 200).trimEnd();
+  const head = body.slice(0, headBytes).trimEnd();
   return {
     ...m,
     content:
@@ -67,28 +79,44 @@ function stubFor(m: Message): Message {
  */
 export function trimForRequest(messages: Message[], opts: TrimOptions): TrimResult {
   const before = sizeOf(messages);
-  if (before <= opts.budget) return { messages, saved: 0, trimmed: 0 };
-
   const keepRecent = opts.keepRecent ?? 8;
   const minBytes = opts.minTrimBytes ?? 400;
+  const maxResult = opts.maxResultBytes ?? 0;
   // Everything before the recent tail is fair game.
   const cutoff = Math.max(0, messages.length - keepRecent);
+  if (before <= opts.budget && !maxResult) return { messages, saved: 0, trimmed: 0 };
 
   const out = messages.slice();
   let current = before;
   let trimmed = 0;
 
-  // Oldest first: the further back a tool result is, the less it is needed.
+  const shorten = (i: number, headBytes: number) => {
+    const stub = stubFor(out[i], headBytes);
+    current -= estimateTokens(String(out[i].content ?? "")) - estimateTokens(String(stub.content));
+    out[i] = stub;
+    trimmed++;
+  };
+
+  // Pass 1: the size cap. Independent of the budget, so a single huge dump
+  // stops riding along from the step after the one that asked for it.
+  if (maxResult > 0) {
+    for (let i = 0; i < cutoff; i++) {
+      const m = out[i];
+      if (m.role !== "tool") continue;
+      if (String(m.content ?? "").length <= maxResult) continue;
+      shorten(i, Math.min(2000, Math.floor(maxResult / 4)));
+    }
+  }
+
+  // Pass 2: the budget. Oldest first — the further back a tool result is, the
+  // less it is needed.
   for (let i = 0; i < cutoff && current > opts.budget; i++) {
     const m = out[i];
     if (m.role !== "tool") continue;
     const body = String(m.content ?? "");
     if (body.length < minBytes) continue;
-
-    const stub = stubFor(m);
-    current -= estimateTokens(body) - estimateTokens(String(stub.content));
-    out[i] = stub;
-    trimmed++;
+    if (/more characters omitted/.test(body)) continue; // already a stub
+    shorten(i, 200);
   }
 
   return { messages: out, saved: Math.max(0, before - current), trimmed };

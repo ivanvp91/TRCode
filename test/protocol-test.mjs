@@ -155,6 +155,34 @@ ok(
   JSON.stringify(again.messages) === JSON.stringify(trimmed.messages),
 );
 
+// ── per-result cap, independent of the budget ─────────────────────────────
+{
+  const mixed = [
+    { role: "user", content: "старт" },
+    { role: "assistant", content: null, tool_calls: [{ id: "a", type: "function", function: { name: "read", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "a", name: "read", content: "y".repeat(30000) },
+    { role: "assistant", content: null, tool_calls: [{ id: "b", type: "function", function: { name: "read", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "b", name: "read", content: "z".repeat(3000) },
+    { role: "user", content: "дальше" },
+    { role: "assistant", content: "ок" },
+  ];
+  // Budget far above the history: only the cap can fire here.
+  const capped = trimForRequest(mixed, { budget: 1_000_000, keepRecent: 2, maxResultBytes: 12000 });
+  const tools = capped.messages.filter((m) => m.role === "tool");
+  ok("cap: большой результат ужат", tools[0].content.length < 30000, String(tools[0].content.length));
+  ok("cap: голова осталась осмысленной", tools[0].content.length > 1500, String(tools[0].content.length));
+  ok("cap: мелкий результат не тронут", tools[1].content.length === 3000);
+  ok("cap: без cap ничего не делает", trimForRequest(mixed, { budget: 1_000_000, keepRecent: 2 }).trimmed === 0);
+  ok("cap: сохранённая история цела", mixed[2].content.length === 30000);
+
+  // Running twice must produce the same bytes, or the cached prefix moves.
+  const twice = trimForRequest(mixed, { budget: 1_000_000, keepRecent: 2, maxResultBytes: 12000 });
+  ok("cap: результат детерминирован", JSON.stringify(twice.messages) === JSON.stringify(capped.messages));
+  // And a second pass over an already-stubbed history must not re-stub it.
+  const onStubs = trimForRequest(capped.messages, { budget: 1_000_000, keepRecent: 2, maxResultBytes: 12000 });
+  ok("cap: заглушку не режет повторно", onStubs.trimmed === 0, String(onStubs.trimmed));
+}
+
 let failed = 0;
 for (const t of results) {
   if (!t.ok) failed++;

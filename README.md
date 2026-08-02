@@ -242,22 +242,44 @@ on.
 
 So before each request **old tool results are shortened** to their first lines with a note
 that the rest was omitted. Nothing is dropped, `tool_call` ↔ `tool` pairing stays intact,
-and the last few turns are left untouched. Measured on a 12-round tool-heavy session
-(bytes of real requests):
+the last few messages are left untouched, and the session keeps the full text — only the
+outgoing copy is cut. Two limits do the cutting, and they answer different problems.
 
-| Threshold | Sent | Saved |
+`maxRequestTokens` is the budget for the whole request. `maxToolResultBytes` is a ceiling
+on **one** old result, applied even when the request is inside the budget — otherwise a
+single 400KB file read rides along on every step until the entire history finally crosses
+the threshold. Measured on a 12-round session that reads a 24KB file each round (bytes of
+real requests, `test/measure-tokens.mjs`):
+
+| Setting | Sent | Saved |
 |---|---|---|
-| no limit | 2001 KB | — |
-| 120k | 2001 KB | 0% — never reached |
-| 60k | 1771 KB | 11% |
-| **40k (default)** | **1356 KB** | **32%** |
-| 25k | 1173 KB | 41% |
+| no limits | 1950 KB | — |
+| budget 60k | 1719 KB | 12% |
+| budget 40k | 1303 KB | 33% |
+| budget 25k | 1118 KB | 43% |
+| **budget 40k + cap 12k (default)** | **1182 KB** | **39%** |
+| budget 25k + cap 12k | 1182 KB | 39% |
+| cap 12k, no budget | 1182 KB | 39% |
+| budget 40k + cap 12k, `trimKeepRecent: 4` | 777 KB | 60% |
 
-The threshold is `maxRequestTokens` (default 40 000; `0` disables it):
+Two things worth reading off that table. Once the per-result cap is on, **lowering the
+budget buys nothing** — the cap has already shortened everything the budget would have
+reached, so 40k and 25k send the same bytes. And the biggest remaining lever is
+`trimKeepRecent`: protecting 4 recent messages instead of 8 saves another 20 points, at
+the risk of the model re-reading a file it was working from.
+
+When results are smaller than the cap it does nothing at all — the same session with 6KB
+reads sends 581 KB with the cap on or off.
 
 ```json
-{ "maxRequestTokens": 40000 }
+{ "maxRequestTokens": 40000, "maxToolResultBytes": 12000, "trimKeepRecent": 8, "trimMinBytes": 400 }
 ```
+
+Set either limit to `0` to disable it.
+
+Tool output is also bounded at the source: `shell` keeps the first 20k characters and the
+**last** 20k, marking what it dropped in between. Cutting only at the head loses the
+summary line a test run exists for, and the model then reruns the command to see it.
 
 The second safeguard is auto-compaction. A fraction of the window (`autoCompactAt`) is
 useless on a 1M-token model — 82% of 1M never arrives, and the history grows all session.
@@ -477,6 +499,9 @@ Prices are not published either, so no money is shown anywhere — only tokens.
   "permissions": { "read": "allow", "write": "ask", "shell": "ask", "agent": "allow" },
   "shell": "auto",
   "maxRequestTokens": 40000,
+  "maxToolResultBytes": 12000,
+  "trimKeepRecent": 8,
+  "trimMinBytes": 400,
   "requestTimeoutMs": 300000,
   "maxSteps": 60,
   "autoCompactAt": 0.82,
@@ -494,13 +519,14 @@ npm test
 ```
 
 ```
-PASS  protocol-test.mjs      45/45     PASS  repaint-test.mjs    5/5
-PASS  cache-test.mjs         8/8       PASS  menu-test.mjs
-PASS  editor-harness.mjs     11/11     PASS  resume-test.mjs     39/39
-PASS  paste-test.mjs         9/9       PASS  turnbar-test.mjs    21/21
-PASS  newline-test.mjs       13/13     PASS  transcript-test.mjs 8/8
-PASS  history-test.mjs       9/9       PASS  keyscan-test.mjs    6/6
-PASS  focus-test.mjs         8/8       PASS  shutdown-test.mjs   8/8
+PASS  protocol-test.mjs      52/52     PASS  menu-test.mjs
+PASS  cache-test.mjs         8/8       PASS  resume-test.mjs     39/39
+PASS  shell-output-test.mjs  6/6       PASS  turnbar-test.mjs    21/21
+PASS  editor-harness.mjs     11/11     PASS  transcript-test.mjs 8/8
+PASS  paste-test.mjs         9/9       PASS  keyscan-test.mjs    6/6
+PASS  newline-test.mjs       13/13     PASS  shutdown-test.mjs   8/8
+PASS  history-test.mjs       9/9       PASS  repaint-test.mjs    5/5
+PASS  focus-test.mjs         8/8
 ```
 
 The suites cover the wire protocols and history trimming, plus the terminal behaviour that

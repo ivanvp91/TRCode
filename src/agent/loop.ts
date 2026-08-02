@@ -138,8 +138,17 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     events?.onStep?.(step);
 
     // Shorten stale tool output instead of resending megabytes every step.
-    const budget = loadConfig().maxRequestTokens;
-    const trim = budget > 0 ? trimForRequest(messages, { budget }) : { messages, saved: 0, trimmed: 0 };
+    const cfg = loadConfig();
+    const budget = cfg.maxRequestTokens;
+    const trim =
+      budget > 0 || cfg.maxToolResultBytes > 0
+        ? trimForRequest(messages, {
+            budget: budget > 0 ? budget : Infinity,
+            keepRecent: cfg.trimKeepRecent,
+            minTrimBytes: cfg.trimMinBytes,
+            maxResultBytes: cfg.maxToolResultBytes,
+          })
+        : { messages, saved: 0, trimmed: 0 };
     if (trim.trimmed) events?.onTrim?.(trim.saved, trim.trimmed);
     const wire: Message[] = [{ role: "system", content: opts.systemPrompt }, ...trim.messages];
 

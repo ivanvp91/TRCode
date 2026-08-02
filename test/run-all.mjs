@@ -14,6 +14,7 @@ const PORT = Number(process.env.MOCK_PORT || 8877);
 const SUITES = [
   "protocol-test.mjs",
   "cache-test.mjs",
+  "shell-output-test.mjs",
   "editor-harness.mjs",
   "paste-test.mjs",
   "newline-test.mjs",

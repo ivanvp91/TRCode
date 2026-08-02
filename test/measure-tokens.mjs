@@ -65,9 +65,11 @@ fs.rmSync(root, { recursive: true, force: true });
 fs.mkdirSync(root, { recursive: true });
 fs.writeFileSync(path.join(root, "big.txt"), TOOL_OUTPUT);
 
-function run(budget) {
+function run({ budget, cap = 0, keepRecent = 8, outBytes = 24000, label }) {
   sizes = [];
-  const home = path.join(root, `home-${budget}`);
+  // Each case gets its own file size: a cap only bites what exceeds it.
+  fs.writeFileSync(path.join(root, "big.txt"), "x".repeat(outBytes));
+  const home = path.join(root, `home-${label.replace(/\W+/g, "_")}`);
   fs.mkdirSync(home, { recursive: true });
   fs.writeFileSync(
     path.join(home, "config.json"),
@@ -76,6 +78,8 @@ function run(budget) {
       apiKey: "sk-test",
       model: "measure-model",
       maxRequestTokens: budget,
+      maxToolResultBytes: cap,
+      trimKeepRecent: keepRecent,
       permissions: { read: "allow", write: "deny", shell: "deny", network: "deny", agent: "allow" },
     }),
   );
@@ -90,20 +94,40 @@ function run(budget) {
   });
 }
 
-const budgets = [0, 40000];
+const CASES = [
+  { label: "без ограничений", budget: 0 },
+  { label: "бюджет 60k", budget: 60000 },
+  { label: "бюджет 40k (default)", budget: 40000 },
+  { label: "бюджет 25k", budget: 25000 },
+  { label: "бюджет 40k + cap 12k", budget: 40000, cap: 12000 },
+  { label: "бюджет 40k + cap 8k", budget: 40000, cap: 8000 },
+  { label: "бюджет 25k + cap 8k", budget: 25000, cap: 8000 },
+  { label: "cap 8k без бюджета", budget: 0, cap: 8000 },
+  { label: "бюджет 40k + cap 12k, keep 4", budget: 40000, cap: 12000, keepRecent: 4 },
+  // Results below the cap: it must not change anything at all.
+  { label: "результаты 6k, без ограничений", budget: 0, outBytes: 6000 },
+  { label: "результаты 6k, cap 12k", budget: 40000, cap: 12000, outBytes: 6000 },
+];
+
 const runs = [];
-for (const b of budgets) runs.push([b, await run(b)]);
+for (const c of CASES) runs.push([c, await run(c)]);
 
 server.close();
 
 const sum = (a) => a.reduce((x, y) => x + y, 0);
 const kb = (n) => (n / 1024).toFixed(0) + " КБ";
 const row = (name, a) =>
-  `${name.padEnd(26)} запросов ${String(a.length).padStart(2)}  ·  суммарно ${kb(sum(a)).padStart(9)}  ·  самый большой ${kb(Math.max(...a)).padStart(8)}`;
+  `${name.padEnd(30)} запросов ${String(a.length).padStart(2)}  ·  суммарно ${kb(sum(a)).padStart(9)}  ·  самый большой ${kb(Math.max(...a)).padStart(8)}`;
 
-const base = sum(runs[0][1]);
-for (const [b, a] of runs) {
+// Savings are only meaningful against a run with the same tool-output size.
+const baseFor = new Map();
+for (const [c, a] of runs) {
+  const key = c.outBytes ?? 24000;
+  if (!c.budget && !c.cap && !baseFor.has(key)) baseFor.set(key, sum(a));
+}
+for (const [c, a] of runs) {
+  const base = baseFor.get(c.outBytes ?? 24000) ?? sum(runs[0][1]);
   const pct = Math.round((1 - sum(a) / base) * 100);
-  console.log(row(b === 0 ? "без ограничения" : `порог ${b/1000}k токенов`, a) + "  ·  экономия " + String(pct).padStart(3) + "%");
+  console.log(row(c.label, a) + "  ·  экономия " + String(pct).padStart(3) + "%");
 }
 fs.rmSync(root, { recursive: true, force: true });

@@ -83,6 +83,16 @@ export interface Config {
    * lot of live context while actually engaging.
    */
   maxRequestTokens: number;
+  /** Trailing messages that are never shortened, counted in messages. */
+  trimKeepRecent: number;
+  /** Tool results below this size are left alone. */
+  trimMinBytes: number;
+  /**
+   * Ceiling for one old tool result, applied even when the request is inside
+   * the budget: a single 400KB read would otherwise ride along on every step
+   * until the whole history finally crossed the threshold. 0 disables it.
+   */
+  maxToolResultBytes: number;
   /** Hard stop on tool-call rounds per user turn. */
   maxSteps: number;
   /** Auto-compact once the context passes this fraction of the window. */
@@ -137,6 +147,9 @@ const DEFAULTS: Config = {
   // Free tiers can queue for minutes before the first byte arrives.
   requestTimeoutMs: 300_000,
   maxRequestTokens: 40_000,
+  trimKeepRecent: 8,
+  trimMinBytes: 400,
+  maxToolResultBytes: 12_000,
   maxSteps: 60,
   autoCompactAt: 0.82,
   promptCache: true,

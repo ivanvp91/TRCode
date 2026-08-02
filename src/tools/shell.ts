@@ -4,7 +4,41 @@ import { loadConfig } from "../config.js";
 import type { ToolDef } from "../types.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
-const MAX_OUTPUT = 60_000;
+/** Kept from the start and from the end of a stream, in characters. */
+const HEAD_LIMIT = 20_000;
+const TAIL_LIMIT = 20_000;
+
+/**
+ * Head plus a rolling tail. Truncating at the head alone throws away the one
+ * part that usually matters — a test run's summary, the error a build ended
+ * on — and then the model runs the command again to see the end of it.
+ */
+class Capture {
+  private head = "";
+  private tail = "";
+  private dropped = 0;
+
+  push(s: string): void {
+    if (this.head.length < HEAD_LIMIT) {
+      const room = HEAD_LIMIT - this.head.length;
+      this.head += s.slice(0, room);
+      s = s.slice(room);
+      if (!s) return;
+    }
+    this.tail += s;
+    if (this.tail.length > TAIL_LIMIT) {
+      const cut = this.tail.length - TAIL_LIMIT;
+      this.dropped += cut;
+      this.tail = this.tail.slice(cut);
+    }
+  }
+
+  text(): string {
+    if (!this.tail) return this.head;
+    if (!this.dropped) return this.head + this.tail;
+    return `${this.head}\n… [${this.dropped} characters omitted from the middle] …\n${this.tail}`;
+  }
+}
 
 /** Commands that are refused outright regardless of permission mode. */
 const HARD_BLOCK = [
@@ -76,18 +110,12 @@ export const shellTool: ToolDef = {
         stdio: ["ignore", "pipe", "pipe"],
       });
 
-      let stdout = "";
-      let stderr = "";
+      const out = new Capture();
+      const err = new Capture();
       let killed = false;
-      let truncated = false;
 
       const push = (target: "out" | "err", chunk: Buffer) => {
-        const s = chunk.toString("utf8");
-        if (target === "out") {
-          if (stdout.length < MAX_OUTPUT) stdout += s;
-          else truncated = true;
-        } else if (stderr.length < MAX_OUTPUT) stderr += s;
-        else truncated = true;
+        (target === "out" ? out : err).push(chunk.toString("utf8"));
       };
 
       child.stdout.on("data", (c) => push("out", c));
@@ -113,10 +141,11 @@ export const shellTool: ToolDef = {
       child.on("close", (code) => {
         clearTimeout(timer);
         ctx.signal.removeEventListener("abort", onAbort);
+        const stdout = out.text();
+        const stderr = err.text();
         const parts: string[] = [];
         if (stdout.trim()) parts.push(stdout.trimEnd());
         if (stderr.trim()) parts.push(`[stderr]\n${stderr.trimEnd()}`);
-        if (truncated) parts.push(`[output truncated at ${MAX_OUTPUT} characters]`);
         if (killed) parts.push(`[killed after a ${timeout} ms timeout]`);
         if (!parts.length) parts.push("(no output)");
         const body = parts.join("\n");
