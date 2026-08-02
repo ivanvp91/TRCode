@@ -67,6 +67,9 @@ export class App {
   private pending: string[] = [];
   /** The bottom bar of the running turn, so prompts can step around it. */
   private bar: TurnBar | null = null;
+  /** Highest context threshold already mentioned, so it is said once. */
+  private nudgedAt = 0;
+  private nudgeKey = "";
   /** Releases the turn-cancel key listener; null when no turn is running. */
   private turnKeys: (() => void) | null = null;
 
@@ -604,10 +607,35 @@ export class App {
 
     line();
     padded(bits.join(c.gray(" · ")));
+    this.contextNudge();
 
     if (stopped === "aborted") warn("Interrupted.");
     if (stopped === "max_steps") warn(`Hit the ${this.cfg.maxSteps}-step limit — say "continue" to resume.`);
     if (stopped === "length") warn("The answer was cut off by the model's token limit.");
+  }
+
+  /**
+   * Says once, at each threshold, that the history is what the next turn will
+   * cost. Auto-compaction eventually fires on its own, but by then several
+   * turns have paid full price for a history the user was finished with.
+   */
+  private contextNudge(): void {
+    // Compacting or switching sessions makes the advice relevant again.
+    const key = `${this.session.id}:${this.session.compactions}`;
+    if (key !== this.nudgeKey) {
+      this.nudgeKey = key;
+      this.nudgedAt = 0;
+    }
+    const { used, ratio } = contextPressure(this.session, this.catalog);
+    const level = ratio >= 0.8 ? 80 : ratio >= 0.5 ? 50 : 0;
+    if (!level || level <= this.nudgedAt) return;
+    this.nudgedAt = level;
+    padded(
+      c.gray(
+        `History is ~${fmtTokens(used)} tokens (${Math.round(ratio * 100)}% of the window) and every step re-sends it. ` +
+          `${c.bold("/compact")} digests it, ${c.bold("/new")} starts clean.`,
+      ),
+    );
   }
 }
 

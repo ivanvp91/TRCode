@@ -305,6 +305,20 @@ goes on the wire, byte-for-byte the same on every step. If a host rejects `cache
 the first 400 is caught, the field is dropped and the request is retried once — set
 `"promptCache": false` to skip even that probe.
 
+The cheapest tokens are the ones never fetched, so the system prompt spends ~150 of its
+own on saying how: delegate anything needing more than three files to a read-only subagent
+(its reading stays in *its* context), grep for the line before reading around it with
+offset/limit, never `cat` a file through the shell, never re-read a file already in the
+transcript, prefer `edit` over rewriting. The prompt is 710 tokens and `test/prompt-test.mjs`
+holds it under 900 — it rides along on every request, so it is measured, not just written.
+
+Past half the window, the turn footer says so once per threshold:
+
+```
+   History is ~62k tokens (62% of the window) and every step re-sends it.
+   /compact digests it, /new starts clean.
+```
+
 Reasoning tokens are counted separately, because they bill as **output**: a three-line
 answer can carry 25k tokens of thinking at `high`. If more than half the output is
 reasoning, `/cost` says so and suggests lowering `/effort`.
@@ -519,14 +533,14 @@ npm test
 ```
 
 ```
-PASS  protocol-test.mjs      52/52     PASS  menu-test.mjs
+PASS  protocol-test.mjs      52/52     PASS  repaint-test.mjs    5/5
 PASS  cache-test.mjs         8/8       PASS  resume-test.mjs     39/39
 PASS  shell-output-test.mjs  6/6       PASS  turnbar-test.mjs    21/21
+PASS  prompt-test.mjs        18/18     PASS  menu-test.mjs
 PASS  editor-harness.mjs     11/11     PASS  transcript-test.mjs 8/8
 PASS  paste-test.mjs         9/9       PASS  keyscan-test.mjs    6/6
 PASS  newline-test.mjs       13/13     PASS  shutdown-test.mjs   8/8
-PASS  history-test.mjs       9/9       PASS  repaint-test.mjs    5/5
-PASS  focus-test.mjs         8/8
+PASS  history-test.mjs       9/9       PASS  focus-test.mjs      8/8
 ```
 
 The suites cover the wire protocols and history trimming, plus the terminal behaviour that
