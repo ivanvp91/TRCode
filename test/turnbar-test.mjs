@@ -263,5 +263,74 @@ line("   after the turn");
   process.stdout.write = outerWrite;
 }
 
+// ── the bar answers ctrl+o and steers like the idle editor ──────────────────
+{
+  const paste = await import("../dist/ui/paste.js");
+  const CTRL_O = String.fromCharCode(15);
+  const LF = String.fromCharCode(10);
+  const withHistory = new TurnBar({
+    status: () => ({ left: "model", hint: "esc to interrupt", context: "context: 2%" }),
+    onInterrupt: () => {},
+    history: ["ранее отправленное сообщение"],
+  });
+  screen.reset();
+  withHistory.start();
+  await sleep(20);
+
+  // A shortened block, as the transcript leaves one behind.
+  const outerWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = () => true;
+  paste.rememberCollapsed("длинный блок целиком\n" + "ещё строка\n".repeat(12));
+  process.stdout.write = outerWrite;
+  await key(CTRL_O);
+  {
+    const t = strip(screen.text());
+    check("ctrl+o prints the shortened block mid-turn", t.includes("длинный блок целиком"), t.slice(-400));
+    check("the frame survives the expansion", count(t, "╭") === 1, t);
+    check("the block landed above the frame", t.indexOf("длинный блок целиком") < t.indexOf("╭"), t);
+  }
+
+  // Caret steering inside a wrapped, multi-line draft.
+  for (const ch of "первая") await key(ch);
+  await key(LF); // Ctrl+Enter — newline, not submit
+  for (const ch of "вторая") await key(ch);
+  await key(ESC + "[D"); // left
+  await key(ESC + "[D");
+  await key("X");
+  {
+    const t = strip(screen.text());
+    check("left moves the caret before inserting", /│   вторXая\s+│/.test(t), t);
+  }
+  withHistory.stop();
+
+  // ↑ recalls a submitted line while the model is still working.
+  const third = new TurnBar({
+    status: () => ({ left: "model", hint: "", context: "" }),
+    onInterrupt: () => {},
+    history: ["что было раньше"],
+  });
+  screen.reset();
+  third.start();
+  await sleep(20);
+  await key("черновик");
+  await key(ESC + "[A"); // up — out of the draft into the history
+  {
+    const t = strip(screen.text());
+    check("up recalls history mid-turn", /│ ❯ что было раньше\s+│/.test(t), t);
+  }
+  await key(ESC + "[B"); // down — back to newest, i.e. the held draft
+  {
+    const t = strip(screen.text());
+    check("down returns to the draft", /│ ❯ черновик\s+│/.test(t), t);
+  }
+  await key(ESC + "[A"); // up again…
+  await key("!"); // …and an edit lands in the recalled line
+  {
+    const t = strip(screen.text());
+    check("an edit lands in the recalled line", /│ ❯ что было раньше!\s+│/.test(t), t);
+  }
+  third.stop();
+}
+
 say(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

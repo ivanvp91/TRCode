@@ -10,13 +10,14 @@
 import { c, width } from "./ansi.js";
 import { contentWidth, indent, PAD_LEFT } from "./layout.js";
 import { fmtDuration } from "./layout.js";
-import { refreshFooter, setFooter } from "./render.js";
+import { line, padded, refreshFooter, renderMarkdownBlock, setFooter } from "./render.js";
 import { pushConsumer } from "./stdin.js";
-import { cleanPaste, isNewlineKey, SHIFT_TAB, type EditorStatus } from "./editor.js";
-import { stashPaste } from "./paste.js";
+import { cleanPaste, isNewlineKey, KEY, locatePos, rowSpansOf, SHIFT_TAB, type EditorStatus } from "./editor.js";
+import { stashPaste, takeCollapsed } from "./paste.js";
 
 const CTRL_C = String.fromCharCode(3);
 const CTRL_U = String.fromCharCode(21);
+const CTRL_O = String.fromCharCode(15);
 const ESC = String.fromCharCode(27);
 const DEL = String.fromCharCode(127);
 const BACKSPACE = String.fromCharCode(8);
@@ -156,6 +157,8 @@ export interface TurnBarOptions {
   onInterrupt: () => void;
   /** Shift+Tab: cycles the confirmation mode, same as in the idle editor. */
   onToggleMode?: () => void;
+  /** Submitted lines, for ↑ recall — the same list the idle editor walks. */
+  history?: string[];
 }
 
 export class TurnBar {
@@ -172,6 +175,11 @@ export class TurnBar {
   /** Where the caret sits inside rows(), so the footer can show it there. */
   private caret = { row: 0, col: 0 };
   private buf = "";
+  /** The caret inside `buf`; the bar used to append only, the arrows need it. */
+  private pos = 0;
+  /** -1 while typing; walking the history owns the index until an edit. */
+  private historyIdx = -1;
+  private draft = "";
   private queued: string[] = [];
   private pasting = false;
   private pasteBuf = "";
@@ -268,12 +276,54 @@ export class TurnBar {
     if (isNewlineKey(s)) return this.insert("\n");
     if (s === "\r" || s === "\n") return this.submit();
     if (s === CTRL_U) {
-      this.buf = "";
+      this.buf = this.buf.slice(this.pos);
+      this.pos = 0;
       return refreshFooter();
     }
     if (s === DEL || s === BACKSPACE) {
-      this.buf = [...this.buf].slice(0, -1).join("");
+      // DEL is delete-right, the way the idle editor reads it.
+      if (s === DEL && this.pos < this.buf.length) {
+        this.buf = this.buf.slice(0, this.pos) + this.buf.slice(this.pos + 1);
+        return refreshFooter();
+      }
+      if (this.pos > 0) {
+        this.buf = this.buf.slice(0, this.pos - 1) + this.buf.slice(this.pos);
+        this.pos--;
+      }
       return refreshFooter();
+    }
+    switch (s) {
+      case KEY.left:
+        if (this.pos > 0) this.pos--;
+        return refreshFooter();
+      case KEY.right:
+        if (this.pos < this.buf.length) this.pos++;
+        return refreshFooter();
+      case KEY.home:
+      case KEY.end:
+        this.pos = s === KEY.home ? 0 : this.buf.length;
+        return refreshFooter();
+      case KEY.up:
+      case KEY.down: {
+        // Between the rows of a wrapped draft the arrows steer the caret;
+        // from its top (or bottom) they fall through to the history.
+        if (this.historyIdx === -1 && this.moveLine(s === KEY.up ? -1 : 1)) return refreshFooter();
+        this.historyStep(s === KEY.up ? -1 : 1);
+        return refreshFooter();
+      }
+      case CTRL_O: {
+        // Same walk as in the idle editor: newest shortened block first, then
+        // one further back. The bar steps aside for the block, and start()
+        // puts it back below what was printed.
+        const block = takeCollapsed();
+        if (!block) return;
+        this.pause();
+        line();
+        for (const l of renderMarkdownBlock(block.text)) padded(l);
+        line();
+        this.start();
+        return;
+      }
     }
     if (SHIFT_TAB.includes(s)) {
       // The status row re-reads the mode on every repaint; refresh now rather
@@ -287,8 +337,57 @@ export class TurnBar {
   }
 
   private insert(text: string): void {
-    this.buf += text;
+    this.edited();
+    this.buf = this.buf.slice(0, this.pos) + text + this.buf.slice(this.pos);
+    this.pos += text.length;
     refreshFooter();
+  }
+
+  /**
+   * Editing a recalled line hands the arrows back to the caret, exactly as in
+   * the idle editor.
+   */
+  private edited(): void {
+    this.historyIdx = -1;
+  }
+
+  /**
+   * Same rule as InputEditor.moveLine: rows are what the eye sees — a wrapped
+   * line covers several — and only past the first (or last) row do the arrows
+   * become history.
+   */
+  private moveLine(dir: -1 | 1): boolean {
+    const rows = rowSpansOf(this.buf, Math.max(10, contentWidth() - 5));
+    let at = 0;
+    while (at + 1 < rows.length && rows[at + 1].start <= this.pos) at++;
+    const target = at + dir;
+    if (target < 0 || target >= rows.length) return false;
+    const col = this.pos - rows[at].start;
+    this.pos = rows[target].start + Math.min(col, rows[target].len);
+    return true;
+  }
+
+  /** The idle editor's walk: draft held aside, oldest up, newest back down. */
+  private historyStep(dir: -1 | 1): void {
+    const h = this.opts.history ?? [];
+    if (!h.length) return;
+    if (this.historyIdx === -1) {
+      if (dir === 1) return;
+      this.draft = this.buf;
+      this.historyIdx = h.length - 1;
+    } else {
+      const next = this.historyIdx + dir;
+      if (next < 0) return;
+      if (next >= h.length) {
+        this.historyIdx = -1;
+        this.buf = this.draft;
+        this.pos = this.buf.length;
+        return;
+      }
+      this.historyIdx = next;
+    }
+    this.buf = h[this.historyIdx];
+    this.pos = this.buf.length;
   }
 
   private submit(): void {
@@ -296,6 +395,8 @@ export class TurnBar {
     if (!text) return;
     this.queued.push(text);
     this.buf = "";
+    this.pos = 0;
+    this.edited();
     refreshFooter();
   }
 
@@ -327,8 +428,14 @@ export class TurnBar {
       const marker = i === 0 ? c.brightCyan("❯ ") : c.gray("  ");
       rows.push(indent + c.gray("│") + " " + marker + r.padEnd(inner) + c.gray("│"));
     }
-    // The caret always trails the typed text: this input appends only.
-    this.caret = { row: rows.length - 1, col: PAD_LEFT + 4 + width(bufRows[bufRows.length - 1] ?? "") };
+    // The caret follows this.pos through the wrapped draft, the way the idle
+    // editor parks it.
+    const at = locatePos(this.buf, this.pos, inner);
+    const caretRowBeforeFrame = rows.length - 1;
+    this.caret = {
+      row: caretRowBeforeFrame + 1 + at.row,
+      col: PAD_LEFT + 4 + at.col,
+    };
     rows.push(indent + c.gray("╰" + "─".repeat(w - 2) + "╯"));
 
     const gap = Math.max(2, w - width(st.left) - width(st.hint));

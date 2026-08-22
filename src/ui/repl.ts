@@ -101,6 +101,10 @@ export class App {
   get activeSkills(): Skill[] {
     return this.cfg.skillsEnabled ? this.skills : [];
   }
+  /** Memory joins requests only while enabled: /memory off drops both halves. */
+  get memoryOn(): boolean {
+    return this.cfg.memoryEnabled !== false;
+  }
   todo = new TodoStore();
   broker: PermissionBroker;
   usage: UsageTracker;
@@ -250,6 +254,7 @@ export class App {
       loadedSkills: this.loadedSkills,
       todo: this.todo,
       onTodoChange: () => {},
+      cwd: this.memoryOn ? this.cwd : undefined,
       subagentDeps: {
         cwd: this.cwd,
         catalog: this.catalog,
@@ -406,6 +411,7 @@ export class App {
       status: () => composeStatus({ ...this.status(), hint: "esc to interrupt · enter to queue" }),
       onInterrupt: () => this.abort?.abort(),
       onToggleMode: () => this.toggleAutoApprove(),
+      history: this.history,
     });
     this.bar = bar;
     const spinner = {
@@ -951,6 +957,7 @@ export class App {
       status: () => composeStatus({ ...this.status(), hint: "esc to interrupt · enter to queue" }),
       onInterrupt: () => this.abort?.abort(),
       onToggleMode: () => this.toggleAutoApprove(),
+      history: this.history,
     });
     this.bar = bar;
     const spinner = {

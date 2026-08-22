@@ -95,7 +95,7 @@ const PASTE_END = ESC + "[201~";
 const ENABLE_BRACKETED_PASTE = ESC + "[?2004h";
 const DISABLE_BRACKETED_PASTE = ESC + "[?2004l";
 
-const KEY = {
+export const KEY = {
   up: ESC + "[A",
   down: ESC + "[B",
   right: ESC + "[C",
@@ -190,6 +190,49 @@ export function cleanPaste(s: string): string {
     .replace(new RegExp(ESC + "\\[[0-9;]*[~A-Za-z]", "g"), "")
     .replace(CONTROL_CHARS, "")
     .replace(/\r\n?/g, "\n");
+}
+
+/**
+ * Wraps a buffer into rows that fit inside the frame. Shared with the turn
+ * bar, whose input must look and steer exactly like this one.
+ */
+export function wrapBuf(buf: string, inner: number): string[] {
+  const rows: string[] = [];
+  for (const para of buf.split("\n")) {
+    if (!para.length) {
+      rows.push("");
+      continue;
+    }
+    for (let i = 0; i < para.length; i += inner) rows.push(para.slice(i, i + inner));
+  }
+  return rows.length ? rows : [""];
+}
+
+/** Buffer index → (row, column) inside the wrapped text. */
+export function locatePos(buf: string, pos: number, inner: number): { row: number; col: number } {
+  let remaining = pos;
+  let row = 0;
+  for (const para of buf.split("\n")) {
+    const lines = para.length ? Math.ceil(para.length / inner) : 1;
+    if (remaining <= para.length) {
+      return { row: row + Math.floor(remaining / inner), col: remaining % inner };
+    }
+    remaining -= para.length + 1; // +1 for the newline itself
+    row += lines;
+  }
+  return { row: Math.max(0, row - 1), col: 0 };
+}
+
+/** Where each wrapped row starts in the buffer, and how long it is. */
+export function rowSpansOf(buf: string, inner: number): { start: number; len: number }[] {
+  const rows: { start: number; len: number }[] = [];
+  let at = 0;
+  for (const para of buf.split("\n")) {
+    if (!para.length) rows.push({ start: at, len: 0 });
+    else for (let i = 0; i < para.length; i += inner) rows.push({ start: at + i, len: Math.min(inner, para.length - i) });
+    at += para.length + 1; // +1 for the newline itself
+  }
+  return rows.length ? rows : [{ start: 0, len: 0 }];
 }
 
 export class InputEditor {
@@ -574,7 +617,7 @@ export class InputEditor {
    */
   private moveLine(dir: -1 | 1): boolean {
     if (this.historyIdx !== -1) return false;
-    const rows = this.rowSpans(innerWidth());
+    const rows = rowSpansOf(this.buf, innerWidth());
     // The caret sits on the last row starting at or before it; on a wrap
     // boundary that is the row below, which is where draw() parks it too.
     let at = 0;
@@ -584,18 +627,6 @@ export class InputEditor {
     const col = this.pos - rows[at].start;
     this.pos = rows[target].start + Math.min(col, rows[target].len);
     return true;
-  }
-
-  /** Where each wrapped row starts in the buffer, and how long it is. */
-  private rowSpans(inner: number): { start: number; len: number }[] {
-    const rows: { start: number; len: number }[] = [];
-    let at = 0;
-    for (const para of this.buf.split("\n")) {
-      if (!para.length) rows.push({ start: at, len: 0 });
-      else for (let i = 0; i < para.length; i += inner) rows.push({ start: at + i, len: Math.min(inner, para.length - i) });
-      at += para.length + 1; // +1 for the newline itself
-    }
-    return rows.length ? rows : [{ start: 0, len: 0 }];
   }
 
   private historyStep(dir: -1 | 1): void {
@@ -644,30 +675,12 @@ export class InputEditor {
 
   /** Wraps the buffer into rows that fit inside the frame. */
   private wrap(inner: number): string[] {
-    const rows: string[] = [];
-    for (const para of this.buf.split("\n")) {
-      if (!para.length) {
-        rows.push("");
-        continue;
-      }
-      for (let i = 0; i < para.length; i += inner) rows.push(para.slice(i, i + inner));
-    }
-    return rows.length ? rows : [""];
+    return wrapBuf(this.buf, inner);
   }
 
   /** Buffer index → (row, column) inside the wrapped text. */
   private locate(inner: number): { row: number; col: number } {
-    let remaining = this.pos;
-    let row = 0;
-    for (const para of this.buf.split("\n")) {
-      const lines = para.length ? Math.ceil(para.length / inner) : 1;
-      if (remaining <= para.length) {
-        return { row: row + Math.floor(remaining / inner), col: remaining % inner };
-      }
-      remaining -= para.length + 1; // +1 for the newline itself
-      row += lines;
-    }
-    return { row: Math.max(0, row - 1), col: 0 };
+    return locatePos(this.buf, this.pos, inner);
   }
 
   private erase(): void {
