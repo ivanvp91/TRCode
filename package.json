@@ -36,7 +36,9 @@
     "dev": "tsc -p tsconfig.json --watch",
     "start": "node dist/index.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "node test/run-all.mjs"
+    "test": "node test/run-all.mjs",
+    "prepack": "npm run build",
+    "package": "npm pack"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
