@@ -36,6 +36,8 @@ export interface ProviderMode {
   protocol?: Protocol;
   /** Whether GET {baseUrl}/models returns a usable catalog. */
   listModels: boolean;
+  /** Path of that catalog, for hosts that serve it outside /models. */
+  catalogPath?: string;
   /**
    * Set when that catalog is public. Zen serves its listing to anyone, so a
    * listing that comes back says nothing about the credential — and a login
@@ -422,6 +424,101 @@ const PROVIDERS: ProviderDef[] = [
       },
     },
   },
+  {
+    id: "xai",
+    // "grok": the models are named that, and the subscription people arrive at
+    // the brand rather than the company.
+    aka: ["grok"],
+    label: "xAI",
+    keyHint: "xAI API key (console.x.ai)",
+    modes: {
+      // SuperGrok / X Premium+, against the same proxy the grok CLI uses. The
+      // host speaks the Responses dialect and gates on a fixed header contract:
+      // without X-XAI-Token-Auth / x-authenticateresponse it answers 426, and
+      // unknown x-grok-* names are rejected outright — so only the reviewed
+      // set goes out here, with truthful identity values.
+      oauth: {
+        baseUrl: "https://cli-chat-proxy.grok.com/v1",
+        protocol: "responses",
+        headers: {
+          "X-XAI-Token-Auth": "xai-grok-cli",
+          "x-authenticateresponse": "authenticate-response",
+          "x-grok-client-identifier": "trcode-cli",
+          // The proxy version-gates on this header and answers 426 below its
+          // moving minimum (0.1.202 as of 2026-08-23), whoever the identifier
+          // says is calling. It is the Grok CLI version line, not ours; when
+          // the gate moves again, override via config → providers.xai.headers.
+          "x-grok-client-version": "0.1.202",
+          // A text terminal session; the CLI has no headless route of its own.
+          "x-grok-client-mode": "interactive",
+        },
+        listModels: true,
+        catalogPath: "models-v2",
+        seed: [
+          { id: "grok-4.5", label: "Grok 4.5", contextWindow: 500_000 },
+          { id: "grok-4.20-beta", label: "Grok 4.20 Beta", contextWindow: 2_000_000 },
+        ],
+      },
+      // The pay-per-token console, OpenAI-shaped.
+      apikey: {
+        baseUrl: "https://api.x.ai/v1",
+        protocol: "openai",
+        listModels: true,
+        seed: [],
+      },
+    },
+    oauth: {
+      clientId: "b1a00492-073a-47ea-816f-4c329264a828",
+      deviceAuthUrl: "https://auth.x.ai/oauth2/device/code",
+      tokenUrl: "https://auth.x.ai/oauth2/token",
+      scope: "openid profile email offline_access grok-cli:access api:access conversations:read conversations:write",
+    },
+  },
+  {
+    id: "zai",
+    aka: ["z.ai", "bigmodel"],
+    label: "Z.AI",
+    keyHint: "Z.AI API key (z.ai → API Keys)",
+    hostHint: "Host URL",
+    hosts: [
+      {
+        label: "GLM Coding Plan · international",
+        url: "https://api.z.ai/api/coding/paas/v4",
+        note: "Coding Plan subscription",
+      },
+      {
+        label: "Open platform · international",
+        url: "https://api.z.ai/api/paas/v4",
+        note: "pay-as-you-go",
+      },
+      {
+        label: "GLM Coding Plan · China",
+        url: "https://open.bigmodel.cn/api/coding/paas/v4",
+        note: "bigmodel.cn accounts",
+      },
+      {
+        label: "Open platform · China",
+        url: "https://open.bigmodel.cn/api/paas/v4",
+        note: "pay-as-you-go",
+      },
+    ],
+    modes: {
+      // Key only: the service offers no OAuth grant to third-party clients.
+      // The coding host serves plain chat completions; its listing is thin,
+      // so the roster below is both cold start and fallback.
+      apikey: {
+        baseUrl: "https://api.z.ai/api/coding/paas/v4",
+        protocol: "openai",
+        listModels: true,
+        seed: [
+          { id: "glm-5.3", label: "GLM-5.3", contextWindow: 1_000_000 },
+          { id: "glm-5.2", label: "GLM-5.2", contextWindow: 1_000_000 },
+          { id: "glm-5.1", label: "GLM-5.1", contextWindow: 200_000 },
+          { id: "glm-5-turbo", label: "GLM-5 Turbo", contextWindow: 131_072 },
+        ],
+      },
+    },
+  },
 ];
 
 export function providers(): ProviderDef[] {
@@ -544,7 +641,7 @@ export interface ResolvedAuth {
 /** In-flight refreshes, so a burst of parallel requests renews a token once. */
 const refreshing = new Map<string, Promise<Credentials>>();
 
-async function freshCredentials(def: ProviderDef): Promise<Credentials> {
+async function freshCredentials(def: ProviderDef, force = false): Promise<Credentials> {
   let creds = readCredentials(def.id);
   if (!creds) {
     // A login the vendor's own CLI already did counts as a login here too.
@@ -552,7 +649,7 @@ async function freshCredentials(def: ProviderDef): Promise<Credentials> {
     if (!imported) throw new Error(`${def.label} is not connected. Run: trc auth login --provider ${def.id}`);
     creds = writeCredentials(def.id, imported);
   }
-  if (creds.mode !== "oauth" || !isStale(creds)) return creds;
+  if (creds.mode !== "oauth" || (!force && !isStale(creds))) return creds;
   if (!def.oauth || !creds.refreshToken) {
     throw new Error(`The ${def.label} session expired. Run: trc auth login --provider ${def.id}`);
   }
@@ -569,6 +666,26 @@ async function freshCredentials(def: ProviderDef): Promise<Credentials> {
     .finally(() => refreshing.delete(def.id));
   refreshing.set(def.id, job);
   return job;
+}
+
+/**
+ * Force-renews an OAuth token the host just refused. `isStale` only knows the
+ * expiry the token was issued with; a host can revoke one earlier — a login on
+ * another device, a session cut server-side — and then every request 401s
+ * while a perfectly good refresh token sits on disk. Returns true when a new
+ * access token was obtained and the request is worth resending.
+ */
+export async function renewRejectedToken(providerId: string): Promise<boolean> {
+  const def = providerById(providerId);
+  if (!def?.oauth) return false;
+  const before = readCredentials(def.id);
+  if (before?.mode !== "oauth" || !before.refreshToken) return false;
+  try {
+    const next = await freshCredentials(def, true);
+    return next.accessToken !== before.accessToken;
+  } catch {
+    return false; // the 401 stands and is reported as such
+  }
 }
 
 /** Everything a request needs: where to send it and what to send with it. */

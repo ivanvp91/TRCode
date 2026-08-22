@@ -7,12 +7,12 @@
  * it always is, and anything typed into it is queued and sent when the current
  * turn finishes.
  */
-import { c, width } from "./ansi.js";
+import { c, clipAnsi, width } from "./ansi.js";
 import { contentWidth, indent, PAD_LEFT } from "./layout.js";
 import { fmtDuration } from "./layout.js";
 import { line, padded, refreshFooter, renderMarkdownBlock, setFooter } from "./render.js";
 import { pushConsumer } from "./stdin.js";
-import { cleanPaste, isNewlineKey, KEY, locatePos, rowSpansOf, SHIFT_TAB, type EditorStatus } from "./editor.js";
+import { cleanPaste, isPartialEscape, isNewlineKey, KEY, locatePos, rowSpansOf, SHIFT_TAB, type EditorStatus } from "./editor.js";
 import { stashPaste, takeCollapsed } from "./paste.js";
 
 const CTRL_C = String.fromCharCode(3);
@@ -184,6 +184,8 @@ export class TurnBar {
   private pasting = false;
   private pasteBuf = "";
   private watch = new InterruptWatcher(() => this.opts.onInterrupt());
+  /** The head of an escape sequence whose tail has not arrived yet. */
+  private held = "";
 
   constructor(private opts: TurnBarOptions) {}
 
@@ -256,6 +258,22 @@ export class TurnBar {
     // open: escape bytes inside pasted content are data, not a cancel.
     if (this.watch.feed(s, this.pasting)) return;
 
+    // Only a genuinely cut sequence (ESC[ / ESCO without its final byte) is
+    // held here. A lone ESC is NOT: the interrupt watcher above already waits
+    // out its possible tail, and holding it too would glue the dead byte onto
+    // whatever the user types next — dropping the keystroke entirely.
+    if (!this.pasting && s.length > 1 && isPartialEscape(s)) {
+      // A sequence cut across reads (a slow terminal, a busy stream): held
+      // until its tail arrives, or it reads as text and stray "[" lands in
+      // the draft — and ESC[Z never matches SHIFT_TAB at all.
+      this.held = s;
+      return;
+    }
+    if (this.held) {
+      s = this.held + s;
+      this.held = "";
+    }
+
     if (this.pasting || s.includes(PASTE_START)) {
       const from = s.indexOf(PASTE_START);
       if (from !== -1) s = s.slice(from + PASTE_START.length);
@@ -325,10 +343,21 @@ export class TurnBar {
         return;
       }
     }
-    if (SHIFT_TAB.includes(s)) {
-      // The status row re-reads the mode on every repaint; refresh now rather
-      // than on the next spinner tick, so the flip feels instant.
-      this.opts.onToggleMode?.();
+    if (SHIFT_TAB.some((seq) => s.includes(seq))) {
+      // A chunk can carry more than the key: "abc" + ESC[Z in one read, or two
+      // presses glued together. Strip every occurrence, toggle once per key,
+      // and keep what is left — usually nothing, but the surrounding text
+      // still belongs to the draft.
+      let rest = s;
+      let presses = 0;
+      for (const seq of SHIFT_TAB) {
+        const hits = rest.split(seq).length - 1;
+        presses += hits;
+        rest = rest.split(seq).join("");
+      }
+      const text = cleanPaste(rest).replace(/\n$/, "");
+      for (let i = 0; i < presses; i++) this.opts.onToggleMode?.();
+      if (text) this.insert(text);
       return refreshFooter();
     }
     if (s.startsWith(ESC)) return; // arrows and friends: nothing to do here
@@ -406,34 +435,51 @@ export class TurnBar {
     const w = contentWidth();
     const inner = Math.max(10, w - 5);
     const st = this.opts.status();
+    const queued = this.queued.slice(-2);
+    const bufRows = wrapBuffer(this.buf, inner);
+    // The frame, spinner and status have to fit on screen even while a model
+    // dumps a long reasoning preview: a footer taller than the terminal
+    // scrolls the input box off the bottom, which reads as it having vanished.
+    const chrome =
+      1 + // gap above the live block
+      1 + // spinner
+      queued.length +
+      1 + // top border
+      Math.max(1, bufRows.length) +
+      1 + // bottom border
+      2; // status
+    const termRows = Math.max(10, process.stdout.rows || 24);
+    const thinkRoom = Math.max(0, termRows - chrome - 1);
+    const thinking = this.thinking.slice(-thinkRoom);
+
     const rows: string[] = [];
 
     // A gap between the transcript above and the live block: without it the
     // streamed text and the spinner (or reasoning preview) read as one blob.
     rows.push("");
-    for (const tl of this.thinking) {
+    for (const tl of thinking) {
       rows.push(indent + "  " + c.dim(clipRow(tl, Math.max(10, w - 4))));
     }
     // The preview is its own block; without the gap its last line and the
     // spinner read as one.
-    if (this.thinking.length) rows.push("");
-    rows.push(indent + this.spinnerLine());
-    for (const q of this.queued.slice(-2)) {
+    if (thinking.length) rows.push("");
+    rows.push(indent + clipAnsi(this.spinnerLine(), w));
+    for (const q of queued) {
       rows.push(indent + c.gray("  ⎿ queued: ") + c.dim(clipRow(q, inner - 10)));
     }
 
     rows.push(indent + c.gray("╭" + "─".repeat(w - 2) + "╮"));
-    const bufRows = wrapBuffer(this.buf, inner);
     for (const [i, r] of bufRows.entries()) {
       const marker = i === 0 ? c.brightCyan("❯ ") : c.gray("  ");
       rows.push(indent + c.gray("│") + " " + marker + r.padEnd(inner) + c.gray("│"));
     }
     // The caret follows this.pos through the wrapped draft, the way the idle
-    // editor parks it.
+    // editor parks it. bufRows end at the current last row, so the first of
+    // them is where locatePos's rows count from.
     const at = locatePos(this.buf, this.pos, inner);
-    const caretRowBeforeFrame = rows.length - 1;
+    const firstBufRow = rows.length - bufRows.length;
     this.caret = {
-      row: caretRowBeforeFrame + 1 + at.row,
+      row: firstBufRow + at.row,
       col: PAD_LEFT + 4 + at.col,
     };
     rows.push(indent + c.gray("╰" + "─".repeat(w - 2) + "╯"));
@@ -454,6 +500,11 @@ export class TurnBar {
       this.inTokens || this.outTokens
         ? ` · ↑ ${fmtCompact(this.inTokens)} ↓ ${fmtCompact(this.outTokens)}${cached}`
         : "";
+    // Average over the whole turn so far — thinking and tool calls included.
+    const tps =
+      this.outTokens && Date.now() - this.started > 1000
+        ? ` · ${fmtCompact(Math.round(this.outTokens / ((Date.now() - this.started) / 1000)))} tok/s`
+        : "";
     const hint = this.buf.trim()
       ? c.gray("  enter to queue · esc to interrupt")
       : c.gray("  esc to interrupt · type to queue a message");
@@ -461,7 +512,7 @@ export class TurnBar {
       c.brightMagenta(FRAMES[this.frame % FRAMES.length]) +
       " " +
       c.dim(this.label) +
-      c.gray(` (${elapsed}${counts})`) +
+      c.gray(` (${elapsed}${counts}${tps})`) +
       hint
     );
   }
@@ -490,3 +541,4 @@ function fmtCompact(n: number): string {
   if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0) + "k";
   return (n / 1_000_000).toFixed(2) + "M";
 }
+

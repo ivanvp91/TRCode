@@ -13,10 +13,11 @@
 agent in the spirit of Claude Code, with live model switching, subagents, skills and
 token accounting.
 
-One client, seven providers: the TokenRouter catalog, Kimi, Anthropic, OpenRouter,
-OpenCode Zen, OpenCode Go and Alibaba Cloud (Qwen) — subscriptions and API keys side by
-side, each model served on the wire protocol its vendor speaks (OpenAI chat, Responses
-and Anthropic Messages), with reasoning effort and prompt caching shaped per host.
+One client, nine providers: the TokenRouter catalog, Kimi, Anthropic, OpenRouter,
+OpenCode Zen, OpenCode Go, Alibaba Cloud (Qwen), xAI (Grok) and Z.AI — subscriptions and
+API keys side by side, each model served on the wire protocol its vendor speaks (OpenAI
+chat, Responses and Anthropic Messages), with reasoning effort and prompt caching shaped
+per host.
 
 Node 20+ on Windows, macOS and Linux; zero runtime dependencies (native `fetch`,
 raw-mode TTY, ANSI).
@@ -64,6 +65,8 @@ trc auth login --provider openrouter    # OpenRouter key (sk-or-…)
 trc auth login --provider opencode      # OpenCode Zen key; /login zen works too
 trc auth login --provider opencode-go   # the Go subscription; /login go works too
 trc auth login --provider alibabacloud  # QwenCloud key; asks which host it is for
+trc auth login --provider xai           # SuperGrok subscription or a console.x.ai key
+trc auth login --provider zai           # Z.AI / bigmodel key; asks which host it is for
 trc auth login --provider kimi --oauth  # subscription, via an OAuth device code
 trc auth login --provider kimi --key    # Moonshot platform key, pay per token
 trc auth status                         # every provider, one line each

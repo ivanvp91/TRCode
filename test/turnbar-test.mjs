@@ -225,6 +225,53 @@ line("   after the turn");
   setFooter(null);
 }
 
+// Growing the bar used to paint extra rows below it and the terminal scrolled
+// the input frame off the bottom — the box "vanished" while the model thought.
+{
+  const { setFooter, refreshFooter } = await import("../dist/ui/render.js");
+  const grow = new Screen(100);
+  const outerWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { grow.write(String(chunk)); return true; };
+
+  for (let i = 0; i < 8; i++) grow.write("transcript " + i + "\n");
+  const bottomBefore = grow.maxRow;
+  let rows = ["  ⠋ thinking", "  ╭────╮", "  │ ❯  │", "  ╰────╯"];
+  setFooter(() => rows);
+  const bottomWithBar = grow.maxRow;
+  rows = ["  reasoning one", "  reasoning two", "  ⠙ thinking", "  ╭────╮", "  │ ❯  │", "  ╰────╯"];
+  refreshFooter();
+
+  process.stdout.write = outerWrite;
+  const t = grow.lines().map(strip).join("\n");
+  check("growing the bar does not scroll the frame off", grow.maxRow === bottomWithBar, `before ${bottomBefore} with-bar ${bottomWithBar} after ${grow.maxRow}`);
+  check("the input frame is still on screen after reasoning arrives", /╭────╮/.test(t) && /│ ❯/.test(t), t);
+  setFooter(null);
+}
+
+// A 10-line reasoning preview plus the frame must not exceed the terminal.
+{
+  const origRows = process.stdout.rows;
+  Object.defineProperty(process.stdout, "rows", { value: 16, configurable: true });
+  const tight = new TurnBar({
+    status: () => ({ left: "model", hint: "esc", context: "ctx" }),
+    onInterrupt: () => {},
+  });
+  screen.reset();
+  tight.start();
+  tight.setThinking(Array.from({ length: 12 }, (_, i) => `reason line ${i}`));
+  await sleep(20);
+  const shown = strip(screen.text());
+  const frameAt = shown.lastIndexOf("╭");
+  check("a long reasoning preview still shows the frame", frameAt !== -1, shown);
+  check(
+    "the preview is clipped so the frame fits",
+    (shown.match(/reason line/g) || []).length < 12 && /reason line 11/.test(shown),
+    shown,
+  );
+  tight.stop();
+  Object.defineProperty(process.stdout, "rows", { value: origRows, configurable: true });
+}
+
 // ── a frame reaches the terminal whole ──────────────────────────────────────
 // Flicker is a frame the terminal caught half-drawn: the bar erased, its
 // replacement not yet written. So each frame must be one write, must not blank

@@ -17,6 +17,7 @@ import {
   saveConfig,
   configPath,
   rememberProjectState,
+  sessionsDir,
   VERSION,
   EFFORT_LEVELS,
   LANGUAGES,
@@ -59,7 +60,8 @@ import { compactSession, contextPressure } from "../session/compact.js";
 import { pushConsumer } from "./stdin.js";
 import { dropStore, forgetFrom, listCheckpoints, rewindFiles, type Checkpoint } from "../session/checkpoint.js";
 import { collapsedCount, collapsedText } from "./paste.js";
-import { fmtTokens, historyTokens, estimateTokens } from "../usage.js";
+import { fmtTokens, fmtCost, historyTokens, estimateTokens } from "../usage.js";
+import type { ModelUsage } from "../usage.js";
 import { buildSystemPrompt } from "../agent/prompt.js";
 import { runSwarm } from "../agent/swarm.js";
 import { runOrchestration } from "../agent/orchestrator.js";
@@ -1519,6 +1521,171 @@ const COMMANDS: Command[] = [
         );
       }
 
+      line();
+    },
+  },
+  {
+    name: "/stat",
+    group: "session",
+    help: () => t("usage by provider and model, with period filters", "расход по провайдерам и моделям, с фильтром по периоду"),
+    async run(app) {
+      /** Every stored request row; per-model rows keep their lastUsed. */
+      const loadAll = (): ModelUsage[] => {
+        const out: ModelUsage[] = [];
+        let dir: string;
+        try {
+          dir = sessionsDir(app.cwd);
+        } catch {
+          return [];
+        }
+        for (const n of fs.readdirSync(dir)) {
+          if (!n.endsWith(".json")) continue;
+          try {
+            const data = JSON.parse(fs.readFileSync(path.join(dir, n), "utf8"));
+            for (const u of data.usage ?? []) out.push(u);
+          } catch {
+            /* skip corrupt files */
+          }
+        }
+        // The live session's numbers are fresher than its last save: its rows
+        // replace whatever the file on disk still holds.
+        return out.filter((u) => !app.usage.all().some((l) => l.model === u.model)).concat(app.usage.all());
+      };
+
+      const PERIODS = [
+        { value: "today" as const, label: "Today", key: "t" },
+        { value: "week" as const, label: "Week", key: "w" },
+        { value: "month" as const, label: "Month", key: "m" },
+        { value: "all" as const, label: "All time", key: "a" },
+      ];
+      const sinceOf = (p: (typeof PERIODS)[number]["value"]): number => {
+        if (p === "all") return 0;
+        const d = new Date();
+        if (p === "today") d.setHours(0, 0, 0, 0);
+        else if (p === "week") d.setDate(d.getDate() - 7);
+        else d.setDate(d.getDate() - 30);
+        return d.getTime();
+      };
+
+      const all = loadAll();
+      line();
+      rule(c.brightCyan(" usage "));
+      if (!all.length) {
+        hint("No usage recorded yet.");
+        line();
+        return;
+      }
+
+      /** Folds raw per-session rows into one ModelUsage per model. */
+      const fold = (rows: ModelUsage[]): Map<string, ModelUsage> => {
+        const m = new Map<string, ModelUsage>();
+        for (const u of rows) {
+          const e = m.get(u.model) ?? { ...u };
+          for (const k of ["requests", "input", "output", "cached", "reasoning", "costUsd"] as const) e[k] += u[k];
+          e.priceUnknown = e.priceUnknown || u.priceUnknown;
+          e.lastUsed = Math.max(e.lastUsed ?? 0, u.lastUsed ?? 0);
+          m.set(u.model, e);
+        }
+        return m;
+      };
+
+      const totalsLine = (rows: Map<string, ModelUsage>): void => {
+        let input = 0, output = 0, cached = 0, reasoning = 0, cost = 0, reqs = 0, unknown = false, models = 0;
+        for (const u of rows.values()) {
+          input += u.input; output += u.output; cached += u.cached;
+          reasoning += u.reasoning ?? 0; cost += u.costUsd; reqs += u.requests;
+          models++;
+          unknown = unknown || u.priceUnknown;
+        }
+        const fresh = Math.max(0, input - cached);
+        padded(
+          `${c.gray("models")} ${String(models).padStart(4)}  ${c.gray("reqs")} ${String(reqs).padStart(5)}  ` +
+            `${c.gray("↑")} ${fmtTokens(fresh)} ${c.gray(`(${cached && input ? Math.round((cached / input) * 100) : 0}% cached)`.padEnd(13))}` +
+            `${c.gray("↓")} ${fmtTokens(output)}  ` +
+            `${c.gray("cost")} ${c.bold(fmtCost(cost, unknown))}`,
+        );
+      };
+
+      // Overview first: everything on record.
+      totalsLine(fold(all));
+      hint(t("input* is fresh tokens only, cache reads are in the cached column.", "input* — только чистые токены, чтения из кеша — в колонке cached."));
+
+      const renderTable = (rows: Map<string, ModelUsage>): void => {
+        const byProvider = new Map<string, ModelUsage[]>();
+        for (const u of rows.values()) {
+          const pid = splitModelId(u.model).providerId;
+          (byProvider.get(pid) ?? byProvider.set(pid, []).get(pid)!).push(u);
+        }
+        const row =
+          (label: string, u: { requests: number; input: number; cached: number; output: number; reasoning: number }) =>
+            `${label.padEnd(32)} ${String(u.requests).padStart(5)} ${fmtTokens(Math.max(0, u.input - u.cached)).padStart(9)} ` +
+            `${(u.cached ? fmtTokens(u.cached) : "—").padStart(9)} ${fmtTokens(u.output).padStart(9)} ` +
+            `${(u.reasoning ? fmtTokens(u.reasoning) : "—").padStart(10)}`;
+        const header =
+          c.gray(`${"model".padEnd(32)} ${"reqs".padStart(5)} ${"input*".padStart(9)} ${"cached".padStart(9)} ${"output".padStart(9)} ${"reasoning".padStart(10)}`);
+        for (const pid of [...byProvider.keys()].sort()) {
+          line();
+          padded(c.bold(c.brightBlue(providerLabel(pid))));
+          padded(header);
+          let cost = 0;
+          let unknown = false;
+          const list = byProvider.get(pid)!;
+          for (const u of list) {
+            padded(row(u.model.includes(":") ? u.model.slice(u.model.indexOf(":") + 1) : u.model, u));
+            cost += u.costUsd;
+            unknown = unknown || u.priceUnknown;
+          }
+          const sub = list.reduce(
+            (a, u) => ({
+              requests: a.requests + u.requests,
+              input: a.input + u.input,
+              cached: a.cached + u.cached,
+              output: a.output + u.output,
+              reasoning: a.reasoning + (u.reasoning ?? 0),
+            }),
+            { requests: 0, input: 0, cached: 0, output: 0, reasoning: 0 },
+          );
+          padded(c.gray("─".repeat(Math.min(80, contentWidth()))));
+          padded(c.gray(row("subtotal", sub)) + c.gray(`   cost ${fmtCost(cost, unknown)}`));
+        }
+      };
+
+      // Drill down: pick a period, then a provider. Esc keeps it closed.
+      const period = await choose(PERIODS.map((p) => ({ ...p, label: p.label === "All time" ? t("All time", "Всё время") : p.value === "today" ? t("Today", "Сегодня") : p.value === "week" ? t("Week", "Неделя") : t("Month", "Месяц"), key: p.key })), {
+        fallback: "all",
+        initial: "all",
+        cancel: () => {},
+      });
+      const since = sinceOf(period);
+
+      const inPeriod = all.filter((u) => !u.lastUsed || u.lastUsed >= since);
+      const folded = fold(inPeriod);
+      if (!folded.size) {
+        line();
+        hint(t("No usage in this period.", "За этот период расхода нет."));
+        line();
+        return;
+      }
+
+      const providers = [...new Set([...folded.values()].map((u) => splitModelId(u.model).providerId))].sort();
+      const provChoices = [
+        ...(providers.length > 1
+          ? [{ value: "__all__" as const, label: t("All providers", "Все провайдеры"), key: "A" }]
+          : []),
+        ...providers.map((pid) => ({ value: pid, label: providerLabel(pid), key: pid[0]?.toUpperCase() })),
+      ];
+      const picked = providers.length > 1
+        ? await choose(provChoices, { fallback: "__all__", initial: "__all__", cancel: () => {} })
+        : providers[0];
+
+      line();
+      const periodLabel = period === "today" ? t("today", "сегодня") : period === "week" ? t("last 7 days", "7 дней") : period === "month" ? t("last 30 days", "30 дней") : t("all time", "всё время");
+      rule(c.brightCyan(` ${periodLabel} `));
+      renderTable(
+        picked === "__all__"
+          ? folded
+          : new Map([...folded].filter(([model]) => splitModelId(model).providerId === picked)),
+      );
       line();
     },
   },

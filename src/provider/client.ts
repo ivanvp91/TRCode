@@ -3,10 +3,12 @@ import { loadConfig, saveConfig, type Effort } from "../config.js";
 import type { Message, StreamEvent, ToolCall, ToolDef, Usage } from "../types.js";
 import { type Protocol } from "./protocol.js";
 import {
+  DEFAULT_PROVIDER,
   modeConfig,
   modeFor,
   protocolForModel,
   qualifyModelId,
+  renewRejectedToken,
   resolveAuth,
   splitModelId,
   wireModelId,
@@ -385,6 +387,7 @@ async function postWithRetry(
   let rateRetries = 0;
   let rateWaited = 0;
   let transientRetries = 0;
+  let authRenewed = false;
   for (;;) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     let res: Response;
@@ -398,7 +401,15 @@ async function postWithRetry(
     }
     if (res.ok) return res;
     const text = await res.text().catch(() => "");
-    const err = new ApiError(describeStatus(res.status, text), res.status, text);
+    // A host can revoke an OAuth access token before its stated expiry — a
+    // login on another device, a session cut server-side — and `isStale`
+    // cannot see that. The refresh token usually still stands, so renew once
+    // and resend before reporting the key as bad.
+    if (res.status === 401 && !authRenewed) {
+      authRenewed = true;
+      if (await abortable(renewRejectedToken(splitModelId(model).providerId), signal)) continue;
+    }
+    const err = new ApiError(describeStatus(res.status, text, model), res.status, text);
     if (!RETRYABLE.has(res.status)) throw err;
     const rateLimited = res.status === 429;
     if (rateLimited ? rateRetries >= RATE_LIMIT_RETRIES || rateWaited >= RATE_LIMIT_PATIENCE_MS : transientRetries >= TRANSIENT_RETRIES) throw err;
@@ -424,8 +435,12 @@ async function postWithRetry(
   }
 }
 
-function describeStatus(status: number, body: string): string {
+function describeStatus(status: number, body: string, model?: string): string {
   const detail = extractError(body);
+  // The fix for a bad key is provider-specific: `trc auth login` alone
+  // re-auths TokenRouter, which is not the host that just refused.
+  const provider = model ? splitModelId(model).providerId : undefined;
+  const loginCmd = provider && provider !== DEFAULT_PROVIDER ? `trc auth login --provider ${provider}` : "trc auth login";
   // Model Studio's content filter, which reads source code as inappropriate
   // content. The message alone reads like the request was malformed.
   if (/DataInspection|inappropriate content|content.?(filter|policy|moderation)/i.test(detail)) {
@@ -435,7 +450,7 @@ function describeStatus(status: number, body: string): string {
   }
   switch (status) {
     case 401:
-      return `401 — key rejected. Check with: trc auth login${detail ? ` (${detail})` : ""}`;
+      return `401 — key rejected. Check with: ${loginCmd}${detail ? ` (${detail})` : ""}`;
     case 403:
       return `403 — access to this model is denied${detail ? ` (${detail})` : ""}`;
     case 402:
@@ -460,7 +475,10 @@ function describeStatus(status: number, body: string): string {
 function extractError(body: string): string {
   try {
     const j = JSON.parse(body);
-    return String(j?.error?.message ?? j?.message ?? "").slice(0, 300);
+    // {"error": {"message": …}} is the common shape; the grok proxy sends
+    // {"error": "…"} — a bare string, which used to read as no detail at all.
+    const e = j?.error;
+    return String((typeof e === "string" ? e : e?.message) ?? j?.message ?? "").slice(0, 300);
   } catch {
     return body.slice(0, 200).replace(/\s+/g, " ").trim();
   }
@@ -955,11 +973,12 @@ export async function verifyProvider(providerId: string): Promise<ProviderCheck>
     return { ok: false, detail: (err as Error).message };
   }
   try {
-    const res = await fetch(`${auth.baseUrl}/models`, { headers: auth.headers });
+    const mode = modeFor(providerId);
+    const catalog = (mode ? modeConfig(providerId, mode) : null)?.catalogPath ?? "models";
+    const res = await fetch(`${auth.baseUrl}/${catalog}`, { headers: auth.headers });
     if (res.ok) {
       const body: any = await res.json().catch(() => ({}));
       const list: any[] = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : [];
-      const mode = modeFor(providerId);
       const cfg = mode ? modeConfig(providerId, mode) : null;
       // A public listing answers the same to everyone: it has said nothing
       // about the credential, so the credential has to be asked elsewhere.

@@ -76,7 +76,7 @@ const PASTE_TIMEOUT_MS = 3000;
  * True when `s` looks like the beginning of an escape sequence whose final
  * byte has not arrived yet. A lone ESC is NOT partial — that is the Esc key.
  */
-function isPartialEscape(s: string): boolean {
+export function isPartialEscape(s: string): boolean {
   if (!s.startsWith(ESC)) return false;
   if (s.length > 16) return false; // too long to be a key; treat as text
   // A bare ESC is ambiguous: the Esc key, or the first byte of a sequence

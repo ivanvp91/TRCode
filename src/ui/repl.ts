@@ -287,13 +287,19 @@ export class App {
    */
   async composePrompt(task: string): Promise<string | null> {
     const model = promptModelFor(this.session.model, this.catalog);
-    const spinner = new Spinner(tr(`writing the brief on ${wireModelId(model)}`, `пишу задание на ${wireModelId(model)}`));
-    spinner.start();
+    const label = tr(`writing the brief on ${wireModelId(model)}`, `пишу задание на ${wireModelId(model)}`);
+    // Mid-turn the bar already owns the bottom of the screen and stdin; a
+    // second spinner on top of it would hide the input frame. Idle (from
+    // /prompt) still needs its own spinner and Esc listener.
+    const bar = this.bar;
+    const spinner = bar ? null : new Spinner(label);
     const ac = new AbortController();
-    const composeWatch = new InterruptWatcher(() => ac.abort());
-    const release = process.stdin.isTTY
-      ? pushConsumer((buf) => void composeWatch.feed(buf.toString("utf8")))
+    const composeWatch = bar ? null : new InterruptWatcher(() => ac.abort());
+    const release = !bar && process.stdin.isTTY
+      ? pushConsumer((buf) => void composeWatch!.feed(buf.toString("utf8")))
       : () => {};
+    bar?.setLabel(label);
+    spinner?.start();
     try {
       return await composePrompt({
         task,
@@ -302,7 +308,7 @@ export class App {
         skills: this.activeSkills,
         catalog: this.catalog,
         effort: effortFor(model, this.effortOverride),
-        signal: ac.signal,
+        signal: bar ? this.abort?.signal ?? ac.signal : ac.signal,
         usage: this.usage,
       });
     } catch (err) {
@@ -310,9 +316,10 @@ export class App {
       else warn(tr(`Could not write the brief: ${(err as Error).message}`, `Не удалось составить задание: ${(err as Error).message}`));
       return null;
     } finally {
-      composeWatch.stop();
+      composeWatch?.stop();
       release();
-      spinner.stop();
+      spinner?.stop();
+      bar?.setLabel("thinking");
     }
   }
 
@@ -925,18 +932,41 @@ export class App {
     // Created before auto-compaction, not after: the compaction request has to
     // hang off the same signal, or Esc cannot reach it.
     this.abort = new AbortController();
+    // The bar goes up before auto-compaction and the brief rewrite, not after:
+    // either can run for minutes on a full window, and a missing input frame
+    // for that long reads as the CLI having died.
+    const bar = new TurnBar({
+      status: () => composeStatus({ ...this.status(), hint: "esc to interrupt · enter to queue" }),
+      onInterrupt: () => this.abort?.abort(),
+      onToggleMode: () => this.toggleAutoApprove(),
+      history: this.history,
+    });
+    this.bar = bar;
+    const spinner = {
+      setLabel: (l: string) => bar.setLabel(l),
+      setTokens: (i: number, o: number, cached?: number) => bar.setTokens(i, o, cached),
+      start: () => {},
+      stop: () => {},
+    };
+    bar.start();
+
     await this.maybeAutoCompact();
     if (this.abort.signal.aborted) {
       warn(tr("Interrupted.", "Прервано."));
       this.abort = null;
-      // The prompt never went out; hand it back instead of losing it.
-      this.editor?.prefill(text);
+      // Nothing went out — not the prompt, not whatever was typed into the
+      // frame meanwhile. Hand all of it back instead of losing it.
+      const { queued, draft } = bar.stop();
+      this.bar = null;
+      const held = [text, ...queued, draft].filter(Boolean).join("\n");
+      if (held) this.editor?.prefill(held);
       return;
     }
 
     userEcho(text);
     // Rewriting happens after the echo: what the user typed stays on screen as
-    // they typed it, with the brief under it.
+    // they typed it, with the brief under it. The bar stays up — a missing
+    // frame here is the same bug as during auto-compaction.
     text = await this.maybeRewrite(text);
     this.coldCacheNudge();
     // Opened before the prompt joins the history, so /rewind can cut the
@@ -952,20 +982,8 @@ export class App {
 
     const started = Date.now();
     // The bar owns stdin for the duration of the turn: it interrupts on Esc
-    // and keeps the input frame on screen, so no separate key listener.
-    const bar = new TurnBar({
-      status: () => composeStatus({ ...this.status(), hint: "esc to interrupt · enter to queue" }),
-      onInterrupt: () => this.abort?.abort(),
-      onToggleMode: () => this.toggleAutoApprove(),
-      history: this.history,
-    });
-    this.bar = bar;
-    const spinner = {
-      setLabel: (l: string) => bar.setLabel(l),
-      setTokens: (i: number, o: number, cached?: number) => bar.setTokens(i, o, cached),
-      start: () => {},
-      stop: () => {},
-    };
+    // and keeps the input frame on screen. It was raised above, before the
+    // compaction and rewrite that can each take minutes.
     let streaming = false;
     let inToolGroup = false;
     let lastTool = "";
@@ -1022,8 +1040,6 @@ export class App {
       this.progress(tr("waiting for MCP servers…", "жду MCP-серверы…"));
       await mcpSettled();
     }
-
-    bar.start();
 
     try {
       const result = await this.runWithFailover({
@@ -1328,23 +1344,20 @@ export class App {
     if (!shouldAutoCompact(this.session, this.catalog)) return;
     const { used, ratio } = contextPressure(this.session, this.catalog);
     info(tr(`History reached ~${fmtTokens(used)} tokens (${Math.round(ratio * 100)}% of the window) — compacting…`, `История доросла до ~${fmtTokens(used)} токенов (${Math.round(ratio * 100)}% окна) — сжимаю…`));
-    const spinner = new Spinner("compacting context");
-    spinner.start();
-    // No bar runs yet, so without this listener nothing on the stdin stack
-    // would see Esc — a hung compaction request would be uninterruptible.
-    this.attachTurnKeys();
+    // The turn bar is already up (raised before this ran), so the label lands
+    // on it and the input frame stays on screen for the whole compaction.
+    const bar = this.bar;
+    bar?.setLabel(tr("compacting context", "сжимаю контекст"));
     try {
       const res = await compactSession(this.session, { catalog: this.catalog, signal: this.abort?.signal });
-      spinner.stop();
       if (res.summary) info(tr(`Compacted ${res.droppedMessages} messages, ${res.keptMessages} left.`, `Сжато ${nOf(res.droppedMessages, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}, осталось ${res.keptMessages}.`));
     } catch (err) {
-      spinner.stop();
       // The caller reports an interruption; here it is not a failure.
       if ((err as Error)?.name !== "AbortError") {
         warn(tr(`Could not compact the context: ${(err as Error).message}`, `Не удалось сжать контекст: ${(err as Error).message}`));
       }
     } finally {
-      this.detachTurnKeys();
+      bar?.setLabel("thinking");
     }
   }
 
@@ -1369,6 +1382,9 @@ export class App {
         (t.reasoning ? c.gray(` · ${fmtTokens(t.reasoning)} of it reasoning`) : ""),
       c.gray(nOf(steps, ["step", "steps"], ["шаг", "шага", "шагов"])),
       c.gray(fmtDuration(elapsedMs)),
+      elapsedMs > 1000 && t.output
+        ? c.gray(`${fmtTokens(Math.round((t.output / elapsedMs) * 1000))} tok/s avg`)
+        : "",
     ].filter(Boolean);
 
     line();

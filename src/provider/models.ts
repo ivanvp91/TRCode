@@ -85,6 +85,8 @@ const CONTEXT_RULES: ContextRule[] = [
   // stays at the 200k it was released with.
   { match: /^claude/, from: 5, window: 1_000_000 },
   { match: /^claude/, window: 200_000 },
+  // The ox-alpha stealth preview (OpenCode Go, OpenRouter) states 1.05M.
+  { match: /^ox-alpha/, window: 1_050_000 },
   // GPT-5.4 raised the line to 1M; the earlier 5.x are 400k.
   { match: /^gpt-5/, from: 5.4, window: 1_050_000 },
   { match: /^gpt-5/, window: 400_000 },
@@ -503,7 +505,8 @@ async function fetchProviderModels(
 
   try {
     const auth = await resolveAuth(providerId);
-    const res = await fetch(`${auth.baseUrl}/models`, { headers: auth.headers, signal: opts.signal });
+    const catalog = modeCfg.catalogPath ?? "models";
+    const res = await fetch(`${auth.baseUrl}/${catalog}`, { headers: auth.headers, signal: opts.signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body: any = await res.json();
     const list: any[] = Array.isArray(body) ? body : body?.data ?? [];

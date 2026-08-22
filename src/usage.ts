@@ -11,6 +11,8 @@ export interface ModelUsage {
   costUsd: number;
   /** True when we had no price for this model and cost is unknown. */
   priceUnknown: boolean;
+  /** When this model was last used, so /stat can filter by period. */
+  lastUsed?: number;
 }
 
 export interface TurnTotals {
@@ -40,7 +42,7 @@ export class UsageTracker {
     priceUnknown: false,
   };
 
-  record(model: string, usage: Usage | undefined, catalog: ModelInfo[]): void {
+  record(model: string, usage: Usage | undefined, catalog: ModelInfo[], at = Date.now()): void {
     if (!usage) return;
     const price = catalog.find((m) => m.id === model)?.pricing;
     const cached = usage.cached_tokens ?? 0;
@@ -68,6 +70,7 @@ export class UsageTracker {
     entry.reasoning += usage.reasoning_tokens ?? 0;
     entry.costUsd += cost;
     entry.priceUnknown = entry.priceUnknown || !price;
+    entry.lastUsed = Math.max(entry.lastUsed ?? 0, at);
     this.byModel.set(model, entry);
 
     this.lastTurn = {
@@ -122,6 +125,7 @@ export class UsageTracker {
       entry.reasoning += u.reasoning ?? 0;
       entry.costUsd += u.costUsd;
       entry.priceUnknown = entry.priceUnknown || u.priceUnknown;
+      entry.lastUsed = Math.max(entry.lastUsed ?? 0, u.lastUsed ?? 0);
       this.byModel.set(u.model, entry);
     }
   }

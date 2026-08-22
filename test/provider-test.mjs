@@ -603,6 +603,40 @@ ok("refresh без токена — внятная ошибка", denied === "no
 
 server.close();
 
+// ── renewRejectedToken: хост отозвал токен до срока ───────────────────────
+// По часам токен свежий, isStale его не тронет — обновить может только
+// принудительный путь, который дергается после 401 от хоста.
+creds.writeCredentials("kimi", {
+  mode: "oauth",
+  accessToken: "revoked-token",
+  refreshToken: "still-good-refresh",
+  expiresAt: Date.now() + 3600_000,
+});
+const realFetch = globalThis.fetch;
+let refreshCalls = 0;
+globalThis.fetch = async () => {
+  refreshCalls++;
+  return new Response(JSON.stringify({ access_token: "renewed-token", expires_in: 900 }), {
+    status: 200,
+    headers: { "Content-Type": "application/json" },
+  });
+};
+try {
+  const renewed = await registry.renewRejectedToken("kimi");
+  ok("отозванный до срока токен обновлён принудительно", renewed === true);
+  ok("refresh сходил на token-endpoint один раз", refreshCalls === 1, String(refreshCalls));
+  const after = creds.readCredentials("kimi");
+  ok("новый access сохранён на диск", after?.accessToken === "renewed-token", after?.accessToken);
+  ok("refresh-токен не потерян", after?.refreshToken === "still-good-refresh");
+} finally {
+  globalThis.fetch = realFetch;
+}
+
+// Когда обновлять нечем, ответ — false без похода в сеть: 401 остаётся 401.
+creds.writeCredentials("kimi", { mode: "apikey", accessToken: "sk-platform-key" });
+ok("api-ключ не «обновляется»", (await registry.renewRejectedToken("kimi")) === false);
+ok("tokenrouter без oauth — false", (await registry.renewRejectedToken("tokenrouter")) === false);
+
 // ── cleanup ───────────────────────────────────────────────────────────────
 try {
   fs.rmSync(HOME, { recursive: true, force: true });

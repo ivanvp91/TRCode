@@ -52,6 +52,7 @@ const SUITES = [
   "indent-test.mjs",
   "resume-test.mjs",
   "turnbar-test.mjs",
+  "turnbar-mode-test.mjs",
   "transcript-test.mjs",
   "keyscan-test.mjs",
   "shutdown-test.mjs",

@@ -270,7 +270,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       throw err instanceof ApiError ? err : new Error(`Request failed: ${(err as Error).message}`);
     }
 
-    opts.usage.record(opts.model, usage, opts.catalog);
+    opts.usage.record(opts.model, usage, opts.catalog, Date.now());
     events?.onUsage?.(opts.model, usage);
 
     const assistantMsg: Message = {

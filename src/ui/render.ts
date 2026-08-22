@@ -101,8 +101,16 @@ function drawSeq(lines: string[]): string {
  */
 function repaintSeq(lines: string[]): string {
   const prev = footerRows;
+  // Growing paints extra rows below the old bar and the terminal scrolls —
+  // the input frame walks off the bottom, which is exactly "the box vanished
+  // while the model was thinking". Start `grow` rows higher instead, so the
+  // new lines overwrite the transcript above and the bottom stays put.
+  const grow = Math.max(0, lines.length - prev);
   let body =
-    esc.hide + esc.toColumn(1) + esc.up(footerCursorRow) + lines.map((l) => CLEAR_LINE + l).join("\n");
+    esc.hide +
+    esc.toColumn(1) +
+    esc.up(footerCursorRow + grow) +
+    lines.map((l) => CLEAR_LINE + l).join("\n");
   // A shorter bar leaves rows of the taller one below it. That row exists, so
   // stepping onto it to clear downwards cannot scroll the transcript.
   if (lines.length < prev) body += "\n" + esc.clearDown + esc.up(1);
@@ -906,6 +914,10 @@ export class Spinner {
       this.inTokens || this.outTokens
         ? ` · ↑ ${fmtCompact(this.inTokens)} ↓ ${fmtCompact(this.outTokens)}`
         : "";
+    const tps =
+      this.outTokens && Date.now() - this.started > 1000
+        ? ` · ${fmtCompact(Math.round(this.outTokens / ((Date.now() - this.started) / 1000)))} tok/s`
+        : "";
     cursor.clearLine();
     cursor.toColumn(0);
     out(
@@ -913,7 +925,7 @@ export class Spinner {
         c.brightMagenta(FRAMES[this.i++ % FRAMES.length]) +
         " " +
         c.dim(this.label) +
-        c.gray(` (${elapsed}${counts})`) +
+        c.gray(` (${elapsed}${counts}${tps})`) +
         c.gray("  esc to interrupt"),
     );
   }
