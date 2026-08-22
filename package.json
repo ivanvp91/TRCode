@@ -16,7 +16,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ivanvp91/tokenrouter-cli.git"
+    "url": "git+https://github.com/ivanvp91/TRCode.git"
   },
   "homepage": "https://github.com/ivanvp91/tokenrouter-cli#readme",
   "bugs": {
