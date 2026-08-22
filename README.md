@@ -9,7 +9,7 @@
     ╚═╝   ╚═╝  ╚═╝
 ```
 
-**TRCode** (formerly TokenRouter Code) — a cross-platform agentic coding CLI: a terminal
+**TRCode** — a cross-platform agentic coding CLI: a terminal
 agent in the spirit of Claude Code, with live model switching, subagents, skills and
 token accounting.
 
