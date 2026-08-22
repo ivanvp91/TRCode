@@ -5,6 +5,7 @@ import os from "node:os";
 import { spawnSync } from "node:child_process";
 import { loadConfig, loadProjectInstructions, type Lang } from "../config.js";
 import { skillsPromptSection, type Skill } from "../skills/loader.js";
+import { memorySection } from "../tools/memory.js";
 
 const BASE = `You are TRCode, a coding agent in the terminal. You work on a real filesystem and change real files.
 
@@ -34,7 +35,10 @@ Every step re-sends the whole conversation, so what you pull in you pay for agai
 - Answering one question needs more than about three files opened? Delegate it: task with read_only: true, one call per angle, several in the same turn. They read in their own context and hand you back the answer, not the files.
 - grep for the line, then read around it with offset/limit. Read a whole large file only when you really need all of it, and never cat/type one through shell.
 - Do not read a file you have already read in this session — it is still above you in the transcript. An old result that was shortened says so in its own text; only then read it again.
-- Prefer edit over rewriting a file with write: a diff costs a fraction of a full copy.`;
+- Prefer edit over rewriting a file with write: a diff costs a fraction of a full copy.
+
+# Memory
+- A durable project fact goes to the memory tool the turn you learn it.`;
 
 const SUBAGENT_BASE = `You are a TRCode subagent, launched by the lead agent for one specific subtask.
 
@@ -85,10 +89,19 @@ let dateSnapshot = "";
  */
 const gitSnapshots = new Map<string, string>();
 
+/**
+ * Memory is snapshotted like everything else in front of the history: the
+ * memory tool edits the very file this section is built from, and a section
+ * that moved mid-session would void the cached prefix on every save.
+ * Re-read on /new, /resume and anything else that calls resetPromptSnapshots.
+ */
+const memorySnapshots = new Map<string, string>();
+
 export function resetPromptSnapshots(): void {
   listingSnapshots.clear();
   gitSnapshots.clear();
   projectSnapshots.clear();
+  memorySnapshots.clear();
   dateSnapshot = "";
 }
 
@@ -225,6 +238,15 @@ Git repository: ${isGitRepo(opts.cwd) ? "yes" : "no"}${sshHostsLine()}
     projectSnapshots.set(opts.cwd, project);
   }
   if (project) parts.push(project);
+
+  let memory = memorySnapshots.get(opts.cwd);
+  if (memory === undefined) {
+    // Off means off for the section too: /memory should leave nothing of the
+    // feature in the session, not just take the tool away.
+    memory = loadConfig().memoryEnabled !== false ? memorySection(opts.cwd) : "";
+    memorySnapshots.set(opts.cwd, memory);
+  }
+  if (memory) parts.push(memory);
 
   const note = modelNote(opts.model);
   if (note) parts.push("<model-notes>" + NL + note + NL + "</model-notes>");

@@ -27,6 +27,7 @@ const SUITES = [
   "interrupt-test.mjs",
   "reconnect-test.mjs",
   "toolpairs-test.mjs",
+  "memory-test.mjs",
   "subagent-test.mjs",
   "brain-test.mjs",
   "brain-ui-test.mjs",

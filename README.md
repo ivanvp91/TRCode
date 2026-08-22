@@ -1087,6 +1087,27 @@ or a model family. It ships with reference files next to `SKILL.md`, read on dem
 `AGENTS.md`, `TRCODE.md`, `CLAUDE.md` or `.trcode/instructions.md` are picked up walking
 up from the current directory, plus `~/.trcode/instructions.md` as global instructions.
 
+## Project memory
+
+The agent remembers what is worth carrying across sessions: a decision taken, a convention
+agreed on, a gotcha that cost an hour once and must not cost it again. Facts land in
+`.trcode/memory.md` — plain markdown, one line per fact, safe to read and edit by hand.
+
+Memory is **on by default**; `/memory` opens the settings screen with buttons to turn it
+off and on (or `/memory off` / `/memory on` straight away), and `/memory show` prints what
+is remembered.
+
+```markdown
+Builds with npm run build; tests need no network
+The mock server owns port 8877 — do not hardcode another one
+```
+
+While on, everything in the file rides along in the system prompt as `<project-memory>`
+(capped at 200 lines) and the `memory` tool is in the registry, so the next session opens
+already knowing it. Turning it off takes both out of the session. The section is
+snapshotted at session start like the rest of the prompt, which keeps the provider cache
+intact while the tool writes the file.
+
 ## What a turn costs
 
 An agent loop re-sends the whole history on every step, so a session costs O(steps²) in
@@ -1494,7 +1515,7 @@ src/
     compact.ts         context compaction
     trim.ts            per-request history trimming
     history.ts         prompt history across restarts
-  tools/               read, edit, write, ls, glob, grep, shell, skill, todo
+  tools/               read, edit, write, ls, glob, grep, shell, skill, todo, memory
   skills/loader.ts     skill discovery
   ui/
     highlight.ts       syntax colour for diffs

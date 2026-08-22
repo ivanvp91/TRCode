@@ -227,6 +227,12 @@ export interface Config {
    * projects never use them. Turn on with `/skills on` when they earn it.
    */
   skillsEnabled: boolean;
+  /**
+   * Whether project memory takes part in sessions: the <project-memory> section
+   * in the prompt and the `memory` tool. On by default — a fact costs nothing
+   * while there are none, and most projects accumulate a few. Off with /memory.
+   */
+  memoryEnabled: boolean;
 }
 
 const DEFAULTS: Config = {
@@ -323,6 +329,7 @@ const DEFAULTS: Config = {
   // Off, as the comment on the field says: the block and the tool cost tokens
   // on every request, and a project that never uses a skill pays them anyway.
   skillsEnabled: false,
+  memoryEnabled: true,
   mcpServers: {},
 };
 

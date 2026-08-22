@@ -1,4 +1,5 @@
 /** Slash commands, grouped from everyday to occasional. */
+import fs from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { c } from "./ansi.js";
@@ -63,6 +64,7 @@ import { buildSystemPrompt } from "../agent/prompt.js";
 import { runSwarm } from "../agent/swarm.js";
 import { runOrchestration } from "../agent/orchestrator.js";
 import { createSkill } from "../skills/loader.js";
+import { memoryPath, memoryCount } from "../tools/memory.js";
 import { resetPromptSnapshots } from "../agent/prompt.js";
 import { connectMcpServers, mcpClients, stopMcpServers } from "../mcp/client.js";
 import { t, count } from "../i18n.js";
@@ -1998,6 +2000,68 @@ const COMMANDS: Command[] = [
       hint("Anything else the model loads itself when the task matches the description.");
       hint("New: /skills new <name> · Edit: /skills edit <name> · Generate: /skills gen <task>");
       hint(t("Turn off to stop paying for them: /skills off", "Выключить, чтобы не платить за них: /skills off"));
+    },
+  },
+  {
+    name: "/memory",
+    group: "other",
+    args: () => t("[on | off | show]", "[on | off | показать]"),
+    help: () => t("project memory: on/off, show what is remembered", "память проекта: вкл/выкл, что запомнено"),
+    async run(app, rest) {
+      const sub = rest.trim().toLowerCase();
+      const file = memoryPath(app.cwd);
+      const enabled = loadConfig().memoryEnabled !== false;
+
+      if (sub === "on" || sub === "off") {
+        app.cfg = saveConfig({ memoryEnabled: sub === "on" });
+        app.rebuildTools();
+        resetPromptSnapshots();
+        if (sub === "on") {
+          success(t("Project memory is on — facts go to .trcode/memory.md and ride in the prompt.", "Память проекта включена — факты пишутся в .trcode/memory.md и едут в промпте."));
+          hint(t(`Off again with: /memory off`, `Выключить обратно: /memory off`));
+        } else {
+          success(t("Project memory is off — the section and the tool leave the session.", "Память проекта выключена — секция и тулз memory уходят из сессии."));
+        }
+        return;
+      }
+
+      if (sub === "show" || sub === "list") {
+        const facts = memoryCount(app.cwd) ? fs.readFileSync(file, "utf8").trim() : "";
+        if (!facts) return info(t("Memory is empty.", "Память пуста."));
+        line();
+        for (const l of renderMarkdownBlock(facts)) padded(l);
+        return;
+      }
+
+      // Bare `/memory` is a settings screen: state, where the file lives,
+      // and a button row — the way it is reached most often.
+      line();
+      padded(c.bold(t("Project memory", "Память проекта")));
+      info(
+        enabled
+          ? t("On — remembered facts join every request.", "Включена — запомненные факты добавляются к каждому запросу.")
+          : t("Off — nothing is remembered or shown.", "Выключена — ничего не запоминается и не показывается."),
+      );
+      hint(`${file} · ${t("facts:", "фактов:")} ${memoryCount(app.cwd)}`);
+      hint(t("The agent saves durable project facts there itself (the memory tool).", "Агент сам записывает туда прочные факты о проекте (тулз memory)."));
+      if (!process.stdin.isTTY) return hint(t("Toggle with: /memory on | /memory off", "Переключить: /memory on | /memory off"));
+
+      const answer = await app.exclusiveInput(() =>
+        choose<"toggle" | "show">(
+          [
+            {
+              value: "toggle",
+              label: enabled ? t("Turn off", "Выключить") : t("Turn on", "Включить"),
+              key: "o",
+              tone: enabled ? "warn" : "ok",
+            },
+            { value: "show", label: t("Show", "Показать"), key: "s" },
+          ],
+          { initial: "toggle", fallback: "toggle", hint: t("←/→ · Enter to confirm", "←/→ · Enter — подтвердить") },
+        ),
+      );
+      if (answer === "toggle") return this.run(app, enabled ? "off" : "on");
+      if (answer === "show") return this.run(app, "show");
     },
   },
   {

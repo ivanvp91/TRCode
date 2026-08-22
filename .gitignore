@@ -13,3 +13,4 @@ mock-output.txt
 .chk/
 
 *.zip
+site/
