@@ -311,11 +311,7 @@ export function banner(info: BannerInfo): void {
   row();
   const aside = [
     c.bold(c.brightBlue(t("Welcome to TRCode!", "TRCode — добро пожаловать!"))),
-    c.gray(t("Send ", "Наберите ")) +
-      c.bold("/help") +
-      c.gray(t(" for help, ", " для справки, ")) +
-      c.bold("/") +
-      c.gray(t(" for the command list", " для списка команд")),
+    "",
   ];
   const fields: [string, string][] = [
     [t("Directory:", "Каталог:"), info.cwdLabel],
@@ -325,6 +321,7 @@ export function banner(info: BannerInfo): void {
     [t("Version:", "Версия:"), info.version],
   ];
   for (const [label, value] of fields) aside.push(c.gray(label.padEnd(12)) + c.bold(value));
+  aside.push("", c.gray(t("Send ", "Наберите ")) + c.bold("/help") + c.gray(t(" for help, ", " для справки, ")) + c.bold("/") + c.gray(t(" for the command list", " для списка команд")));
   const logoTop = Math.floor((aside.length - LOGO.length) / 2);
   aside.forEach((text, i) => {
     const art = c.brightCyan((LOGO[i - logoTop] ?? "").padEnd(19));
