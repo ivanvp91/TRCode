@@ -1,4 +1,5 @@
 /** Shared types for the TokenRouter agentic CLI. */
+import type { SpillStore } from "./tools/spill.js";
 
 export type Role = "system" | "user" | "assistant" | "tool";
 
@@ -14,8 +15,12 @@ export interface Message {
   name?: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
-  /** Local-only bookkeeping, stripped before hitting the wire. */
-  meta?: { hidden?: boolean; ts?: number; model?: string };
+  /**
+   * Local bookkeeping. `hidden` is stripped before hitting the wire; `skill`
+   * marks an auto-loaded procedure, which the model must see but which would
+   * bury the transcript if it were replayed.
+   */
+  meta?: { hidden?: boolean; ts?: number; model?: string; skill?: string };
 }
 
 export interface Usage {
@@ -57,6 +62,12 @@ export interface ModelInfo {
   tags?: string;
   /** What the model produces; drives the type selector in the picker. */
   modality?: "text" | "image" | "video" | "audio";
+  /**
+   * Everything the model can produce, not just the one it is filed under. A
+   * model that answers in text and can also return an image belongs in both
+   * lists — it is a chat model, and it is also how you make a picture here.
+   */
+  modalities?: ("text" | "image" | "video" | "audio")[];
   /** Provider-reported creation timestamp (seconds), used for ordering. */
   created?: number;
   /**
@@ -67,6 +78,19 @@ export interface ModelInfo {
   chatCapable?: boolean;
 }
 
+/** One MCP server: how to launch it and, optionally, which tools to expose. */
+export interface McpServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+  /**
+   * Expose only these tools (names as the server reports them). Every schema
+   * rides along in every request, so a fat server is worth filtering.
+   */
+  tools?: string[];
+}
+
 export interface ToolDef {
   name: string;
   description: string;
@@ -75,6 +99,12 @@ export interface ToolDef {
   risk: "read" | "write" | "shell" | "network" | "agent";
   /** Short one-line summary shown in the transcript while running. */
   summarize?(args: Record<string, any>): string;
+  /**
+   * Which end of an oversized result carries the answer. Logs and test runs
+   * end with what the command was run for, so they keep their tail; a file
+   * read or a listing keeps its head. See tools/spill.ts.
+   */
+  spillBias?: "head" | "tail";
   run(args: Record<string, any>, ctx: ToolContext): Promise<ToolResult>;
 }
 
@@ -84,6 +114,8 @@ export interface ToolResult {
   isError?: boolean;
   /** Optional rich detail rendered to the user but not sent to the model. */
   display?: string;
+  /** "diff" means `display` is already laid out and must be printed verbatim. */
+  displayKind?: "text" | "diff";
 }
 
 export interface ToolContext {
@@ -93,10 +125,26 @@ export interface ToolContext {
   depth: number;
   /** Returns true when the user (or policy) approves the action. */
   confirm(tool: ToolDef, args: Record<string, any>, preview?: string): Promise<boolean>;
+  /**
+   * True when the confirm() just answered had put `preview` on screen, so the
+   * result can leave it out instead of printing the same diff a second time.
+   * Consumed by the call: asking twice for the same preview answers false.
+   */
+  previewShown?(preview: string): boolean;
+  /**
+   * Stores what a file held before a write, so the turn can be undone. Absent
+   * outside the REPL (a one-shot run has no session to keep it in).
+   */
+  snapshot?(opts: { path: string; tool: string; before: string | null; after: string }): void;
   /** Emits a line into the live transcript. */
   emit(line: string): void;
   /** Files already read this session, used to guard blind overwrites. */
   readFiles: Set<string>;
+  /**
+   * Where oversized tool output is parked so the history stays append-only.
+   * Absent outside the REPL, where there is no session to park it beside.
+   */
+  spill?: SpillStore;
 }
 
 export interface StreamEvent {

@@ -5,7 +5,7 @@
  * whatever arrived as a newline key.
  */
 import { c } from "./ansi.js";
-import { line, padded } from "./render.js";
+import { hint, line, padded } from "./render.js";
 import { pushConsumer } from "./stdin.js";
 import { isNewlineKey } from "./editor.js";
 
@@ -77,9 +77,9 @@ export function scanKeys(): Promise<CapturedKey[]> {
 
     line();
     padded(c.bold("Key inspector"));
-    padded(c.gray("Press keys — this shows exactly what the CLI receives."));
-    padded(c.gray("Try Ctrl+Enter, Shift+Enter, Ctrl+Shift+Enter."));
-    padded(c.gray("Press Esc twice to finish."));
+    hint("Press keys — this shows exactly what the CLI receives.");
+    hint("Try Ctrl+Enter, Shift+Enter, Ctrl+Shift+Enter.");
+    hint("Press Esc twice to finish.");
     line();
 
     const release = pushConsumer((chunk) => {

@@ -112,6 +112,50 @@ ok("anthropic: форма none снимает thinking", aOff.thinking === undef
   );
 }
 
+// The moving breakpoint at the tail is one expiry away from a full re-prefill,
+// so a second one is pinned where nothing moves for the rest of the turn: the
+// last thing the user actually typed.
+{
+  const midTurn = [
+    { role: "system", content: "СИСТЕМА " + "с".repeat(3000) },
+    { role: "user", content: "прочитай файл" },
+    { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c1", name: "read", content: "x".repeat(9000) },
+    { role: "user", content: "продолжай" },
+    { role: "assistant", content: null, tool_calls: [{ id: "c2", type: "function", function: { name: "read", arguments: "{}" } }] },
+    { role: "tool", tool_call_id: "c2", name: "read", content: "y".repeat(9000) },
+  ];
+  const body = buildAnthropicBody(
+    { model: "anthropic/claude-opus-5", messages: midTurn, tools: [{ name: "read", description: "d", parameters: {} }] },
+    true,
+  );
+  const marks = (JSON.stringify(body).match(/"cache_control"/g) ?? []).length;
+  ok("кэш: четыре пометки — потолок Anthropic", marks === 4, String(marks));
+
+  const turnStart = body.messages[2];
+  ok("кэш: якорь на реплике пользователя", turnStart.content[1]?.cache_control?.type === "ephemeral", JSON.stringify(turnStart).slice(0, 120));
+  ok("кэш: а не на результате инструмента перед ней", turnStart.content[0]?.cache_control === undefined);
+  ok("кэш: хвост тоже помечен", body.messages.at(-1).content.at(-1)?.cache_control?.type === "ephemeral");
+
+  // The anchor holds still while the turn goes on: that is the whole point of
+  // it, and a moving one would be a second tail.
+  const next = buildAnthropicBody(
+    {
+      model: "anthropic/claude-opus-5",
+      messages: [...midTurn, { role: "assistant", content: "готово" }],
+      tools: [{ name: "read", description: "d", parameters: {} }],
+    },
+    true,
+  );
+  ok("кэш: якорь не двигается на следующем шаге", JSON.stringify(next.messages[2]) === JSON.stringify(turnStart));
+
+  const ttl = buildAnthropicBody(
+    { model: "anthropic/claude-opus-5", messages: midTurn, cacheTtl: "1h" },
+    true,
+  );
+  ok("кэш: час запрашивается явно", JSON.stringify(ttl).includes('"ttl":"1h"'));
+}
+
 const ap = new AnthropicStreamParser();
 ap.handle({ type: "message_start", message: { usage: { input_tokens: 250 } } });
 ap.handle({ type: "content_block_start", index: 0, content_block: { type: "text" } });
@@ -126,12 +170,28 @@ ok("anthropic: текст собран", aText.join("") === "Да");
 ok("anthropic: tool_use собран", aRes.toolCalls[0]?.function?.arguments === '{"path":"b.ts"}', JSON.stringify(aRes.toolCalls));
 ok("anthropic: usage", aRes.usage.prompt_tokens === 250 && aRes.usage.completion_tokens === 30);
 
+// Anthropic reports the cache beside the input, not inside it: counting only
+// input_tokens made a turn look a tenth its size and "cached" exceed 100%.
+{
+  const cp = new AnthropicStreamParser();
+  cp.handle({
+    type: "message_start",
+    message: { usage: { input_tokens: 800, cache_read_input_tokens: 6300, cache_creation_input_tokens: 400 } },
+  });
+  cp.handle({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 10 } });
+  const cRes = cp.result();
+  ok("anthropic: кэш входит в prompt_tokens", cRes.usage.prompt_tokens === 7500, String(cRes.usage.prompt_tokens));
+  ok("anthropic: доля кэша не выше 100%", cRes.usage.cached_tokens <= cRes.usage.prompt_tokens, `${cRes.usage.cached_tokens}/${cRes.usage.prompt_tokens}`);
+}
+
 // ── input-token trimming ──────────────────────────────────────────────────
 const big = [];
 for (let i = 0; i < 12; i++) {
   big.push({ role: "user", content: `запрос ${i}` });
   big.push({ role: "assistant", content: null, tool_calls: [{ id: `c${i}`, type: "function", function: { name: "read", arguments: "{}" } }] });
-  big.push({ role: "tool", tool_call_id: `c${i}`, name: "read", content: "x".repeat(20000) });
+  // Distinct on purpose: identical results are collapsed by the repeat pass,
+  // and this section is about the budget one.
+  big.push({ role: "tool", tool_call_id: `c${i}`, name: "read", content: `файл ${i} ` + "x".repeat(20000) });
   big.push({ role: "assistant", content: `ответ ${i}` });
 }
 const beforeSize = historySize(big);
@@ -143,10 +203,10 @@ ok("трим: уложились в бюджет", afterSize <= 20000, `${afterS
 ok("трим: сообщения не потеряны", trimmed.messages.length === big.length);
 ok("трим: роли и id сохранены", trimmed.messages.every((m, i) => m.role === big[i].role && m.tool_call_id === big[i].tool_call_id));
 const lastTool = trimmed.messages.filter((m) => m.role === "tool").at(-1);
-ok("трим: свежий результат не тронут", lastTool.content.length === 20000, `${lastTool.content.length}`);
+ok("трим: свежий результат не тронут", lastTool.content.length > 20000, `${lastTool.content.length}`);
 // Only the wire copy is shortened; the session keeps the full output so
 // /resume and /compact still see what actually happened.
-ok("трим: сохранённая история не тронута", big.filter((m) => m.role === "tool")[0].content.length === 20000);
+ok("трим: сохранённая история не тронута", big.filter((m) => m.role === "tool")[0].content.length > 20000);
 ok("трим: на проводе — заглушка", trimmed.messages.filter((m) => m.role === "tool")[0].content.length < 20000);
 // The stub must be byte-identical between steps, or the cached prefix moves.
 const again = trimForRequest(big, { budget: 20000, keepRecent: 8 });

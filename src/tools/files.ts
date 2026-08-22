@@ -1,5 +1,14 @@
-/** File tools: read, write, edit, ls. */
+/**
+ * File tools: read, write, edit, ls.
+ *
+ * Content I/O is async on purpose: on a cloud-synced directory (OneDrive) a
+ * placeholder file hydrates on first read, and a synchronous read blocks the
+ * whole event loop for as long as that takes — frozen spinner, dead Esc.
+ * Metadata calls (stat, readdir, exists) stay sync: they answer from the
+ * local index without hydrating anything.
+ */
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import type { ToolDef } from "../types.js";
 import { detectLineEnding, isIgnored, looksBinary, rel, resolveInside } from "./fsutil.js";
@@ -40,7 +49,7 @@ export const readTool: ToolDef = {
         isError: true,
       };
     }
-    const buf = fs.readFileSync(abs);
+    const buf = await fsp.readFile(abs);
     if (looksBinary(buf)) return { output: `Binary file (${st.size} bytes), skipped.`, isError: true };
 
     const lines = buf.toString("utf8").split(/\r?\n/);
@@ -83,7 +92,7 @@ export const writeTool: ToolDef = {
     const exists = fs.existsSync(abs);
     let before = "";
     if (exists) {
-      before = fs.readFileSync(abs, "utf8");
+      before = await fsp.readFile(abs, "utf8");
       if (!ctx.readFiles.has(abs)) {
         return {
           output: `File ${args.path} exists but has not been read yet. Read it first so you do not overwrite changes you have not seen.`,
@@ -92,19 +101,26 @@ export const writeTool: ToolDef = {
       }
     }
 
-    const preview = exists
-      ? renderDiff(before, content)
-      : content.split("\n").slice(0, 40).map((l) => " + " + l).join("\n");
+    // A new file is a diff against nothing: same gutter, same band, same
+    // clipping — rather than a second, unaligned way of showing added lines.
+    const preview = renderDiff(exists ? before : "", content, { path: args.path });
     const ok = await ctx.confirm(writeTool, args, preview);
+    // Claimed even on a rejection, so a later identical diff is not mistaken
+    // for one already on screen. The prompt has just shown it; repeating it
+    // below the answer would print the same change twice.
+    const seen = ctx.previewShown?.(preview) ?? false;
     if (!ok) return { output: "The user rejected the file write.", isError: true };
 
-    fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, content, "utf8");
+    // Kept before the write, not after: once the bytes are gone they are gone.
+    ctx.snapshot?.({ path: abs, tool: "write", before: exists ? before : null, after: content });
+    await fsp.mkdir(path.dirname(abs), { recursive: true });
+    await fsp.writeFile(abs, content, "utf8");
     ctx.readFiles.add(abs);
     const lines = content.split("\n").length;
     return {
       output: `${exists ? "Overwrote" : "Created"} ${rel(ctx.cwd, abs)} (${lines} lines).`,
-      display: preview,
+      display: seen ? undefined : preview,
+      displayKind: seen ? "text" : "diff",
     };
   },
 };
@@ -135,7 +151,7 @@ export const editTool: ToolDef = {
       return { output: `Read ${args.path} first with the read tool.`, isError: true };
     }
 
-    const before = fs.readFileSync(abs, "utf8");
+    const before = await fsp.readFile(abs, "utf8");
     const oldStr = String(args.old_string ?? "");
     const newStr = String(args.new_string ?? "");
     if (oldStr === newStr) return { output: "old_string and new_string are identical — nothing to change.", isError: true };
@@ -163,14 +179,17 @@ export const editTool: ToolDef = {
       ? before.split(needle).join(replacement)
       : before.replace(needle, () => replacement);
 
-    const preview = renderDiff(before, after);
+    const preview = renderDiff(before, after, { path: args.path });
     const ok = await ctx.confirm(editTool, args, preview);
+    const seen = ctx.previewShown?.(preview) ?? false;
     if (!ok) return { output: "The user rejected the edit.", isError: true };
 
-    fs.writeFileSync(abs, after, "utf8");
+    ctx.snapshot?.({ path: abs, tool: "edit", before, after });
+    await fsp.writeFile(abs, after, "utf8");
     return {
       output: `Updated ${rel(ctx.cwd, abs)} (${count > 1 ? `${count} replacements` : "1 replacement"}).`,
-      display: preview,
+      display: seen ? undefined : preview,
+      displayKind: seen ? "text" : "diff",
     };
   },
 };

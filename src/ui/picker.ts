@@ -1,10 +1,12 @@
 /** Interactive list picker: arrow keys, type-to-filter, sections, tabs. */
+import { t } from "../i18n.js";
 import { c, clipAnsi, cursor } from "./ansi.js";
 import { contentWidth, indent } from "./layout.js";
 import { line, out } from "./render.js";
 import { pushConsumer } from "./stdin.js";
 
 const CTRL_C = String.fromCharCode(3);
+const CTRL_U = String.fromCharCode(21);
 const ESC = String.fromCharCode(27);
 const DEL = String.fromCharCode(127);
 const BACKSPACE = String.fromCharCode(8);
@@ -13,6 +15,8 @@ const DOWN = ESC + "[B";
 const RIGHT = ESC + "[C";
 const LEFT = ESC + "[D";
 const TAB = String.fromCharCode(9);
+/** Written this way so the source file stays plain text. */
+const CONTROL_CHARS = new RegExp("[" + String.fromCharCode(0) + "-" + String.fromCharCode(31) + DEL + "]", "g");
 
 export interface PickerItem {
   value: string;
@@ -42,6 +46,19 @@ export interface PickerOptions {
 
 /** Returns the chosen value, or null when cancelled. */
 export function pick(opts: PickerOptions): Promise<string | null> {
+  return run(opts, false) as Promise<string | null>;
+}
+
+/**
+ * The same list, choosing several. Space marks a row, Enter returns everything
+ * marked — or, when nothing is marked, the row under the cursor, so a list
+ * used for one thing does not need a different key to answer with one thing.
+ */
+export function pickMulti(opts: PickerOptions & { selected?: string[] }): Promise<string[] | null> {
+  return run(opts, true) as Promise<string[] | null>;
+}
+
+function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Promise<string | string[] | null> {
   const stdin = process.stdin;
   const tabs = opts.tabs ?? [];
   const resolveItems = (tabKey: string): PickerItem[] =>
@@ -51,17 +68,30 @@ export function pick(opts: PickerOptions): Promise<string | null> {
   if (!tabs.length) tabIndex = 0;
 
   if (!stdin.isTTY) return Promise.resolve(null);
+  const chosen = new Set<string>(opts.selected ?? []);
 
   return new Promise((resolve) => {
-    const pageSize = Math.min(opts.pageSize ?? 14, Math.max(4, (process.stdout.rows || 24) - 9));
+    // Chrome above and below the page: title, tabs, search field, key hints
+    // and the position counter.
+    const pageSize = Math.min(opts.pageSize ?? 14, Math.max(4, (process.stdout.rows || 24) - 10));
     let filter = "";
     let all: PickerItem[] = resolveItems(tabs[tabIndex]?.key ?? "");
     let index = 0;
     let rendered = 0;
 
+    /**
+     * Every word has to appear somewhere in the row, in any order: with 500
+     * models in a list, "qwen max" is how a person looks for `qwen3.8-max`,
+     * and a plain substring search finds nothing for it.
+     */
+    const matches = (it: PickerItem, words: string[]): boolean => {
+      const hay = `${it.label} ${it.value}`.toLowerCase();
+      return words.every((w) => hay.includes(w));
+    };
+
     /** Selectable entries only. */
     const visible = (): PickerItem[] => {
-      const f = filter.toLowerCase();
+      const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
       const kept: PickerItem[] = [];
       let pendingHeader: PickerItem | null = null;
       for (const it of all) {
@@ -69,7 +99,7 @@ export function pick(opts: PickerOptions): Promise<string | null> {
           pendingHeader = it;
           continue;
         }
-        if (f && !it.label.toLowerCase().includes(f) && !it.value.toLowerCase().includes(f)) continue;
+        if (words.length && !matches(it, words)) continue;
         if (pendingHeader) {
           kept.push(pendingHeader);
           pendingHeader = null;
@@ -133,9 +163,29 @@ export function pick(opts: PickerOptions): Promise<string | null> {
           .join(" ");
         buf.push(strip + c.gray("   ←/→ or Tab to switch type"));
       }
+      // The search field sits above the list, where the typing goes. Hiding it
+      // in the footer made a long list look unsearchable — the whole point is
+      // that it is visible before anyone thinks to try typing into it.
+      const matched = selectableIdx(rows).length;
+      const totalItems = all.filter((it) => !it.header).length;
+      const counter = filter ? `${matched}/${totalItems}` : String(totalItems);
+      const field = filter
+        ? c.brightYellow(filter) + c.brightCyan("▏")
+        : c.dim(t("search — just type", "поиск — просто печатайте"));
+      const searchWidth = Math.max(10, w - counter.length - 6);
+      buf.push(c.brightCyan("⌕ ") + clipAnsi(field, searchWidth).padEnd(0) + c.gray(`  ${counter}`));
       buf.push(
-        c.gray("↑↓ move · Enter select · Esc cancel · type to filter") +
-          (filter ? c.gray(" · filter: ") + c.brightYellow(filter) : ""),
+        c.gray(
+          multi
+            ? t(
+                "↑↓ move · Space mark · Enter confirm · Esc cancel · ^U clear",
+                "↑↓ выбор · Пробел отметить · Enter подтвердить · Esc отмена · ^U очистить",
+              )
+            : t(
+                "↑↓ move · Enter select · Esc cancel · ^U clear",
+                "↑↓ выбор · Enter выбрать · Esc отмена · ^U очистить",
+              ),
+        ),
       );
 
       // Keep the cursor roughly centred without slicing off headers.
@@ -153,10 +203,11 @@ export function pick(opts: PickerOptions): Promise<string | null> {
         }
         const active = abs === index;
         const marker = active ? c.brightCyan("❯ ") : "  ";
+        const box = multi ? (chosen.has(item.value) ? c.brightGreen("[x] ") : c.gray("[ ] ")) : "";
         const name = active ? c.bold(c.brightCyan(item.label)) : item.label;
         const hint = item.hint ? c.dim(" " + item.hint) : "";
         const badge = item.badge ? c.gray(" " + item.badge) : "";
-        buf.push(`${marker}${clipAnsi(name + hint + badge, w - 4)}`);
+        buf.push(`${marker}${box}${clipAnsi(name + hint + badge, w - 4 - (multi ? 4 : 0))}`);
       }
 
       const total = selectableIdx(rows).length;
@@ -176,7 +227,7 @@ export function pick(opts: PickerOptions): Promise<string | null> {
     }
     draw();
 
-    const finish = (value: string | null) => {
+    const finish = (value: string | string[] | null) => {
       release();
       clear();
       cursor.show();
@@ -190,7 +241,19 @@ export function pick(opts: PickerOptions): Promise<string | null> {
       if (s === "\r" || s === "\n") {
         const rows = visible();
         const item = rows[index];
-        return finish(item && !item.header ? item.value : null);
+        const here = item && !item.header ? item.value : null;
+        if (!multi) return finish(here);
+        // Nothing marked: the row under the cursor is the answer, so one list
+        // serves both jobs without a second key to learn.
+        return finish(chosen.size ? [...chosen] : here ? [here] : []);
+      }
+      if (s === " " && multi) {
+        const item = visible()[index];
+        if (item && !item.header) {
+          if (chosen.has(item.value)) chosen.delete(item.value);
+          else chosen.add(item.value);
+        }
+        return draw();
       }
       if (s === UP) return move(-1), draw();
       if (s === DOWN) return move(1), draw();
@@ -200,8 +263,18 @@ export function pick(opts: PickerOptions): Promise<string | null> {
         filter = filter.slice(0, -1);
         return draw();
       }
-      if (s >= " " && s.length === 1) {
-        filter += s;
+      if (s === CTRL_U) {
+        filter = "";
+        return draw();
+      }
+      // Anything left that is not an escape sequence is text for the search.
+      // Taken as a chunk rather than a character: a pasted model name arrives
+      // in one read, and a one-character rule dropped the whole paste.
+      if (s === " " && multi) return; // handled above; never search text here
+      if (s.startsWith(ESC)) return;
+      const text = s.replace(CONTROL_CHARS, "");
+      if (text) {
+        filter += text;
         return draw();
       }
     };

@@ -136,14 +136,17 @@ export function contextPressure(session: Session, catalog: ModelInfo[]): { used:
 }
 
 /**
- * When to auto-compact. A fraction of the window alone is useless on a 1M-token
- * model — 82% of 1M means it never fires and the history grows all session. So
- * the request budget caps it too: past twice that, compaction is overdue.
+ * When to auto-compact: the share of the context window the history occupies,
+ * and nothing else.
+ *
+ * This used to also fire at twice `maxRequestTokens`, on the reasoning that a
+ * fraction of a 1M-token window would never be reached. But that budget is the
+ * on-the-wire trim, not the window: with the default 40k it compacted at 80k —
+ * 8% of a 1M window — throwing away a history the model could still hold in
+ * full. Compaction is lossy, so it waits for the window to actually run out.
  */
 export function shouldAutoCompact(session: Session, catalog: ModelInfo[]): boolean {
   const cfg = loadConfig();
   const { used, window } = contextPressure(session, catalog);
-  const byWindow = window * cfg.autoCompactAt;
-  const byBudget = cfg.maxRequestTokens > 0 ? cfg.maxRequestTokens * 2 : Infinity;
-  return used >= Math.min(byWindow, byBudget);
+  return used >= window * cfg.autoCompactAt;
 }

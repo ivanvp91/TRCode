@@ -39,8 +39,12 @@ check("subagents get the same discipline", /grep first, then read around the hit
 
 // ── size: this rides along on every single request ──────────────────────────
 {
-  const tokens = estimateTokens(prompt);
-  check(`the prompt stays small (${tokens} tokens)`, tokens < 900, String(tokens));
+  // Measured on a model with no note of its own, so this stays a guard on the
+  // prompt itself rather than on the per-model addition below.
+  const plain = estimateTokens(buildSystemPrompt({ ...opts, model: "anthropic/claude-opus-5" }));
+  check(`the prompt stays small (${plain} tokens)`, plain < 900, String(plain));
+  const withNote = estimateTokens(buildSystemPrompt({ ...opts, model: "qwen/qwen3.8-max" }));
+  check(`a model note costs little (${withNote - plain} tokens)`, withNote - plain < 90, String(withNote - plain));
   const sub = estimateTokens(buildSystemPrompt({ ...opts, subagent: true }));
   check(`the subagent prompt stays smaller (${sub} tokens)`, sub < 500, String(sub));
 }
@@ -112,7 +116,88 @@ check("subagents get the same discipline", /grep first, then read around the hit
   void say;
 }
 
+// ── when auto-compaction fires ──────────────────────────────────────────────
+// Compaction is lossy, so it has to wait for the window to actually fill. It
+// used to also trigger at twice the on-the-wire trim budget, which on a 1M
+// window meant compacting at 8% — a history the model could still hold whole.
+{
+  const { shouldAutoCompact, contextPressure } = await import("../dist/session/compact.js");
+  const { Session } = await import("../dist/session/session.js");
+  const { saveConfig } = await import("../dist/config.js");
+
+  saveConfig({ maxRequestTokens: 40_000, autoCompactAt: 0.9 });
+  const catalog = [{ id: "big", contextWindow: 1_000_000 }];
+  const s = new Session({ cwd: WORK, model: "big", title: "t" });
+  const fill = (tokens) => {
+    s.messages = [{ role: "user", content: "x".repeat(Math.round(tokens * 3.6)) }];
+  };
+
+  fill(200_000); // 20% of the window, five times the request budget
+  const low = contextPressure(s, catalog);
+  check(
+    "a fifth of the window does not compact",
+    !shouldAutoCompact(s, catalog),
+    `ratio ${low.ratio.toFixed(2)}`,
+  );
+
+  fill(880_000); // 88% — close, but the threshold is 90
+  check("just under the threshold still holds", !shouldAutoCompact(s, catalog));
+
+  fill(920_000);
+  check("past 90% of the window it compacts", shouldAutoCompact(s, catalog));
+
+  // The share is what decides, on any window size.
+  const small = [{ id: "small", contextWindow: 100_000 }];
+  s.model = "small";
+  fill(95_000);
+  check("the same share fires on a small window", shouldAutoCompact(s, small));
+}
+
+// "Check my servers" has an answer on this machine — but only if the agent
+// knows where the list is.
+{
+  const os = await import("node:os");
+  const fsx = await import("node:fs");
+  const pathx = await import("node:path");
+  const has = fsx.existsSync(pathx.join(os.homedir(), ".ssh", "config"));
+  const env = prompt.slice(prompt.indexOf("<environment>"), prompt.indexOf("</environment>"));
+  check(
+    has ? "ssh-хосты названы в окружении" : "без ~/.ssh/config строки нет",
+    has ? new RegExp("SSH hosts configured: [0-9]+").test(env) : !/SSH hosts/.test(env),
+    env,
+  );
+}
+
+// ── model-specific notes ────────────────────────────────────────────────────
+{
+  const { modelNote } = await import("../dist/agent/prompt.js");
+  const { saveConfig } = await import("../dist/config.js");
+
+  check("многословные семейства получают заметку", modelNote("qwen/qwen3.8-max").includes("Thinking budget"), modelNote("qwen/qwen3.8-max").slice(0, 40));
+  check("префикс поставщика не мешает", modelNote("alibabacloud:qwen3.8-max").includes("Thinking budget"));
+  check("kimi тоже", modelNote("moonshotai/kimi-k3").includes("Thinking budget"));
+  // The subscription host names its own models: "k3" carries no family in it,
+  // so the provider prefix has to count as part of the name.
+  check("kimi:k3 с подписки — тоже", modelNote("kimi:k3").includes("Thinking budget"), modelNote("kimi:k3"));
+  check("и kimi:kimi-for-coding", modelNote("kimi:kimi-for-coding").includes("Thinking budget"));
+  check("а claude: с префиксом — нет", modelNote("claude:claude-opus-5") === "", modelNote("claude:claude-opus-5"));
+  check("остальным ничего не добавляется", modelNote("anthropic/claude-opus-5") === "", modelNote("anthropic/claude-opus-5"));
+
+  saveConfig({ modelPrompts: { "qwen/qwen3.8-max": "своя заметка" } });
+  check("точный ключ заменяет встроенную", modelNote("qwen/qwen3.8-max") === "своя заметка", modelNote("qwen/qwen3.8-max"));
+  check("а не просто дописывается", !modelNote("qwen/qwen3.8-max").includes("Thinking budget"));
+
+  saveConfig({ modelPrompts: { "qwen/qwen3.8-max": "" } });
+  check("пустая строка снимает заметку совсем", modelNote("qwen/qwen3.8-max") === "");
+
+  saveConfig({ modelPrompts: { "kimi*": "для всей линейки" } }, { replace: ["modelPrompts"] });
+  const both = modelNote("moonshotai/kimi-k3");
+  check("ключ с * дописывается к встроенной", both.includes("Thinking budget") && both.includes("для всей линейки"), both);
+  saveConfig({ modelPrompts: {} }, { replace: ["modelPrompts"] });
+}
+
 fs.rmSync(HOME, { recursive: true, force: true });
 fs.rmSync(WORK, { recursive: true, force: true });
-console.log(`\n${passed} passed, ${failed} failed`);
+console.log(`
+${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

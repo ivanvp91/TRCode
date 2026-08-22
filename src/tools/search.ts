@@ -1,5 +1,6 @@
 /** Search tools: glob (by name) and grep (by content). */
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import type { ToolDef } from "../types.js";
 import { extraIgnoresFrom, globToRegExp, looksBinary, rel, resolveInside, walk } from "./fsutil.js";
@@ -82,12 +83,14 @@ export const grepTool: ToolDef = {
     const matchedFiles: string[] = [];
     let total = 0;
 
-    const scanFile = (abs: string, size: number) => {
+    // Async on purpose: a synchronous read of a cloud-synced placeholder file
+    // (OneDrive) hydrates it and blocks the event loop for the duration.
+    const scanFile = async (abs: string, size: number) => {
       if (size > 2_000_000) return;
       if (includeRe && !includeRe.test(path.basename(abs)) && !includeRe.test(rel(root, abs))) return;
       let buf: Buffer;
       try {
-        buf = fs.readFileSync(abs);
+        buf = await fsp.readFile(abs);
       } catch {
         return;
       }
@@ -119,16 +122,23 @@ export const grepTool: ToolDef = {
       return { output: `Path not found: ${args.path}`, isError: true };
     }
     if (st.isFile()) {
-      scanFile(root, st.size);
+      await scanFile(root, st.size);
     } else {
+      // The walk is metadata-only and fast; content reads happen after it, so
+      // they can await. The match cap decides when to stop reading.
+      const files: { abs: string; size: number }[] = [];
       walk(root, {
         cwd: ctx.cwd,
         extraIgnores: extraIgnoresFrom(ctx.cwd),
         onFile(abs, s) {
-          scanFile(abs, s.size);
-          return total < limit * 30;
+          files.push({ abs, size: s.size });
+          return files.length < 20_000;
         },
       });
+      for (const f of files) {
+        if (total >= limit * 30 || ctx.signal.aborted) break;
+        await scanFile(f.abs, f.size);
+      }
     }
 
     if (!total) return { output: `No matches: /${args.pattern}/` };

@@ -34,6 +34,11 @@ export const c = {
   bgRed: wrap(41, 49),
   bgGreen: wrap(42, 49),
   bgGray: wrap(100, 49),
+  // Diff bands. The plain bgRed/bgGreen are far too loud behind a whole line of
+  // code; these are the dark 256-colour pair every diff viewer settles on.
+  // Gated like every other colour — NO_COLOR has to mean no colour.
+  bgDel: (s: string) => (noColor ? s : `\x1b[48;5;52m${s}\x1b[49m`),
+  bgAdd: (s: string) => (noColor ? s : `\x1b[48;5;22m${s}\x1b[49m`),
 };
 
 export const hasColor = !noColor;
@@ -143,23 +148,175 @@ export function clipAnsi(s: string, max: number): string {
   return out + "…" + (noColor ? "" : "\x1b[0m");
 }
 
-export const cursor = {
-  hide: () => process.stdout.write("\x1b[?25l"),
-  show: () => process.stdout.write("\x1b[?25h"),
+/**
+ * The cursor moves as strings, so a whole frame can be assembled and written
+ * once. A terminal may repaint between two writes: split a redraw across
+ * several of them and it gets caught mid-way — the old rows cleared, the new
+ * ones not yet there. That gap, at a spinner's rate, is what flickers.
+ */
+export const esc = {
+  hide: "\x1b[?25l",
+  show: "\x1b[?25h",
   // CSI 0 A means "move 1 line" to a terminal, so a zero move must be skipped.
+  up: (n = 1) => (n > 0 ? `\x1b[${n}A` : ""),
+  down: (n = 1) => (n > 0 ? `\x1b[${n}B` : ""),
+  toColumn: (n = 0) => `\x1b[${n}G`,
+  clearLine: "\x1b[2K",
+  /** From the cursor to the end of the row — the rest of a shortened line. */
+  clearRight: "\x1b[K",
+  clearDown: "\x1b[0J",
+  clearScreen: "\x1b[2J\x1b[H",
+  /**
+   * Synchronized output: a terminal that honours the pair shows the frame
+   * between them all at once, never half-drawn. Unknown private modes are
+   * ignored, so terminals without it are unaffected.
+   */
+  syncOn: "\x1b[?2026h",
+  syncOff: "\x1b[?2026l",
+};
+
+export const cursor = {
+  hide: () => process.stdout.write(esc.hide),
+  show: () => process.stdout.write(esc.show),
   up: (n = 1) => {
-    if (n > 0) process.stdout.write(`\x1b[${n}A`);
+    if (n > 0) process.stdout.write(esc.up(n));
   },
   down: (n = 1) => {
-    if (n > 0) process.stdout.write(`\x1b[${n}B`);
+    if (n > 0) process.stdout.write(esc.down(n));
   },
-  toColumn: (n = 0) => process.stdout.write(`\x1b[${n}G`),
-  clearLine: () => process.stdout.write("\x1b[2K"),
-  clearDown: () => process.stdout.write("\x1b[0J"),
-  clearScreen: () => process.stdout.write("\x1b[2J\x1b[H"),
+  toColumn: (n = 0) => process.stdout.write(esc.toColumn(n)),
+  clearLine: () => process.stdout.write(esc.clearLine),
+  clearDown: () => process.stdout.write(esc.clearDown),
+  clearScreen: () => process.stdout.write(esc.clearScreen),
 };
 
 /** Real terminal width; margins are applied by the layout module. */
 export function termWidth(): number {
   return Math.max(48, process.stdout.columns || 100);
+}
+
+/**
+ * Wraps a styled string to a cell width, keeping its colours.
+ *
+ * `wrapText` counts escape bytes as characters, so a coloured sentence broke
+ * far short of the edge; stripping the colour first, as `message()` used to,
+ * throws the styling away instead. This walks the string by visible cells and
+ * reopens whatever was still open at the point of the break, so a wrapped line
+ * looks like the line it was cut from.
+ */
+export function wrapAnsi(s: string, max: number): string[] {
+  const limit = Math.max(8, max);
+  const lines: string[] = [];
+
+  for (const raw of s.split("\n")) {
+    if (width(raw) <= limit) {
+      lines.push(raw);
+      continue;
+    }
+    // Words carry their own escapes: a colour that opens mid-word must not be
+    // separated from the letters it applies to.
+    const words: { text: string; w: number }[] = [];
+    let word = "";
+    let wordW = 0;
+    const flush = () => {
+      if (word) words.push({ text: word, w: wordW });
+      word = "";
+      wordW = 0;
+    };
+    for (let i = 0; i < raw.length; i++) {
+      if (raw[i] === "\x1b") {
+        const seq = /^\x1b\[[0-9;]*[A-Za-z]/.exec(raw.slice(i));
+        if (seq) {
+          word += seq[0];
+          i += seq[0].length - 1;
+          continue;
+        }
+      }
+      const cp = raw.codePointAt(i) ?? 0;
+      const ch = String.fromCodePoint(cp);
+      i += ch.length - 1;
+      if (ch === " ") {
+        flush();
+        continue;
+      }
+      word += ch;
+      wordW += charWidth(cp);
+    }
+    flush();
+
+    // Style still in force where the line was cut, so the next one can reopen
+    // it. A reset clears the stack; anything else is pushed onto it.
+    let open = "";
+    const track = (text: string) => {
+      for (const seq of text.match(/\x1b\[[0-9;]*m/g) ?? []) {
+        if (/^\x1b\[0?m$/.test(seq)) open = "";
+        else open += seq;
+      }
+    };
+    const close = () => (noColor || !open ? "" : "\x1b[0m");
+
+    let cur = "";
+    let curW = 0;
+    let carry = "";
+    const push = () => {
+      // Tracked before the line is closed: what is still open at the break is
+      // exactly what has to be closed here and reopened on the next line.
+      track(cur);
+      lines.push(carry + cur + close());
+      carry = noColor ? "" : open;
+      cur = "";
+      curW = 0;
+    };
+    for (const { text, w } of words) {
+      if (w > limit) {
+        // One unbroken run wider than the line — a URL, a path, a hash. It has
+        // to be cut, or it takes the wrap with it.
+        if (curW) push();
+        let rest = text;
+        while (width(rest) > limit) {
+          const head = clipAnsiHard(rest, limit);
+          cur = head;
+          curW = width(head);
+          push();
+          rest = rest.slice(head.length);
+        }
+        cur = rest;
+        curW = width(rest);
+        continue;
+      }
+      if (curW && curW + 1 + w > limit) push();
+      cur = curW ? `${cur} ${text}` : text;
+      curW = curW ? curW + 1 + w : w;
+    }
+    if (cur) {
+      track(cur);
+      lines.push(carry + cur + close());
+    }
+    else if (carry) lines.push("");
+  }
+  return lines;
+}
+
+/** The first `max` visible cells of a styled string, with nothing appended. */
+function clipAnsiHard(s: string, max: number): string {
+  let out = "";
+  let visible = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] === "\x1b") {
+      const seq = /^\x1b\[[0-9;]*[A-Za-z]/.exec(s.slice(i));
+      if (seq) {
+        out += seq[0];
+        i += seq[0].length - 1;
+        continue;
+      }
+    }
+    const cp = s.codePointAt(i) ?? 0;
+    const ch = String.fromCodePoint(cp);
+    const cw = charWidth(cp);
+    if (visible + cw > max) break;
+    out += ch;
+    visible += cw;
+    i += ch.length - 1;
+  }
+  return out;
 }

@@ -28,7 +28,7 @@ if (!process.env.TOKENROUTER_BASE_URL) {
 process.env.TOKENROUTER_API_KEY = "sk-test";
 
 const { fetchModels } = await import("../dist/provider/models.js");
-const { complete, modelRejectsCache } = await import("../dist/provider/client.js");
+const { complete, modelRejectsCache, modelRejectsLongCacheTtl } = await import("../dist/provider/client.js");
 
 await fetchModels(); // registers protocols, so mock-claude routes to /messages
 
@@ -59,6 +59,28 @@ async function ask(model) {
   check("the anthropic path answers", res.content.includes("Готово"), res.content);
   check("cached tokens come back", res.usage?.cached_tokens === 900, JSON.stringify(res.usage));
   check("the request carried breakpoints", /ANTHROPIC model=mock-claude cache=yes/.test(mockOut()), mockOut());
+  // An agent turn outlives five minutes many times over, and so does the pause
+  // while the user reads a diff.
+  check("and asked for the hour, not the five minutes", /model=mock-claude cache=yes ttl=1h/.test(mockOut()), mockOut());
+  // System prompt, tool block, and the tail of the history. The anchor at the
+  // start of the turn coincides with the tail on a first request, and one mark
+  // is not spent twice on the same block.
+  check("three blocks are marked on a first request", /model=mock-claude cache=yes ttl=1h marks=3/.test(mockOut()), mockOut());
+}
+
+{
+  // A host that takes breakpoints but not the hour loses the lifetime, not the
+  // caching: the cheaper loss is given up first.
+  const { res } = await ask("mock-nottl");
+  check("a host without the hour still answers", res.content.includes("Готово"), res.content);
+  check("it was asked for the hour once", (mockOut().match(/model=mock-nottl cache=yes ttl=1h/g) ?? []).length === 1, mockOut());
+  check("and then retried at five minutes", /model=mock-nottl cache=yes ttl=5m/.test(mockOut()), mockOut());
+  check("the shorter lifetime is remembered", modelRejectsLongCacheTtl("mock-nottl"));
+  check("and caching itself was never given up", !modelRejectsCache("mock-nottl"));
+
+  const before = (mockOut().match(/model=mock-nottl/g) ?? []).length;
+  await ask("mock-nottl");
+  check("no second probe for the hour", (mockOut().match(/model=mock-nottl/g) ?? []).length - before === 1, mockOut());
 }
 
 {
@@ -72,11 +94,71 @@ async function ask(model) {
   await ask("mock-nocache");
   const after = (mockOut().match(/model=mock-nocache/g) ?? []).length;
   check("no second probe after learning", after - before === 1, `${before} → ${after}`);
-  // Exactly one request carried breakpoints: the probe that taught us.
+  // Two probes carried breakpoints — one per rung of the ladder, the hour and
+  // then the default lifetime — and nothing after that.
   check(
     "breakpoints are not tried again",
-    (mockOut().match(/model=mock-nocache cache=yes/g) ?? []).length === 1,
-    mockOut,
+    (mockOut().match(/model=mock-nocache cache=yes/g) ?? []).length === 2,
+    mockOut(),
+  );
+}
+
+{
+  // Whether the cache read is counted inside the prompt or beside it is a
+  // per-host decision; the counts are reconciled on the way in, or the status
+  // line divides 6300 by 800 and reports "793% cached".
+  const res = await complete({ model: "mock-cache-split", messages: [{ role: "user", content: "привет" }], stream: false });
+  check("cache reported beside the prompt is folded in", res.usage?.prompt_tokens === 7100, JSON.stringify(res.usage));
+  check("the cached share stays a share", (res.usage?.cached_tokens ?? 0) <= (res.usage?.prompt_tokens ?? 0), JSON.stringify(res.usage));
+}
+
+{
+  // OpenRouter reports detailed usage — the cached count included — only when
+  // the body asks for it. Without the ask the tracker books the whole prompt as
+  // fresh input, whether or not the provider cached it.
+  const { writeCredentials } = await import("../dist/provider/credentials.js");
+  const { saveConfig } = await import("../dist/config.js");
+  writeCredentials("openrouter", { mode: "apikey", accessToken: "sk-or-test" });
+  saveConfig({ providers: { openrouter: { baseUrl: process.env.TOKENROUTER_BASE_URL } } });
+  const { res } = await ask("openrouter:mock-fast");
+  check("an openrouter model answers", res.content.includes("СЖАТАЯ ВЫЖИМКА"), res.content);
+  const line = mockOut().split("\n").filter((l) => l.includes("REQ model=mock-fast")).pop() ?? "";
+  check("openrouter is asked for detailed usage", /usage_asked=\{"include":true\}/.test(line), line);
+
+  await ask("mock-claude");
+  const plain = mockOut().split("\n").filter((l) => l.includes("ANTHROPIC model=mock-claude")).pop() ?? "";
+  check("the anthropic path is not asked in openai's dialect", !/"usage"/.test(plain), plain);
+}
+
+{
+  // A host that takes only the older thinking shape says so in its own words:
+  // "adaptive thinking is not supported on this model" names neither
+  // "reasoning" nor "effort". Read literally, that reads as a bad request and
+  // the turn dies — and a subagent with it. It has to step down the ladder.
+  const res = await complete({
+    model: "mock-oldthinking",
+    messages: [{ role: "user", content: "привет" }],
+    effort: "high",
+    stream: false,
+  });
+  check("a host that rejects adaptive thinking still answers", res.content.includes("Готово"), res.content);
+  check(
+    "the older shape is what it was asked with",
+    /model=mock-oldthinking thinking=enabled/.test(mockOut()),
+    mockOut().split("\n").filter((l) => l.includes("oldthinking")).join(" · "),
+  );
+
+  const again = await complete({
+    model: "mock-oldthinking",
+    messages: [{ role: "user", content: "ещё" }],
+    effort: "high",
+    stream: false,
+  });
+  check("and the refusal is not repeated", again.content.includes("Готово"), again.content);
+  check(
+    "the working shape was remembered",
+    (mockOut().match(/rejected=adaptive/g) ?? []).length === 1,
+    mockOut().split("\n").filter((l) => l.includes("oldthinking")).join(" · "),
   );
 }
 

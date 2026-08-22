@@ -8,10 +8,11 @@
  * pinned below.
  */
 import { appendFileSync } from "node:fs";
+import { stashPaste, takeCollapsed } from "./paste.js";
 import { pushConsumer } from "./stdin.js";
-import { c, cursor, width } from "./ansi.js";
+import { c, cursor, esc, width } from "./ansi.js";
 import { contentWidth, indent, PAD_LEFT } from "./layout.js";
-import { out } from "./render.js";
+import { line, padded, paintFrame, renderMarkdownBlock } from "./render.js";
 
 const CTRL_A = String.fromCharCode(1);
 const CTRL_C = String.fromCharCode(3);
@@ -29,6 +30,8 @@ const TAB = String.fromCharCode(9);
 const CONTROL_CHARS = new RegExp("[" + String.fromCharCode(0) + "-" + String.fromCharCode(9) + String.fromCharCode(11) + String.fromCharCode(12) + String.fromCharCode(14) + "-" + String.fromCharCode(31) + String.fromCharCode(127) + "]", "g");
 
 const CTRL_L = String.fromCharCode(12);
+/** Ctrl+O: prints the message the screen shortened. */
+const CTRL_O = String.fromCharCode(15);
 const LF = String.fromCharCode(10);
 const FOCUS_IN = ESC + "[I";
 const FOCUS_OUT = ESC + "[O";
@@ -104,6 +107,13 @@ const KEY = {
   del: ESC + "[3~",
 };
 
+/**
+ * Shift+Tab. `ESC[Z` is the classic backtab; the other two come from terminals
+ * running the kitty keyboard protocol or xterm's modifyOtherKeys, which report
+ * Tab-with-shift as a modified key instead.
+ */
+export const SHIFT_TAB = [ESC + "[Z", ESC + "[27;2;9~", ESC + "[9;2u"];
+
 export interface EditorStatus {
   /** Left part of the first status row. */
   left: string;
@@ -129,6 +139,8 @@ export interface EditorOptions {
   suggest?(buffer: string): Suggestion[];
   /** How many suggestion rows to show at once. */
   suggestRows?: number;
+  /** Shift+Tab: cycles the confirmation mode without leaving the input. */
+  onToggleMode?(): void;
 }
 
 /**
@@ -165,6 +177,14 @@ function logKeys(label: string, s: string): void {
 }
 
 /** Strips terminal noise from a pasted chunk while keeping newlines. */
+/**
+ * The cells of a frame row the text itself gets: the row is
+ * "│" + space + "❯ " + text + "│" — five cells of chrome around it.
+ */
+function innerWidth(): number {
+  return Math.max(10, contentWidth() - 5);
+}
+
 export function cleanPaste(s: string): string {
   return s
     .replace(new RegExp(ESC + "\\[[0-9;]*[~A-Za-z]", "g"), "")
@@ -241,7 +261,7 @@ export class InputEditor {
       // Guard against a terminal that never sends the closing marker.
       if (this.pasteBuf.length > 1_000_000) {
         this.pasting = false;
-        this.insert(cleanPaste(this.pasteBuf));
+        this.insert(stashPaste(cleanPaste(this.pasteBuf)));
         this.pasteBuf = "";
         return true;
       }
@@ -250,7 +270,9 @@ export class InputEditor {
     const text = this.pasteBuf.slice(0, end);
     this.pasting = false;
     this.pasteBuf = "";
-    this.insert(cleanPaste(text).replace(/\n$/, ""));
+    // Held aside when it is big: the frame shows a token, the model gets
+    // the whole thing back when the line is sent.
+    this.insert(stashPaste(cleanPaste(text).replace(/\n$/, "")));
     return true;
   }
 
@@ -443,11 +465,11 @@ export class InputEditor {
             return this.draw();
           case KEY.up:
             if (this.menu.length) this.menuIdx = (this.menuIdx - 1 + this.menu.length) % this.menu.length;
-            else this.historyStep(-1);
+            else if (!this.moveLine(-1)) this.historyStep(-1);
             return this.draw();
           case KEY.down:
             if (this.menu.length) this.menuIdx = (this.menuIdx + 1) % this.menu.length;
-            else this.historyStep(1);
+            else if (!this.moveLine(1)) this.historyStep(1);
             return this.draw();
           case CTRL_U:
             this.markEdited();
@@ -470,8 +492,26 @@ export class InputEditor {
             if (this.menu.length) this.applySuggestion();
             else this.completeWord();
             return this.draw();
+          case SHIFT_TAB[0]:
+          case SHIFT_TAB[1]:
+          case SHIFT_TAB[2]:
+            // The status row is re-read on every draw, so the new mode shows
+            // itself without printing anything above the frame.
+            this.opts.onToggleMode?.();
+            return this.draw();
           case CTRL_L:
             return this.repaint();
+          case CTRL_O: {
+            // The frame is at the bottom of the screen and owns those rows:
+            // the block goes above it, then the frame comes back.
+            const block = takeCollapsed();
+            if (!block) return;
+            this.erase();
+            line();
+            for (const l of renderMarkdownBlock(block.text)) padded(l);
+            line();
+            return this.draw();
+          }
           case ESC:
             // Esc closes the dropdown; with none open it repaints, which is
             // the cheap way out of any frame desync.
@@ -515,6 +555,47 @@ export class InputEditor {
    */
   private markEdited(): void {
     this.historyIdx = -1;
+  }
+
+  /**
+   * The vertical arrows serve two purposes on one key. Inside the draft they
+   * move between the rows the frame shows, which is what the key does in
+   * every editor; only from the top row (or the bottom) do they fall through
+   * to the history, which is what it does in every shell. Returns false when
+   * there is no row that way — that is the caller's cue to walk the history.
+   *
+   * Rows here are what the eye sees, not what the buffer holds: a long line
+   * the frame had to wrap covers several rows, and walking it must not jump
+   * to another prompt halfway through. Hence the same wrapping draw() uses,
+   * rather than a count of newlines.
+   *
+   * While a recalled line is being browsed the history keeps the arrows, or a
+   * multi-line entry would trap them and there would be no way back.
+   */
+  private moveLine(dir: -1 | 1): boolean {
+    if (this.historyIdx !== -1) return false;
+    const rows = this.rowSpans(innerWidth());
+    // The caret sits on the last row starting at or before it; on a wrap
+    // boundary that is the row below, which is where draw() parks it too.
+    let at = 0;
+    while (at + 1 < rows.length && rows[at + 1].start <= this.pos) at++;
+    const target = at + dir;
+    if (target < 0 || target >= rows.length) return false;
+    const col = this.pos - rows[at].start;
+    this.pos = rows[target].start + Math.min(col, rows[target].len);
+    return true;
+  }
+
+  /** Where each wrapped row starts in the buffer, and how long it is. */
+  private rowSpans(inner: number): { start: number; len: number }[] {
+    const rows: { start: number; len: number }[] = [];
+    let at = 0;
+    for (const para of this.buf.split("\n")) {
+      if (!para.length) rows.push({ start: at, len: 0 });
+      else for (let i = 0; i < para.length; i += inner) rows.push({ start: at + i, len: Math.min(inner, para.length - i) });
+      at += para.length + 1; // +1 for the newline itself
+    }
+    return rows.length ? rows : [{ start: 0, len: 0 }];
   }
 
   private historyStep(dir: -1 | 1): void {
@@ -591,9 +672,9 @@ export class InputEditor {
 
   private erase(): void {
     if (!this.renderedRows) return;
-    if (this.cursorRow > 0) cursor.up(this.cursorRow);
-    cursor.toColumn(1);
-    cursor.clearDown();
+    // One write, like every other frame here: the walk up and the clear must
+    // not be two separate repaints for the terminal to show.
+    process.stdout.write(esc.toColumn(1) + esc.up(this.cursorRow) + esc.clearDown);
     this.renderedRows = 0;
     this.cursorRow = 0;
   }
@@ -631,12 +712,9 @@ export class InputEditor {
   private draw(): void {
     if (!process.stdout.isTTY) return;
     this.syncMenu();
-    this.erase();
-    cursor.hide();
 
     const w = contentWidth();
-    // Frame row is "│" + space + "❯ " + text + "│" — five cells of chrome.
-    const inner = Math.max(10, w - 5);
+    const inner = innerWidth();
     const rows = this.wrap(inner);
     const st = this.opts.status();
 
@@ -654,18 +732,30 @@ export class InputEditor {
     lines.push(indent + st.left + " ".repeat(gap) + st.hint);
     lines.push(indent + " ".repeat(Math.max(0, w - width(st.context))) + st.context);
 
-    out(lines.join("\n"));
+    // The whole repaint goes out as one write. Clearing the old box first and
+    // drawing the new one after left a moment with nothing on screen, and on
+    // every keystroke that moment is what flickered. Writing over the old rows
+    // instead means no frame ever shows the box missing. The caret is hidden
+    // for the walk: otherwise it reads as jumping a line up and snapping back.
+    const prev = this.renderedRows;
+    let frame = esc.hide;
+    if (prev) frame += esc.toColumn(1) + esc.up(this.cursorRow);
+    // Column 1 first, then wipe the row: what a shortened line used to occupy
+    // has to go, and the emulators in the tests model K the same way.
+    frame += lines.map((l) => esc.toColumn(1) + esc.clearRight + l).join("\n");
+    // The box shrank — a closed suggestion menu, a deleted line. The row below
+    // exists, so stepping onto it to clear downwards cannot scroll the screen.
+    if (prev > lines.length) frame += "\n" + esc.clearDown + esc.up(1);
 
     // Park the cursor inside the frame, on the row the caret belongs to.
     const { row, col } = this.locate(inner);
     const lastRow = lines.length - 1;
     const targetRow = 1 + row;
-    cursor.up(lastRow - targetRow);
-    cursor.toColumn(PAD_LEFT + 4 + col + 1);
+    frame += esc.up(lastRow - targetRow) + esc.toColumn(PAD_LEFT + 4 + col + 1) + esc.show;
+    paintFrame(frame);
 
     this.renderedRows = lines.length;
     this.cursorRow = targetRow;
-    cursor.show();
   }
 }
 

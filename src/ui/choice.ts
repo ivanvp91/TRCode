@@ -26,7 +26,7 @@ export interface Choice<T extends string> {
  */
 export function choose<T extends string>(
   choices: Choice<T>[],
-  opts: { initial?: T; fallback: T; hint?: string } = { fallback: choices[0].value },
+  opts: { initial?: T; fallback: T; hint?: string; cancel?: () => void } = { fallback: choices[0].value },
 ): Promise<T> {
   const stdin = process.stdin;
   if (!stdin.isTTY) return Promise.resolve(opts.fallback);
@@ -68,7 +68,13 @@ export function choose<T extends string>(
 
     const onData = (buf: Buffer) => {
       const s = buf.toString("utf8");
-      if (s === CTRL_C || s === ESC) return finish(opts.fallback);
+      // Esc is "stop", not "pick the safe button": a prompt that only ever
+      // denies one tool leaves the turn running, and the next tool asks again.
+      // Whoever put the prompt up decides what stopping means.
+      if (s === CTRL_C || s === ESC) {
+        opts.cancel?.();
+        return finish(opts.fallback);
+      }
       if (s === "\r" || s === "\n") return finish(choices[index].value);
       if (s === LEFT || s === UP) {
         index = (index - 1 + choices.length) % choices.length;

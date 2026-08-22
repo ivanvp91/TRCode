@@ -21,7 +21,37 @@ const MODELS = [
   { id: "mock-claude", owned_by: "mock", context_window: 200000, supported_endpoint_types: ["anthropic"] },
   // Same, but its host strips cache_control and 400s on it.
   { id: "mock-nocache", owned_by: "mock", context_window: 200000, supported_endpoint_types: ["anthropic"] },
+  { id: "mock-nottl", owned_by: "mock", context_window: 200000, supported_endpoint_types: ["anthropic"] },
+  // Speaks /v1/messages but only the older thinking shape, and says so in its
+  // own words rather than in the client's.
+  { id: "mock-oldthinking", owned_by: "mock", context_window: 200000, supported_endpoint_types: ["anthropic"] },
+  // Allows one request per 1.5s and phrases its 429 like a real host does.
+  { id: "mock-limited", owned_by: "mock", context_window: 64000 },
+  // Refuses once and then never again: a burst, a busy minute, a neighbour on
+  // the same account — the limit a client must stop paying for afterwards.
+  { id: "mock-burst", owned_by: "mock", context_window: 64000 },
+  // Always refuses: for the paths where one model of several has to fail.
+  { id: "mock-broken", owned_by: "mock", context_window: 8000 },
+  // Fixed at temperature 1 and 400s on anything else, the way a reasoning
+  // model behind OpenCode Go does. The client has to give the parameter up.
+  { id: "mock-fixedtemp", owned_by: "mock", context_window: 64000 },
+  // Streams reasoning forever and never finishes: the hung turn Esc must cut.
+  { id: "mock-slow", owned_by: "mock", context_window: 64000 },
+  // Hangs up in the middle of the answer the first time, then behaves: the
+  // dropped connection a client has to resend rather than report.
+  { id: "mock-drop", owned_by: "mock", context_window: 64000 },
+  // Same, but its router says so in words inside the still-open stream
+  // ("Upstream idle timeout exceeded") instead of closing the socket.
+  { id: "mock-upstream-timeout", owned_by: "mock", context_window: 64000 },
 ];
+
+/** The mock-limited window, in ms; attempts closer together get a 429. */
+const LIMIT_GAP_MS = 1500;
+let lastLimitedAt = 0;
+/** Every attempt at the limited model, so a test can read back the spacing. */
+const rateLog = [];
+let burstRefused = false;
+const dropped = new Set();
 
 function sse(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
@@ -56,11 +86,64 @@ const server = http.createServer((req, res) => {
 
     if (req.url.endsWith("/messages")) return anthropic(payload, res);
 
+    // Speaks a real-world rate limit: one request per window, and the 429
+    // spells out what that window is. Both attempts are logged, so a test can
+    // check that the client waited the window out instead of hammering.
+    if (payload.model === "mock-limited") {
+      const now = Date.now();
+      const ok = now - lastLimitedAt >= LIMIT_GAP_MS;
+      lastLimitedAt = now;
+      rateLog.push({ at: now, ok });
+      if (!ok) {
+        log(`RATE model=mock-limited status=429\n`);
+        res.writeHead(429, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({ error: { message: "You have reached the request limit: Maximum 1 requests within 1 seconds." } }),
+        );
+        return;
+      }
+      log(`RATE model=mock-limited status=200\n`);
+    }
+
+    if (payload.model === "mock-burst" && !burstRefused) {
+      burstRefused = true;
+      log(`RATE model=mock-burst status=429\n`);
+      res.writeHead(429, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({ error: { message: "You have reached the request limit: Maximum 1 requests within 1 seconds." } }),
+      );
+      return;
+    }
+
     // Visible to the test: what reasoning params actually arrived.
     log(
       `REQ model=${payload.model} reasoning_effort=${payload.reasoning_effort ?? "-"} ` +
-        `reasoning=${payload.reasoning ? JSON.stringify(payload.reasoning) : "-"}\n`,
+        `reasoning=${payload.reasoning ? JSON.stringify(payload.reasoning) : "-"} ` +
+        `usage_asked=${payload.usage ? JSON.stringify(payload.usage) : "-"}\n`,
     );
+
+    if (payload.model === "mock-broken") {
+      log("REQ model=mock-broken status=400\n");
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: { message: "this model is not available" } }));
+      return;
+    }
+
+    // mock-fixedtemp is a model that cannot be steered: sampling is fixed and
+    // anything else is a 400, phrased the way OpenCode Go phrases it.
+    if (payload.model === "mock-fixedtemp") {
+      if (payload.temperature !== undefined && payload.temperature !== 1) {
+        log("REQ model=mock-fixedtemp rejected=temperature\n");
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            error: { type: "invalid_request_error", message: "invalid temperature: only 1 is allowed for this model" },
+          }),
+        );
+        return;
+      }
+      log(`REQ model=mock-fixedtemp temperature=${payload.temperature ?? "-"}\n`);
+    }
 
     // mock-noeffort rejects the reasoning budget, like a model that lacks it.
     if (payload.model === "mock-noeffort" && (payload.reasoning_effort || payload.reasoning)) {
@@ -68,6 +151,90 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: { message: "Unsupported parameter: reasoning_effort" } }));
       return;
     }
+    // mock-cache-split reports the cache beside the prompt instead of inside
+    // it, the way xAI does through TokenRouter: 800 fresh tokens next to a
+    // 6300-token cache read.
+    if (payload.model === "mock-cache-split") {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          choices: [{ index: 0, message: { role: "assistant", content: "ок" }, finish_reason: "stop" }],
+          usage: {
+            prompt_tokens: 800,
+            completion_tokens: 10,
+            total_tokens: 810,
+            prompt_tokens_details: { cached_tokens: 6300 },
+          },
+        }),
+      );
+      return;
+    }
+
+    // A connection that dies mid-answer: headers and a first chunk arrive, then
+    // the socket is destroyed. Node reports that as `TypeError: terminated`, and
+    // the second attempt has to succeed for the client to be doing its job.
+    if (payload.model === "mock-drop") {
+      if (!dropped.has("mock-drop")) {
+        dropped.add("mock-drop");
+        log("DROP model=mock-drop first" + "\n");
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        sse(res, chunk({ reasoning_content: "думаю" }));
+        setTimeout(() => res.socket?.destroy(), 50);
+        return;
+      }
+      log("DROP model=mock-drop retry" + "\n");
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      sse(res, chunk({ role: "assistant", content: "" }));
+      sse(res, chunk({ content: "ПОСЛЕ ОБРЫВА" }));
+      sse(res, chunk({}, "stop"));
+      sse(res, { ...chunk({}), usage: { prompt_tokens: 50, completion_tokens: 5, total_tokens: 55 } });
+      res.write("data: [DONE]" + "\n\n");
+      res.end();
+      return;
+    }
+
+    // The same hang-up in a router's words: the stream is fine until the
+    // upstream behind it goes quiet, and the router answers with a JSON error
+    // inside the still-open SSE instead of closing the socket. A client that
+    // only recognises dead sockets reports an answer as if the host had judged
+    // the request and never resends.
+    if (payload.model === "mock-upstream-timeout") {
+      if (!dropped.has("mock-upstream-timeout")) {
+        dropped.add("mock-upstream-timeout");
+        log("DROP model=mock-upstream-timeout first\n");
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        sse(res, chunk({ reasoning_content: "думаю" }));
+        setTimeout(() => {
+          sse(res, { error: { message: "Upstream idle timeout exceeded" } });
+          setTimeout(() => res.socket?.destroy(), 50);
+        }, 50);
+        return;
+      }
+      log("DROP model=mock-upstream-timeout retry\n");
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      sse(res, chunk({ role: "assistant", content: "" }));
+      sse(res, chunk({ content: "ПОСЛЕ ОБРЫВА" }));
+      sse(res, chunk({}, "stop"));
+      sse(res, { ...chunk({}), usage: { prompt_tokens: 50, completion_tokens: 5, total_tokens: 55 } });
+      res.write("data: [DONE]" + "\n\n");
+      res.end();
+      return;
+    }
+
+    // A model that thinks for a very long time and never finishes: what Esc
+    // has to be able to cut through. The response is left open on purpose —
+    // the client must abort it rather than wait for an end that never comes.
+    if (payload.model === "mock-slow") {
+      log(`SLOW model=mock-slow open\n`);
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      const tick = setInterval(() => sse(res, chunk({ reasoning_content: "…" })), 200);
+      req.on("close", () => {
+        clearInterval(tick);
+        log(`SLOW model=mock-slow closed\n`);
+      });
+      return;
+    }
+
     const sawToolResult = messages.some((m) => m.role === "tool");
     const stream = payload.stream !== false;
 
@@ -84,13 +251,22 @@ const server = http.createServer((req, res) => {
         ],
         final: "краткий отчёт",
       };
+      // The panel answers in markdown, and each round is recognisable by the
+      // system prompt it was sent under — that is what lets a UI test tell the
+      // final answer apart from the rounds that led to it.
+      const sys = messages.filter((m) => m.role === "system").map((m) => String(m.content)).join(" ");
+      const brain = /Write the final answer for the user/.test(sys)
+        ? "## ИТОГ\n\n| ключ | значение |\n| --- | --- |\n| скорость | вдвое |\n\n- **вывод** готов\n"
+        : /answering the same question|You answered a question/.test(sys)
+          ? "## РАУНД\n\n- пункт про `build`\n"
+          : null;
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           choices: [
             {
               index: 0,
-              message: { role: "assistant", content: isPlanner ? JSON.stringify(plan) : "СЖАТАЯ ВЫЖИМКА (мок)" },
+              message: { role: "assistant", content: isPlanner ? JSON.stringify(plan) : (brain ?? "СЖАТАЯ ВЫЖИМКА (мок)") },
               finish_reason: "stop",
             },
           ],
@@ -163,12 +339,35 @@ const server = http.createServer((req, res) => {
 function anthropic(payload, res) {
   const raw = JSON.stringify(payload);
   const asked = raw.includes('"cache_control"');
-  log(`ANTHROPIC model=${payload.model} cache=${asked ? "yes" : "no"}\n`);
+  const ttl = /"ttl":"1h"/.test(raw) ? "1h" : asked ? "5m" : "-";
+  const marks = (raw.match(/"cache_control"/g) ?? []).length;
+  log(`ANTHROPIC model=${payload.model} cache=${asked ? "yes" : "no"} ttl=${ttl} marks=${marks}\n`);
+
+  // A proxy that forwards cache_control but has not caught up with the hour:
+  // the client has to give up the lifetime before it gives up caching.
+  if (ttl === "1h" && payload.model === "mock-nottl") {
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "cache_control.ttl: Extra inputs are not permitted" } }));
+    return;
+  }
 
   if (asked && payload.model === "mock-nocache") {
     res.writeHead(400, { "content-type": "application/json" });
     res.end(JSON.stringify({ error: { type: "invalid_request_error", message: "Unexpected field: cache_control" } }));
     return;
+  }
+
+  // A host that only knows the older thinking shape, phrased the way Model
+  // Studio phrases it: no "reasoning", no "effort", nothing the client calls
+  // the parameter it just sent.
+  if (payload.model === "mock-oldthinking" && payload.thinking?.type === "adaptive") {
+    log(`ANTHROPIC model=mock-oldthinking rejected=adaptive\n`);
+    res.writeHead(400, { "content-type": "application/json" });
+    res.end(JSON.stringify({ error: { message: "adaptive thinking is not supported on this model" } }));
+    return;
+  }
+  if (payload.model === "mock-oldthinking") {
+    log(`ANTHROPIC model=mock-oldthinking thinking=${payload.thinking?.type ?? "-"}\n`);
   }
 
   const cached = asked ? 900 : 0;

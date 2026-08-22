@@ -8,6 +8,14 @@
  */
 import type { Message, StreamEvent, ToolCall, ToolDef, Usage } from "../types.js";
 import type { Effort } from "../config.js";
+import { normalizeToolSchema } from "./schema.js";
+import { DEFAULT_MAX_TOKENS, THINKING_BUDGET } from "./anthropic.js";
+
+/** The same ceiling the Anthropic dialect has; see buildAnthropicBody. */
+function defaultMaxTokens(effort?: Effort): number {
+  const budget = effort && effort !== "off" ? THINKING_BUDGET[effort] : undefined;
+  return budget ? budget + DEFAULT_MAX_TOKENS : DEFAULT_MAX_TOKENS;
+}
 
 export interface ResponsesRequest {
   model: string;
@@ -76,11 +84,12 @@ export function buildResponsesBody(req: ResponsesRequest, stream: boolean): Reco
       type: "function",
       name: t.name,
       description: t.description,
-      parameters: t.parameters,
+      parameters: normalizeToolSchema(t.parameters),
     }));
     body.tool_choice = "auto";
   }
   if (req.maxTokens) body.max_output_tokens = req.maxTokens;
+  else body.max_output_tokens = defaultMaxTokens(req.effort);
   if (req.effort && req.effort !== "off") {
     // Responses takes the nested form; "minimal" is not a documented level.
     body.reasoning = { effort: req.effort === "minimal" ? "low" : req.effort };

@@ -8,11 +8,12 @@
  * turn finishes.
  */
 import { c, width } from "./ansi.js";
-import { contentWidth, indent } from "./layout.js";
+import { contentWidth, indent, PAD_LEFT } from "./layout.js";
 import { fmtDuration } from "./layout.js";
 import { refreshFooter, setFooter } from "./render.js";
 import { pushConsumer } from "./stdin.js";
-import { cleanPaste, isNewlineKey, type EditorStatus } from "./editor.js";
+import { cleanPaste, isNewlineKey, SHIFT_TAB, type EditorStatus } from "./editor.js";
+import { stashPaste } from "./paste.js";
 
 const CTRL_C = String.fromCharCode(3);
 const CTRL_U = String.fromCharCode(21);
@@ -24,10 +25,137 @@ const PASTE_END = ESC + "[201~";
 
 const FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
+/** What a raw chunk says about the Esc key. */
+export type InterruptRead = "yes" | "no" | "pending";
+
+const PASTE_OPEN = ESC + "[200~";
+const PASTE_CLOSE = ESC + "[201~";
+
+/**
+ * Strips bracketed-paste payload, which is data and never keys.
+ *
+ * Pasting a terminal log while the model works used to cancel the turn: the
+ * log carries escape bytes of its own — a title sequence, a bare \x1b in a
+ * dump — and the scan below read them as somebody reaching for Esc. `inPaste`
+ * says the chunk begins inside a paste that started in an earlier read.
+ */
+function withoutPaste(s: string, inPaste: boolean): string {
+  let out = "";
+  let i = 0;
+  let inside = inPaste;
+  for (;;) {
+    if (inside) {
+      const close = s.indexOf(PASTE_CLOSE, i);
+      if (close === -1) return out;
+      i = close + PASTE_CLOSE.length;
+      inside = false;
+      continue;
+    }
+    const open = s.indexOf(PASTE_OPEN, i);
+    if (open === -1) return out + s.slice(i);
+    out += s.slice(i, open);
+    i = open + PASTE_OPEN.length;
+    inside = true;
+  }
+}
+
+/**
+ * Whether a read carries an Esc or Ctrl+C keypress meant as "stop".
+ *
+ * Matching the whole chunk was too strict. A terminal delivers whatever has
+ * accumulated since the last read, so Esc pressed while the model is streaming
+ * — the one moment it matters — arrives glued to whatever else was typed, as
+ * `\x1b\x1b` from an impatient second press, or as `\x1b` followed by the next
+ * keystroke. None of those equal a bare Esc, and the turn ran on.
+ *
+ * Two things are not Esc, though, and reading them as Esc cancelled turns
+ * nobody had touched: an Esc that opens a recognised sequence (`\x1b[`,
+ * `\x1bO` — cursor keys, focus events, paste markers), and an Esc that is the
+ * last byte of the chunk, which may simply be a sequence split across two
+ * reads. The second one is "pending": it is Esc only if nothing follows.
+ */
+export function readInterrupt(s: string, inPaste = false): InterruptRead {
+  if (s.includes(CTRL_C)) return "yes";
+  // Alt+Enter is ESC followed by CR, and that is a newline in the message
+  // being composed — not a cancel. Typing a multi-line note while the model
+  // worked and reaching for a second line ended the turn.
+  if (isNewlineKey(s)) return "no";
+  // The same pair inside a longer chunk: the keystroke can arrive glued to
+  // whatever was typed just before it.
+  const newlineKey = new RegExp(ESC + "[\r\n]", "g");
+  const keys = withoutPaste(s, inPaste).replace(newlineKey, "");
+  let pending = false;
+  for (let i = keys.indexOf(ESC); i !== -1; i = keys.indexOf(ESC, i + 1)) {
+    const next = keys[i + 1];
+    if (next === undefined) pending = true;
+    else if (next !== "[" && next !== "O") return "yes";
+  }
+  return pending ? "pending" : "no";
+}
+
+/** Kept for callers with no paste state of their own. */
+export function isInterrupt(s: string): boolean {
+  return readInterrupt(s) === "yes";
+}
+
+/** How long a trailing Esc waits for the rest of its sequence. */
+const ESC_HOLD_MS = 40;
+
+/**
+ * Reads Esc across chunk boundaries.
+ *
+ * A cursor key can arrive as `\x1b` in one read and `[A` in the next; a real
+ * Esc press arrives as `\x1b` and nothing else. Telling them apart takes the
+ * few milliseconds between the two, which is what this holds.
+ */
+export class InterruptWatcher {
+  private timer: NodeJS.Timeout | null = null;
+  constructor(
+    private fire: () => void,
+    private holdMs = ESC_HOLD_MS,
+  ) {}
+
+  /** True when this chunk cancelled the turn, so the caller can stop reading it. */
+  feed(s: string, inPaste = false): boolean {
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+      // The tail of a split sequence — the held Esc was never a keypress.
+      // Anything else means it was: the turn is cancelled, and the keystroke
+      // that decided it is still a keystroke, so it goes on to the editing
+      // logic rather than being eaten by the cancel.
+      if (s[0] !== "[" && s[0] !== "O") {
+        this.fire();
+        return false;
+      }
+    }
+    const read = readInterrupt(s, inPaste);
+    if (read === "yes") {
+      this.fire();
+      return true;
+    }
+    if (read === "pending") {
+      this.timer = setTimeout(() => {
+        this.timer = null;
+        this.fire();
+      }, this.holdMs);
+      this.timer.unref?.();
+    }
+    return false;
+  }
+
+  /** Drops a held Esc; the turn it would have cancelled is already over. */
+  stop(): void {
+    if (this.timer) clearTimeout(this.timer);
+    this.timer = null;
+  }
+}
 export interface TurnBarOptions {
   status: () => EditorStatus;
   /** Cancels the running turn — Esc and Ctrl+C both land here. */
   onInterrupt: () => void;
+  /** Shift+Tab: cycles the confirmation mode, same as in the idle editor. */
+  onToggleMode?: () => void;
 }
 
 export class TurnBar {
@@ -38,16 +166,23 @@ export class TurnBar {
   private label = "thinking";
   private inTokens = 0;
   private outTokens = 0;
+  private cachedTokens = 0;
+  /** Rolling reasoning preview, shown above the spinner while a model thinks. */
+  private thinking: string[] = [];
+  /** Where the caret sits inside rows(), so the footer can show it there. */
+  private caret = { row: 0, col: 0 };
   private buf = "";
   private queued: string[] = [];
   private pasting = false;
+  private pasteBuf = "";
+  private watch = new InterruptWatcher(() => this.opts.onInterrupt());
 
   constructor(private opts: TurnBarOptions) {}
 
   start(): void {
     if (!process.stdout.isTTY || this.timer) return;
     this.started = Date.now();
-    setFooter(() => this.rows());
+    setFooter(() => this.rows(), () => this.caret);
     this.timer = setInterval(() => {
       this.frame++;
       refreshFooter();
@@ -58,6 +193,7 @@ export class TurnBar {
 
   /** Steps aside so a permission prompt can own the bottom of the screen. */
   pause(): void {
+    this.watch.stop();
     if (!this.timer) return;
     clearInterval(this.timer);
     this.timer = null;
@@ -68,7 +204,7 @@ export class TurnBar {
 
   resume(): void {
     if (this.timer || !this.started || !process.stdout.isTTY) return;
-    setFooter(() => this.rows());
+    setFooter(() => this.rows(), () => this.caret);
     this.timer = setInterval(() => {
       this.frame++;
       refreshFooter();
@@ -83,9 +219,17 @@ export class TurnBar {
     refreshFooter();
   }
 
-  setTokens(inTokens: number, outTokens: number): void {
+  setTokens(inTokens: number, outTokens: number, cachedTokens?: number): void {
     this.inTokens = inTokens;
     this.outTokens = outTokens;
+    // Text deltas update counts without knowing the cache split; keep the
+    // share from the last request whose usage reported it.
+    if (cachedTokens !== undefined) this.cachedTokens = cachedTokens;
+  }
+
+  setThinking(rows: string[]): void {
+    this.thinking = rows;
+    refreshFooter();
   }
 
   /** Removes the bar and hands back what the user typed while waiting. */
@@ -100,22 +244,27 @@ export class TurnBar {
   private onData(b: Buffer): void {
     let s = b.toString("utf8");
 
+    // Read before the chunk is treated as text, and told whether a paste is
+    // open: escape bytes inside pasted content are data, not a cancel.
+    if (this.watch.feed(s, this.pasting)) return;
+
     if (this.pasting || s.includes(PASTE_START)) {
       const from = s.indexOf(PASTE_START);
       if (from !== -1) s = s.slice(from + PASTE_START.length);
       const to = s.indexOf(PASTE_END);
       this.pasting = to === -1;
       if (to !== -1) s = s.slice(0, to);
-      this.insert(cleanPaste(s));
+      // Held until the end marker: a paste that arrives in five chunks is one
+      // paste, and stashing it piecemeal would leave five tokens behind.
+      this.pasteBuf += s;
+      if (this.pasting && this.pasteBuf.length < 1_000_000) return;
+      this.pasting = false;
+      const whole = this.pasteBuf;
+      this.pasteBuf = "";
+      this.insert(stashPaste(cleanPaste(whole)));
       return;
     }
 
-    // Esc interrupts the turn; it does not clear the box, so a message typed
-    // while waiting survives the interruption.
-    if (s === ESC || s === CTRL_C) {
-      this.opts.onInterrupt();
-      return;
-    }
     if (isNewlineKey(s)) return this.insert("\n");
     if (s === "\r" || s === "\n") return this.submit();
     if (s === CTRL_U) {
@@ -124,6 +273,12 @@ export class TurnBar {
     }
     if (s === DEL || s === BACKSPACE) {
       this.buf = [...this.buf].slice(0, -1).join("");
+      return refreshFooter();
+    }
+    if (SHIFT_TAB.includes(s)) {
+      // The status row re-reads the mode on every repaint; refresh now rather
+      // than on the next spinner tick, so the flip feels instant.
+      this.opts.onToggleMode?.();
       return refreshFooter();
     }
     if (s.startsWith(ESC)) return; // arrows and friends: nothing to do here
@@ -152,16 +307,28 @@ export class TurnBar {
     const st = this.opts.status();
     const rows: string[] = [];
 
+    // A gap between the transcript above and the live block: without it the
+    // streamed text and the spinner (or reasoning preview) read as one blob.
+    rows.push("");
+    for (const tl of this.thinking) {
+      rows.push(indent + "  " + c.dim(clipRow(tl, Math.max(10, w - 4))));
+    }
+    // The preview is its own block; without the gap its last line and the
+    // spinner read as one.
+    if (this.thinking.length) rows.push("");
     rows.push(indent + this.spinnerLine());
     for (const q of this.queued.slice(-2)) {
       rows.push(indent + c.gray("  ⎿ queued: ") + c.dim(clipRow(q, inner - 10)));
     }
 
     rows.push(indent + c.gray("╭" + "─".repeat(w - 2) + "╮"));
-    for (const [i, r] of wrapBuffer(this.buf, inner).entries()) {
+    const bufRows = wrapBuffer(this.buf, inner);
+    for (const [i, r] of bufRows.entries()) {
       const marker = i === 0 ? c.brightCyan("❯ ") : c.gray("  ");
       rows.push(indent + c.gray("│") + " " + marker + r.padEnd(inner) + c.gray("│"));
     }
+    // The caret always trails the typed text: this input appends only.
+    this.caret = { row: rows.length - 1, col: PAD_LEFT + 4 + width(bufRows[bufRows.length - 1] ?? "") };
     rows.push(indent + c.gray("╰" + "─".repeat(w - 2) + "╯"));
 
     const gap = Math.max(2, w - width(st.left) - width(st.hint));
@@ -172,9 +339,13 @@ export class TurnBar {
 
   private spinnerLine(): string {
     const elapsed = fmtDuration(Date.now() - this.started);
+    const cached =
+      this.cachedTokens && this.inTokens
+        ? ` · ${Math.min(100, Math.round((this.cachedTokens / this.inTokens) * 100))}% cached`
+        : "";
     const counts =
       this.inTokens || this.outTokens
-        ? ` · ↑${fmtCompact(this.inTokens)} ↓${fmtCompact(this.outTokens)}`
+        ? ` · ↑ ${fmtCompact(this.inTokens)} ↓ ${fmtCompact(this.outTokens)}${cached}`
         : "";
     const hint = this.buf.trim()
       ? c.gray("  enter to queue · esc to interrupt")

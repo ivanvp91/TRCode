@@ -233,6 +233,26 @@ function check(name, cond, detail = "") {
   check("long turn is capped", /more lines/.test(text), text);
 }
 
+// ── 3b. earlier prompts show as a table of contents, not a bare count ───────
+{
+  const app = makeApp();
+  const s = new Session({ cwd: CWD, model: "moonshotai/kimi-k3", title: "long one" });
+  for (let i = 1; i <= 7; i++) {
+    s.add({ role: "user", content: `question number ${i} about the dashboard` });
+    s.add({ role: "assistant", content: `answer ${i}`, meta: { model: "moonshotai/kimi-k3" } });
+  }
+  app.session = s;
+  screen.reset();
+  app.replayHistory();
+  const text = screen.lines().map(strip).join("\n");
+
+  check("folded part is announced", /Earlier in this session/.test(text), text);
+  check("each folded prompt is listed", /question number 1/.test(text) && /question number 3/.test(text), text);
+  check("folded prompts carry their age", /just now/.test(text), text);
+  check("folded answers stay folded", !/answer 1\b/.test(text), text);
+  check("recent turns still replay in full", /answer 7/.test(text), text);
+}
+
 // ── 4. a compacted digest replays as a labelled block ───────────────────────
 {
   const app = makeApp();

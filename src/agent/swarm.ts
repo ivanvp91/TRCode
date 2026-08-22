@@ -5,9 +5,9 @@
  * (write-capable) turns can act on it afterwards.
  */
 import { c } from "../ui/ansi.js";
-import { MarkdownStream, Spinner, assistantPrefix, info, line, rule, truncate, warn } from "../ui/render.js";
+import { MarkdownStream, Spinner, assistantPrefix, info, line, padded, rule, truncate, warn } from "../ui/render.js";
 import { buildSystemPrompt } from "./prompt.js";
-import { runAgent } from "./loop.js";
+import { runAgent, stepCeiling } from "./loop.js";
 import { UsageTracker, fmtTokens } from "../usage.js";
 import { loadConfig } from "../config.js";
 import { effortFor } from "../provider/models.js";
@@ -68,8 +68,8 @@ export async function runSwarm(app: App, task: string): Promise<void> {
 
   line();
   rule(c.brightMagenta(` swarm · ${roster.length} ${roster.length === 1 ? "model" : "models"} `));
-  line(`  ${c.bold("task")} ${truncate(task, 90)}`);
-  for (const m of roster) line(`  ${c.brightBlue("├")} ${m}`);
+  padded(`${c.bold("task")} ${truncate(task, 90)}`);
+  for (const m of roster) padded(`${c.brightBlue("├")} ${m}`);
   line();
 
   const readOnlyTools: ToolDef[] = app.toolList().filter((t) => t.risk === "read");
@@ -78,30 +78,30 @@ export async function runSwarm(app: App, task: string): Promise<void> {
 
   const runs = roster.map(async (model, i) => {
     const usage = new UsageTracker();
-    const tag = c.brightBlue(`  ├ [${i + 1}] ${model}`);
+    const tag = `  ${c.brightBlue(`├ [${i + 1}] ${model}`)}`;
     const t0 = Date.now();
     try {
       const res = await runAgent({
         model,
-        systemPrompt: buildSystemPrompt({ cwd: app.cwd, model, skills: app.skills, subagent: true }),
+        systemPrompt: buildSystemPrompt({ cwd: app.cwd, model, skills: app.activeSkills, subagent: true }),
         messages: [{ role: "user", content: task + WORKER_SUFFIX }],
         tools: readOnlyTools,
         toolContext: { ...ctx, depth: 1 },
         catalog: app.catalog,
         usage,
-        maxSteps: Math.min(cfg.maxSteps, 25),
+        maxSteps: stepCeiling(cfg.maxSteps, 25),
         signal: ctx.signal,
         effort: effortFor(model, app.effortOverride),
-        toolConcurrency: 3,
+        toolConcurrency: Math.min(3, loadConfig().toolConcurrency),
         events: {
           onToolStart: (tool, args) => {
-            line(`${tag} ${c.cyan(tool.name)} ${c.gray(truncate(tool.summarize?.(args) ?? "", 60))}`);
+            padded(`${tag} ${c.cyan(tool.name)} ${c.gray(truncate(tool.summarize?.(args) ?? "", 60))}`);
           },
         },
       });
       app.usage.absorb(usage);
       const t = usage.totals();
-      line(
+      padded(
         `${tag} ${c.green("done")} ${c.gray(
           `${((Date.now() - t0) / 1000).toFixed(0)}s · ${fmtTokens(t.input + t.output)} tokens`,
         )}`,
@@ -110,7 +110,7 @@ export async function runSwarm(app: App, task: string): Promise<void> {
     } catch (err) {
       app.usage.absorb(usage);
       const msg = (err as Error)?.name === "AbortError" ? "interrupted" : (err as Error).message;
-      line(`${tag} ${c.red("failed")} ${c.dim(msg)}`);
+      padded(`${tag} ${c.red("failed")} ${c.dim(msg)}`);
       return { model, text: "", ok: false };
     }
   });
@@ -185,15 +185,14 @@ export async function runSwarm(app: App, task: string): Promise<void> {
   commit(app, task, synth, roster);
 
   line();
-  line(
-    "  " +
-      [
-        c.brightMagenta(`swarm ${roster.length}×`),
-        c.gray(`${((Date.now() - started) / 1000).toFixed(0)}s`),
-        c.gray(fmtTokens(app.usage.totals().input + app.usage.totals().output) + " tokens this session"),
-      ].join(c.gray(" · ")),
+  padded(
+    [
+      c.brightMagenta(`swarm ${roster.length}×`),
+      c.gray(`${((Date.now() - started) / 1000).toFixed(0)}s`),
+      c.gray(fmtTokens(app.usage.totals().input + app.usage.totals().output) + " tokens this session"),
+    ].join(c.gray(" · ")),
   );
-  line(c.gray("  The result is in the history — carry on with normal requests."));
+  padded(c.gray("The result is in the history — carry on with normal requests."));
   line();
 }
 

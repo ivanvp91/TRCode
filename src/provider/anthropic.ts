@@ -6,6 +6,7 @@
  * max_tokens is mandatory.
  */
 import { estimateTokens } from "../usage.js";
+import { normalizeToolSchema } from "./schema.js";
 import type { Message, StreamEvent, ToolCall, ToolDef, Usage } from "../types.js";
 import type { Effort } from "../config.js";
 
@@ -29,9 +30,27 @@ export interface AnthropicRequest {
    * asked — every step of an agent loop pays full price for the same history.
    */
   cache?: boolean;
+  /** Cache lifetime to ask for; dropped to "5m" for hosts that refuse it. */
+  cacheTtl?: CacheTtl;
 }
 
-const CACHE_CONTROL = { type: "ephemeral" as const };
+/**
+ * How long a written cache entry lives. Five minutes is the default and it is
+ * the wrong one for an agent: a turn is minutes of tool calls, and the pause
+ * while the user reads a diff is enough to drop the whole prefix, so the next
+ * request re-prefills a context that had not changed by one byte. An hour costs
+ * more to write (2x base against 1.25x) and it is not close — a write is paid
+ * once, the reads are paid on every step of every turn after it.
+ *
+ * Measured on Claude Code: 93% of its cache writes go to the hour, and it sits
+ * at a 99.1% hit-rate. Hosts that proxy the Messages API without supporting the
+ * field degrade to five minutes on their own; see the ladder in client.ts.
+ */
+export type CacheTtl = "1h" | "5m";
+
+function cacheControl(ttl: CacheTtl | undefined): Record<string, string> {
+  return ttl === "1h" ? { type: "ephemeral", ttl: "1h" } : { type: "ephemeral" };
+}
 /**
  * Anthropic ignores a breakpoint below ~1024 tokens (2048 on Haiku), and a
  * cache write costs 25% more than plain input. Below this there is nothing to
@@ -39,15 +58,26 @@ const CACHE_CONTROL = { type: "ephemeral" as const };
  */
 const MIN_CACHEABLE_TOKENS = 2048;
 
-const DEFAULT_MAX_TOKENS = 8192;
+export const DEFAULT_MAX_TOKENS = 8192;
 
 /** Thinking budgets per effort level; "off"/"minimal" disable it. */
-const THINKING_BUDGET: Record<string, number> = { low: 2048, medium: 6144, high: 12288 };
+export const THINKING_BUDGET: Record<string, number> = { low: 2048, medium: 6144, high: 12288 };
 
 /** Chat-shaped history → Anthropic `system` + `messages`. */
-export function toAnthropicMessages(messages: Message[]): { system: string; messages: unknown[] } {
+export function toAnthropicMessages(messages: Message[]): {
+  system: string;
+  messages: unknown[];
+  /**
+   * Where the current turn begins — the last thing the user actually typed.
+   * Fixed for the whole turn however many tool rounds follow it, which makes
+   * it the one place a breakpoint can be written once and read back on every
+   * later step. The moving one at the tail covers what has happened since.
+   */
+  anchor: { msg: number; block: number } | null;
+} {
   const system: string[] = [];
   const out: { role: "user" | "assistant"; content: any[] }[] = [];
+  let anchor: { msg: number; block: number } | null = null;
 
   const push = (role: "user" | "assistant", block: any) => {
     const last = out[out.length - 1];
@@ -88,18 +118,21 @@ export function toAnthropicMessages(messages: Message[]): { system: string; mess
     }
 
     push("user", { type: "text", text: String(m.content ?? "") });
+    anchor = { msg: out.length - 1, block: out[out.length - 1].content.length - 1 };
   }
 
   // The API requires the conversation to start with a user turn.
   if (out.length && out[0].role === "assistant") {
     out.unshift({ role: "user", content: [{ type: "text", text: "(continued)" }] });
+    if (anchor) anchor = { ...anchor, msg: anchor.msg + 1 };
   }
 
-  return { system: system.join("\n\n"), messages: out };
+  return { system: system.join("\n\n"), messages: out, anchor };
 }
 
 export function buildAnthropicBody(req: AnthropicRequest, stream: boolean): Record<string, unknown> {
-  const { system, messages } = toAnthropicMessages(req.messages);
+  const { system, messages, anchor } = toAnthropicMessages(req.messages);
+  const CACHE_CONTROL = cacheControl(req.cacheTtl);
   const wantsThinking = Boolean(req.effort && req.effort !== "off" && req.thinkingForm !== "none");
   const form = req.thinkingForm ?? "adaptive";
   const budget = wantsThinking && form === "budget" ? THINKING_BUDGET[req.effort as string] : undefined;
@@ -110,7 +143,7 @@ export function buildAnthropicBody(req: AnthropicRequest, stream: boolean): Reco
 
   const body: Record<string, unknown> = {
     model: req.model,
-    messages: cache ? withCacheBreakpoint(messages) : messages,
+    messages: cache ? withCacheBreakpoints(messages, anchor, CACHE_CONTROL) : messages,
     max_tokens: maxTokens,
     stream,
   };
@@ -123,7 +156,7 @@ export function buildAnthropicBody(req: AnthropicRequest, stream: boolean): Reco
     const tools = req.tools.map((t) => ({
       name: t.name,
       description: t.description,
-      input_schema: t.parameters as unknown,
+      input_schema: normalizeToolSchema(t.parameters) as unknown,
     }));
     // A breakpoint on the last tool covers the whole block above it.
     if (cache && tools.length) {
@@ -145,18 +178,45 @@ export function buildAnthropicBody(req: AnthropicRequest, stream: boolean): Reco
 }
 
 /**
- * Marks the end of the history so the next step reads it back instead of
- * re-sending it at full price. The breakpoint moves forward every request:
- * this one writes the cache, the next one hits it.
+ * Two breakpoints in the history, doing different jobs.
+ *
+ * The one at the tail moves forward every request: this step writes the cache,
+ * the next one hits it. On its own it is fragile — the entry it wrote is the
+ * only thing standing between the next request and a full re-prefill, and one
+ * expiry throws away the whole conversation.
+ *
+ * So the second one sits at the start of the current turn, where nothing moves
+ * however many tool rounds follow. It is written once and read back on every
+ * step of the turn, and when the tail entry does lapse, the request still
+ * matches everything up to the user's message instead of nothing at all.
+ *
+ * Four is the ceiling Anthropic allows, and this uses all four: the system
+ * prompt, the tool block, the anchor, the tail.
  */
-function withCacheBreakpoint(messages: unknown[]): unknown[] {
+function withCacheBreakpoints(
+  messages: unknown[],
+  anchor: { msg: number; block: number } | null,
+  control: Record<string, string>,
+): unknown[] {
   if (!messages.length) return messages;
   const out = messages.slice();
-  const last = out[out.length - 1] as { role: string; content: any[] };
-  if (!Array.isArray(last?.content) || !last.content.length) return messages;
-  const content = last.content.slice();
-  content[content.length - 1] = { ...content[content.length - 1], cache_control: CACHE_CONTROL };
-  out[out.length - 1] = { ...last, content };
+
+  const mark = (msg: number, block: number): void => {
+    const m = out[msg] as { role: string; content: any[] } | undefined;
+    if (!Array.isArray(m?.content) || !m.content[block]) return;
+    const content = m.content.slice();
+    content[block] = { ...content[block], cache_control: control };
+    out[msg] = { ...m, content };
+  };
+
+  const lastMsg = out.length - 1;
+  const lastBlock = ((out[lastMsg] as { content?: any[] })?.content?.length ?? 0) - 1;
+  if (lastBlock < 0) return messages;
+
+  // On the first step of a turn the two land on the same block; one is enough,
+  // and a duplicate would spend a breakpoint for nothing.
+  if (anchor && !(anchor.msg === lastMsg && anchor.block === lastBlock)) mark(anchor.msg, anchor.block);
+  mark(lastMsg, lastBlock);
   return out;
 }
 
@@ -188,7 +248,7 @@ export class AnthropicStreamParser {
 
     if (type === "message_start") {
       const u = json.message?.usage ?? {};
-      this.usage.prompt_tokens = Number(u.input_tokens ?? 0);
+      this.usage.prompt_tokens = promptTokens(u);
       this.usage.cached_tokens = Number(u.cache_read_input_tokens ?? 0) || undefined;
     } else if (type === "content_block_start") {
       const b = json.content_block ?? {};
@@ -237,6 +297,21 @@ export class AnthropicStreamParser {
   }
 }
 
+/**
+ * Everything the prompt cost. Anthropic reports the cache beside the input
+ * rather than inside it, so the bare `input_tokens` is only the part that was
+ * neither read from the cache nor written to it — and a status line built on
+ * it would say a turn sent a tenth of what it did, and that more of it was
+ * cached than was sent.
+ */
+function promptTokens(u: any): number {
+  return (
+    Number(u?.input_tokens ?? 0) +
+    Number(u?.cache_read_input_tokens ?? 0) +
+    Number(u?.cache_creation_input_tokens ?? 0)
+  );
+}
+
 /** Non-streaming reply → text + calls. */
 export function parseAnthropicResult(json: any): {
   content: string;
@@ -257,7 +332,7 @@ export function parseAnthropicResult(json: any): {
     }
   }
   const u = json?.usage ?? {};
-  const input = Number(u.input_tokens ?? 0);
+  const input = promptTokens(u);
   const output = Number(u.output_tokens ?? 0);
   return {
     content,

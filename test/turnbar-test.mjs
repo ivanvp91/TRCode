@@ -121,6 +121,9 @@ await key("\r"); // queue it
 }
 
 await key(ESC);
+// A lone Esc is held for a few milliseconds first: it may be the head of a
+// cursor-key sequence the terminal split across two reads.
+await new Promise((r) => setTimeout(r, 80));
 check("esc interrupts the turn", interrupted === 1, String(interrupted));
 
 for (const ch of "half typed") await key(ch);
@@ -162,6 +165,102 @@ line("   after the turn");
   second.resume(); // must not resurrect a stopped bar
   await sleep(20);
   check("a stopped bar stays down", !/╭─+╮/.test(strip(screen.text())), strip(screen.text()));
+}
+
+// ── the caret stays out of the way for the whole turn ───────────────────────
+// Every write erases and redraws the bar, which walks the cursor between the
+// transcript and the bar. Visible, that reads as the caret flying around the
+// screen while the model works.
+{
+  const { setFooter, Spinner, padded } = await import("../dist/ui/render.js");
+  const HIDE = ESC + "[?25l";
+  const SHOW = ESC + "[?25h";
+  let raw = "";
+  const realWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => {
+    raw += String(chunk);
+    return true;
+  };
+
+  const spinner = new Spinner("thinking");
+  setFooter(() => ["  bar"]);
+  spinner.start();
+  // What onText does on the first token of the answer: the spinner goes, the
+  // bar stays, and the answer streams in under it.
+  spinner.stop();
+  padded("first line of the answer");
+  padded("second line of the answer");
+  const duringTurn = raw;
+  setFooter(null);
+  const afterTurn = raw;
+  process.stdout.write = realWrite;
+
+  const steps = [...afterTurn.matchAll(new RegExp("\\" + ESC + "\\[\\?25[lh]", "g"))].map((m) =>
+    m[0] === HIDE ? "hide" : "show",
+  );
+  check("the caret is hidden while the bar is up", duringTurn.includes(HIDE), JSON.stringify(steps));
+  check("stopping the spinner does not reveal it", !duringTurn.includes(SHOW), JSON.stringify(steps));
+  check("removing the bar gives it back", afterTurn.endsWith(SHOW) || steps.at(-1) === "show", JSON.stringify(steps));
+}
+
+// ── a shrinking bar leaves nothing of the taller one behind ─────────────────
+// Drawing over the old rows is what removes the flicker, so the case the old
+// erase-everything-first code handled for free has to be checked: fewer rows
+// than last time must clear what is left below them.
+{
+  const { setFooter, refreshFooter } = await import("../dist/ui/render.js");
+  const shrink = new Screen(100);
+  const outerWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { shrink.write(String(chunk)); return true; };
+
+  let rows = ["  reasoning one", "  reasoning two", "  ⠋ thinking", "  ╰────╯"];
+  setFooter(() => rows);
+  rows = ["  ⠙ thinking", "  ╰────╯"];
+  refreshFooter();
+  const left = shrink.lines().map(strip).filter((l) => l.trim());
+
+  process.stdout.write = outerWrite;
+  check("the dropped rows are gone", !left.some((l) => /reasoning/.test(l)), JSON.stringify(left));
+  check("what remains is the shorter bar", left.length === 2 && /thinking/.test(left[0]), JSON.stringify(left));
+  setFooter(null);
+}
+
+// ── a frame reaches the terminal whole ──────────────────────────────────────
+// Flicker is a frame the terminal caught half-drawn: the bar erased, its
+// replacement not yet written. So each frame must be one write, must not blank
+// the bar on the way, and must not be drawn at all when nothing changed.
+{
+  const { setFooter, refreshFooter } = await import("../dist/ui/render.js");
+  const writes = [];
+  const outerWrite = process.stdout.write.bind(process.stdout);
+  process.stdout.write = (chunk) => { writes.push(String(chunk)); return true; };
+
+  let tickNo = 0;
+  setFooter(() => [`  ⠋ thinking ${tickNo}`, "  ╭────╮", "  ╰────╯"]);
+
+  writes.length = 0;
+  tickNo++;
+  refreshFooter();
+  const tick = writes.join("");
+  check("a spinner tick is a single write", writes.length === 1, JSON.stringify(writes));
+  check("the tick never blanks the bar first", !tick.includes(ESC + "[0J"), JSON.stringify(tick));
+  check(
+    "the tick is wrapped in synchronized output",
+    tick.startsWith(ESC + "[?2026h") && tick.endsWith(ESC + "[?2026l"),
+    JSON.stringify(tick),
+  );
+
+  writes.length = 0;
+  refreshFooter();
+  check("an unchanged frame is not redrawn at all", writes.length === 0, JSON.stringify(writes));
+
+  writes.length = 0;
+  tickNo++;
+  line("   ⏺ a line of transcript");
+  check("a transcript line and the redrawn bar go out together", writes.length === 1, JSON.stringify(writes));
+
+  setFooter(null);
+  process.stdout.write = outerWrite;
 }
 
 say(`\n${passed} passed, ${failed} failed`);

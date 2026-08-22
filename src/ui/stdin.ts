@@ -12,8 +12,21 @@ export type InputConsumer = (chunk: Buffer) => void;
 
 const stack: InputConsumer[] = [];
 let attached = false;
+let lastCtrlC = 0;
 
 function dispatch(chunk: Buffer): void {
+  // Safety net ahead of every widget: raw mode swallows SIGINT, so if the
+  // consumer chain ever wedges, no key would work at all. A double Ctrl+C
+  // within 1.5s always exits — the alternative is killing the terminal.
+  if (chunk.length === 1 && chunk[0] === 3) {
+    const now = Date.now();
+    if (now - lastCtrlC < 1500) {
+      releaseStdin();
+      process.stdout.write("\x1b[?25h\n");
+      process.exit(130);
+    }
+    lastCtrlC = now;
+  }
   const top = stack[stack.length - 1];
   if (top) top(chunk);
   // With no consumer the bytes are dropped on purpose: nothing is waiting for

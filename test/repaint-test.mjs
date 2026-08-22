@@ -124,6 +124,34 @@ send(CR);
 await p;
 ok("после отправки рамка убрана", screen.countTopBorders() === 0, `${screen.countTopBorders()}`);
 
+// Мерцание — это кадр, пойманный терминалом на полпути: рамка стёрта, новая ещё
+// не написана. Значит нажатие клавиши обязано быть одной записью, и стирать
+// рамку перед перерисовкой нельзя.
+{
+  const writes = [];
+  process.stdout.write = (chunk) => {
+    writes.push(String(chunk));
+    screen.write(String(chunk));
+    return true;
+  };
+
+  const typing = ed.read();
+  send("ф"); // первая отрисовка рамки
+  writes.length = 0;
+  send("ы"); // перерисовка поверх неё
+  const frame = writes.join("");
+  ok("нажатие клавиши — одна запись", writes.length === 1, `записей: ${writes.length}`);
+  ok("рамка не стирается перед перерисовкой", !frame.includes(ESC + "[0J"), JSON.stringify(frame));
+  ok(
+    "кадр обёрнут в synchronized output",
+    frame.startsWith(ESC + "[?2026h") && frame.endsWith(ESC + "[?2026l"),
+    JSON.stringify(frame),
+  );
+
+  send(CR);
+  await typing;
+}
+
 process.stdout.write = realWrite;
 
 let failed = 0;

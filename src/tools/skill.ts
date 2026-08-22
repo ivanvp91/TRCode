@@ -2,7 +2,7 @@
 import type { ToolDef } from "../types.js";
 import type { Skill } from "../skills/loader.js";
 
-export function makeSkillTool(skills: Skill[]): ToolDef | null {
+export function makeSkillTool(skills: Skill[], loaded?: Set<string>): ToolDef | null {
   if (!skills.length) return null;
   const names = skills.map((s) => s.name);
 
@@ -26,6 +26,15 @@ export function makeSkillTool(skills: Skill[]): ToolDef | null {
       if (!skill) {
         return { output: `Skill not found: ${want}. Available: ${names.join(", ")}`, isError: true };
       }
+      // Already in this conversation — sending the body twice buys nothing and
+      // is billed on every step from here on.
+      if (loaded?.has(skill.name)) {
+        return {
+          output: `Skill "${skill.name}" is already loaded earlier in this conversation — scroll up to it instead of loading it again.`,
+          display: `skill "${skill.name}" already loaded`,
+        };
+      }
+      loaded?.add(skill.name);
       const res = skill.resources.length
         ? `\n\n<skill-resources dir="${skill.dir}">\nFiles ship alongside this skill — read them with the read tool as needed:\n${skill.resources
             .map((r) => `- ${skill.dir}/${r}`)

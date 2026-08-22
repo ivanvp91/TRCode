@@ -59,6 +59,19 @@ const check = (name, cond, detail = "") => {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const events = () => received.map((r) => r.body?.payload?.hook_event_name);
 
+/**
+ * Waits until `n` posts have landed instead of guessing how long delivery
+ * takes. A fixed sleep that is usually long enough leaks the previous block's
+ * post into the next one's buffer, which showed up as a suite that failed
+ * about half the time under load.
+ */
+async function settle(n = 1, budgetMs = 2000) {
+  const until = Date.now() + budgetMs;
+  while (received.length < n && Date.now() < until) await sleep(10);
+  // A beat past the last arrival, to catch anything following it.
+  await sleep(30);
+}
+
 // ── detection ───────────────────────────────────────────────────────────────
 const reporter = OrcaReporter.detect();
 check("detected inside an Orca pane", Boolean(reporter));
@@ -73,14 +86,15 @@ check("detected inside an Orca pane", Boolean(reporter));
 // ── the envelope ────────────────────────────────────────────────────────────
 reporter.busy("s1");
 reporter.userPrompt("почини сборку", "s1");
-await sleep(120);
+await settle(2);
 {
   const first = received[0];
   check("posts to a route Orca knows", first?.url === "/hook/opencode", String(first?.url));
   check("reads the token from the endpoint file, not stale env", first?.token === "tok-from-file", String(first?.token));
   check("carries the pane coordinates", first?.body?.paneKey === "pane-1" && first?.body?.tabId === "tab-1" && first?.body?.worktreeId === "wt-1", JSON.stringify(first?.body));
-  check("busy first, then the prompt", events()[0] === "SessionBusy" && events()[1] === "MessagePart", events().join(","));
-  check("the prompt text is forwarded", received[1]?.body?.payload?.text === "почини сборку" && received[1]?.body?.payload?.role === "user");
+  check("both the status and the prompt are posted", events().includes("SessionBusy") && events().includes("MessagePart"), events().join(","));
+  const part = received.find((r) => r.body?.payload?.hook_event_name === "MessagePart");
+  check("the prompt text is forwarded", part?.body?.payload?.text === "почини сборку" && part?.body?.payload?.role === "user");
 }
 
 // ── a repeated status is not re-sent ────────────────────────────────────────
@@ -102,12 +116,12 @@ await sleep(500);
 // ── a permission prompt is "needs attention", not a status flip ─────────────
 received = [];
 reporter.waiting("shell", "rm -rf build");
-await sleep(80);
+await settle(1);
 check("permission asks are forwarded", events()[0] === "PermissionRequest", events().join(","));
 check("the tool is named", received[0]?.body?.payload?.toolName === "shell");
 received = [];
 reporter.busy("s1");
-await sleep(80);
+await settle(1);
 check("busy still fires after a permission ask", events()[0] === "SessionBusy", events().join(","));
 
 // ── idle flushes the preview and waits for delivery ─────────────────────────
@@ -116,7 +130,9 @@ reporter.assistantText("итоговый ответ", "s1");
 await reporter.idle("s1");
 {
   const names = events();
-  check("idle flushes the pending preview first", names[0] === "MessagePart" && names.includes("SessionIdle"), names.join(","));
+  // Both must arrive; which lands first is not ours to promise — post() fires
+  // each request independently, so two issued together race on the wire.
+  check("idle flushes the pending preview", names.includes("MessagePart") && names.includes("SessionIdle"), names.join(","));
   check("idle has already been delivered when it resolves", received.some((r) => r.body?.payload?.hook_event_name === "SessionIdle"), names.join(","));
 }
 

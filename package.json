@@ -1,7 +1,7 @@
 {
   "name": "trcode",
   "version": "0.1.0",
-  "description": "Agentic coding CLI for TokenRouter models — an open alternative to Claude Code",
+  "description": "TRCode — cross-platform agentic coding CLI: one client over TokenRouter, Kimi, Anthropic, OpenRouter, OpenCode Zen, OpenCode Go and Alibaba Cloud",
   "type": "module",
   "bin": {
     "trc": "dist/index.js",

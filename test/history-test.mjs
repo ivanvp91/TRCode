@@ -79,6 +79,31 @@ send(DOWN);
 send(CR);
 ok("черновик возвращается по ↓", (await p2) === "черновик", "черновик потерян");
 
+// The arrows belong to the draft first: inside it they walk the rows the
+// frame shows, and only the top row hands them over to the history. A long
+// line the frame wrapped is several rows, though the buffer holds no newline.
+async function draft(keys) {
+  history.splice(0, history.length, ...BASE);
+  const p = ed.read();
+  send(...keys);
+  return p;
+}
+
+// 90 columns leaves 73 inside the frame, so this is two rows: 73 + 27.
+const LONG = "а".repeat(100);
+const upInWrap = await draft([LONG, UP, "X", CR]);
+ok("↑ идёт по перенесённой строке, а не в историю", upInWrap.indexOf("X") === 27, upInWrap.slice(0, 40));
+
+const backDown = await draft([LONG, UP, DOWN, "X", CR]);
+ok("↓ возвращает на нижний ряд", backDown.indexOf("X") === 100, backDown.slice(0, 40));
+
+const offTheTop = await draft([LONG, UP, UP, CR]);
+ok("↑ с верхнего ряда всё же зовёт историю", offTheTop === "третий запрос", offTheTop);
+
+// A hard newline, entered with a trailing backslash, walks the same way.
+const twoLines = await draft(["аб\\", CR, "вг", UP, "X", CR]);
+ok("↑ ходит по строкам многострочного черновика", twoLines === "абX\nвг", JSON.stringify(twoLines));
+
 // Persistence across restarts.
 const { loadInputHistory, saveInputHistory } = await import("../dist/session/history.js");
 const os = await import("node:os");

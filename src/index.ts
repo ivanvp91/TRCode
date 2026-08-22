@@ -14,10 +14,23 @@ import {
   EFFORT_LEVELS,
   type Effort,
 } from "./config.js";
-import { fetchModels, resolveModelId } from "./provider/models.js";
-import { verifyKey } from "./provider/client.js";
+import { fetchModels, groupByModality, groupByVendor, resolveModelId } from "./provider/models.js";
+import { fmtTokens } from "./usage.js";
+import { verifyKey, verifyProvider } from "./provider/client.js";
 import { askSecret } from "./ui/secret.js";
+import { loginProvider } from "./ui/login.js";
 import { Session } from "./session/session.js";
+import {
+  DEFAULT_PROVIDER,
+  defaultProviderId,
+  hasProvider,
+  modeFor,
+  providerById,
+  providerLabel,
+  providers,
+  splitModelId,
+} from "./provider/registry.js";
+import { clearCredentials, importVendorCredentials, readCredentials } from "./provider/credentials.js";
 
 interface Args {
   prompt?: string;
@@ -108,7 +121,7 @@ function parseArgs(argv: string[]): Args {
 
 function printHelp(): void {
   line();
-  line(c.bold("  trcode") + c.gray(` v${VERSION} — agentic CLI for TokenRouter models`));
+  line(c.bold("  TRCode") + c.gray(` v${VERSION} — cross-platform agentic coding CLI`));
   line();
   line(c.bold("  Usage"));
   line("    trc                          interactive mode");
@@ -127,9 +140,11 @@ function printHelp(): void {
   line("    -v, --version                version");
   line();
   line(c.bold("  Commands"));
-  line("    trc auth login               save the API key");
+  line("    trc auth login               connect the provider in use");
+  line("    trc auth login --provider kimi   connect a specific one");
   line("    trc auth login --base-url U  key for a different endpoint");
-  line("    trc auth status              verify the key");
+  line("    trc auth status              check every connected provider");
+  line("    trc auth logout [--provider P]   disconnect");
   line("    trc models                   list models");
   line("    trc sessions                 sessions for this project");
   line("    trc config                   config path and contents");
@@ -139,23 +154,83 @@ function printHelp(): void {
   line();
 }
 
+function flagValue(rest: string[], name: string): string | undefined {
+  const i = rest.indexOf(name);
+  return i !== -1 ? rest[i + 1] : undefined;
+}
+
+function isUrl(s: string): boolean {
+  return /^https?:\/\//i.test(s);
+}
+
+async function cmdAuthStatus(): Promise<number> {
+  const cfg = loadConfig();
+  line();
+  let anyOk = false;
+  // The column is as wide as the longest label, so adding a provider with a
+  // longer name does not push its own row out of the grid.
+  const width = Math.max(12, ...providers().map((p) => p.label.length));
+  for (const def of providers()) {
+    const mode = modeFor(def.id);
+    if (!mode) {
+      const inherited = def.importFrom ? importVendorCredentials(def.importFrom) : null;
+      line(
+        `  ${c.bold(def.label.padEnd(width))} ${c.gray("not connected")}` +
+          (inherited ? c.gray(`  (a ${def.label} CLI login is available — run: trc auth login --provider ${def.id})`) : ""),
+      );
+      continue;
+    }
+    const res = def.id === DEFAULT_PROVIDER ? await verifyKey(cfg.baseUrl, cfg.apiKey!) : await verifyProvider(def.id);
+    if (res.ok) anyOk = true;
+    const tone = res.ok ? c.green("ok") : c.red("failed");
+    line(`  ${c.bold(def.label.padEnd(width))} ${tone}  ${c.gray(`${mode} · ${res.detail}`)}`);
+    line(c.gray(`  ${" ".repeat(width)} ${describeCredential(def.id)}`));
+  }
+  line();
+  return anyOk ? 0 : 1;
+}
+
+function describeCredential(providerId: string): string {
+  if (providerId === DEFAULT_PROVIDER) {
+    const cfg = loadConfig();
+    return `${cfg.baseUrl} · ${cfg.apiKey ? maskKey(cfg.apiKey) : "no key"}`;
+  }
+  const creds = readCredentials(providerId);
+  if (!creds) return "no credential";
+  const expiry = creds.expiresAt
+    ? `expires ${new Date(creds.expiresAt).toLocaleString()}${creds.refreshToken ? ", auto-renewed" : ""}`
+    : "does not expire";
+  return `${maskKey(creds.accessToken)} · ${expiry}${creds.source ? ` · from ${creds.source}` : ""}`;
+}
+
 async function cmdAuth(rest: string[]): Promise<number> {
   const sub = rest[0] ?? "status";
   const cfg = loadConfig();
-
-  if (sub === "status") {
-    if (!cfg.apiKey) {
-      warn("No key configured. Run: trc auth login");
-      return 1;
-    }
-    const res = await verifyKey(cfg.baseUrl, cfg.apiKey);
-    if (res.ok) {
-      success(`Key is valid — ${res.detail}`);
-      line(c.gray(`  ${cfg.baseUrl} · ${cfg.apiKey.slice(0, 6)}…${cfg.apiKey.slice(-4)}`));
-      return 0;
-    }
-    error(res.detail);
+  // Unnamed means whichever provider is in use, the same as /login in a
+  // session. `--provider tokenrouter` still reaches the router explicitly.
+  const providerId = flagValue(rest, "--provider") ?? defaultProviderId();
+  const def = providerById(providerId);
+  if (!def) {
+    error(`Unknown provider: ${providerId}. Available: ${providers().map((p) => p.id).join(", ")}`);
     return 1;
+  }
+
+  if (sub === "status") return cmdAuthStatus();
+
+  if (sub === "login" && def.id !== DEFAULT_PROVIDER) {
+    const positional = rest.slice(1).filter((a) => !a.startsWith("--") && a !== def.id);
+    const flagUrl = flagValue(rest, "--base-url");
+    const res = await loginProvider(def, {
+      mode: rest.includes("--key") ? "apikey" : rest.includes("--oauth") ? "oauth" : undefined,
+      fresh: rest.includes("--fresh"),
+      // A URL among the positionals is the host, not the key: the two are never
+      // confusable, and typing the flag for a one-word answer is a chore.
+      key: positional.find((a) => !isUrl(a)),
+      baseUrl: flagUrl ?? positional.find(isUrl),
+    });
+    // Connecting is what this command promises; an inactive plan is reported
+    // but is not a failure of the login.
+    return res.connected ? 0 : 1;
   }
 
   if (sub === "login") {
@@ -229,8 +304,16 @@ async function cmdAuth(rest: string[]): Promise<number> {
   }
 
   if (sub === "logout") {
-    saveConfig({ apiKey: undefined });
-    success("Key removed from the config.");
+    if (def.id === DEFAULT_PROVIDER) {
+      saveConfig({ apiKey: undefined });
+      success("Key removed from the config.");
+      return 0;
+    }
+    if (!clearCredentials(def.id)) {
+      warn(`${def.label} was not connected.`);
+      return 0;
+    }
+    success(`${def.label} disconnected.`);
     return 0;
   }
 
@@ -241,14 +324,34 @@ async function cmdAuth(rest: string[]): Promise<number> {
 async function cmdModels(): Promise<number> {
   const cfg = loadConfig();
   const catalog = await fetchModels({ force: true });
-  line();
-  for (const m of catalog) {
-    const cur = m.id === cfg.model ? c.brightCyan("❯ ") : "  ";
-    const price = m.pricing ? c.gray(`$${m.pricing.input}/$${m.pricing.output} per 1M`) : "";
-    line(`  ${cur}${m.id.padEnd(24)} ${c.dim((m.owner ?? "").padEnd(10))} ${price}`);
+  // Names without the routing prefix; which host serves one is its own column.
+  const bare = (id: string) => splitModelId(id).model;
+  const hosts = new Set(catalog.map((m) => splitModelId(m.id).providerId));
+  const width = Math.min(38, Math.max(12, ...catalog.map((m) => bare(m.id).length + 1)));
+  // Grouped the way the catalog tags them — [Text], [Images], [Video],
+  // [Audio] — and by vendor inside each, so a flat 125-line dump becomes a
+  // list you can find something in.
+  for (const type of groupByModality(catalog)) {
+    line();
+    line(`  ${c.bold(c.brightYellow(`[${type.label}]`))} ${c.gray(String(type.models.length))}`);
+    for (const group of groupByVendor(type.models)) {
+      line();
+      line(`  ${c.bold(c.brightBlue(group.vendor))}`);
+      for (const m of group.models) {
+        const cur = m.id === cfg.model ? c.brightCyan("❯ ") : "  ";
+        const ctxWin = m.contextWindow ? `ctx ${fmtTokens(m.contextWindow)}` : "";
+        const host = hosts.size > 1 ? providerLabel(splitModelId(m.id).providerId) : "";
+        const price = m.pricing ? `$${m.pricing.input}/$${m.pricing.output} per 1M` : "";
+        line(`  ${cur}${bare(m.id).padEnd(width)} ${c.gray(ctxWin.padEnd(11))} ${c.dim(host.padEnd(14))} ${c.dim(price)}`);
+      }
+    }
   }
   line();
-  info(`Models: ${catalog.length} · current default: ${cfg.model}`);
+  info(
+    `Models: ${catalog.length} · ${groupByModality(catalog)
+      .map((g) => `${g.label}: ${g.models.length}`)
+      .join(" · ")} · current default: ${cfg.model}`,
+  );
   return 0;
 }
 
@@ -282,8 +385,8 @@ async function headless(args: Args): Promise<number> {
   await app.init();
   if (args.effort) app.effortOverride = args.effort;
 
-  if (!app.cfg.apiKey) {
-    error("No API key. Run: trc auth login");
+  if (!hasProvider()) {
+    error("No provider connected. Run: trc auth login");
     return 1;
   }
 
@@ -373,7 +476,7 @@ async function main(): Promise<void> {
     return;
   }
   if (args.command === "version") {
-    line(`trcode ${VERSION}`);
+    line(`TRCode ${VERSION}`);
     return;
   }
   if (args.command === "auth") return finish(await cmdAuth(args.rest));

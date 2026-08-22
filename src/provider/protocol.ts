@@ -13,7 +13,16 @@ export type Protocol = "openai" | "responses" | "anthropic" | "unsupported";
 const byModel = new Map<string, Protocol>();
 
 export function protocolOf(m: ModelInfo): Protocol {
-  const e = m.endpoints ?? [];
+  return protocolOfEndpoints(m.endpoints ?? []);
+}
+
+/**
+ * The dialect a set of endpoint types implies. Split out of `protocolOf`
+ * because a provider that knows its own models states them as endpoint types
+ * as well — the same vocabulary the catalogs use — and reads the answer back
+ * through here rather than repeating the mapping.
+ */
+export function protocolOfEndpoints(e: string[]): Protocol {
   if (!e.length) return "openai"; // no metadata — assume the common case
   if (e.includes("openai")) return "openai";
   if (e.includes("openai-response")) return "responses";

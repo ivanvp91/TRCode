@@ -1,6 +1,8 @@
 ---
 name: code-review
 description: Review uncommitted changes or a specific diff — when asked to "check my code", "review this", "what is wrong with these changes". Not for writing new code.
+description_ru: Проверить незакоммиченные изменения или конкретный дифф — когда просят «посмотри мой код», «отревьюй это», «что не так с этими правками». Не для написания нового кода.
+triggers: ревью, review, code review, проверь код, посмотри код, что не так с кодом, диф, diff, pull request, пулреквест, замечания
 ---
 
 # Reviewing changes

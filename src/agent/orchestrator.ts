@@ -10,9 +10,9 @@
  * time and still go through the normal permission prompts.
  */
 import { c } from "../ui/ansi.js";
-import { MarkdownStream, Spinner, assistantPrefix, error, info, line, padded, rule, truncate, warn } from "../ui/render.js";
+import { MarkdownStream, Spinner, assistantPrefix, error, hint, info, line, padded, rule, truncate, warn } from "../ui/render.js";
 import { buildSystemPrompt } from "./prompt.js";
-import { runAgent } from "./loop.js";
+import { runAgent, stepCeiling } from "./loop.js";
 import { complete } from "../provider/client.js";
 import { effortFor } from "../provider/models.js";
 import { UsageTracker, fmtTokens } from "../usage.js";
@@ -173,7 +173,7 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
     sp.stop();
     app.usage.absorb(planUsage);
     error(`Could not build a plan: ${(err as Error).message}`);
-    padded(c.gray("Try a more concrete task, or just run it as a normal request."));
+    hint("Try a more concrete task, or just run it as a normal request.");
     return;
   }
 
@@ -211,16 +211,16 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
       try {
         const res = await runAgent({
           model,
-          systemPrompt: buildSystemPrompt({ cwd: app.cwd, model, skills: app.skills, subagent: true }),
+          systemPrompt: buildSystemPrompt({ cwd: app.cwd, model, skills: app.activeSkills, subagent: true }),
           messages: [{ role: "user", content: prompt }],
           tools: step.writes ? allTools : readTools,
           toolContext: { ...ctx, depth: 1 },
           catalog: app.catalog,
           usage,
-          maxSteps: Math.min(cfg.maxSteps, 30),
+          maxSteps: stepCeiling(cfg.maxSteps, 30),
           signal: ctx.signal,
           effort: effortFor(model, app.effortOverride),
-          toolConcurrency: 3,
+          toolConcurrency: Math.min(3, loadConfig().toolConcurrency),
           events: {
             onToolStart: (tool, args) => {
               padded(`${tag} ${c.cyan(tool.name)} ${c.gray(truncate(tool.summarize?.(args) ?? "", 60))}`);
@@ -332,6 +332,6 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
       c.gray(fmtTokens(totals.input + totals.output) + " tokens this session"),
     ].join(c.gray(" · ")),
   );
-  padded(c.gray("The result is in the history — carry on with normal requests."));
+  hint("The result is in the history — carry on with normal requests.");
   line();
 }

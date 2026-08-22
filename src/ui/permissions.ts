@@ -3,8 +3,10 @@
  * parallel subagents never fight over stdin.
  */
 import readline from "node:readline";
+import { t } from "../i18n.js";
 import { c } from "./ansi.js";
-import { line, rule, truncate } from "./render.js";
+import { clip, line, padded, rule, truncate } from "./render.js";
+import { contentWidth } from "./layout.js";
 import { choose } from "./choice.js";
 import { loadConfig, type PermissionMode } from "../config.js";
 import type { ToolDef } from "../types.js";
@@ -27,6 +29,10 @@ export class PermissionBroker {
   onWaiting: ((tool: string, detail: string) => void) | null = null;
   /** Told when it has been answered, so the pane goes back to working. */
   onAnswered: (() => void) | null = null;
+  /** Esc at the prompt: the user is stopping the turn, not denying one tool. */
+  onCancel: (() => void) | null = null;
+  /** Preview bodies already on screen, waiting to be claimed by their result. */
+  private shown = new Set<string>();
 
   constructor(
     opts: {
@@ -50,6 +56,24 @@ export class PermissionBroker {
 
   reset(): void {
     this.sessionAllow.clear();
+    this.shown.clear();
+  }
+
+  /** Records a preview body as being on screen, for previewShown() to claim. */
+  noteShown(preview: string): void {
+    this.shown.add(preview);
+  }
+
+  /**
+   * True when this exact body was printed by the prompt the caller just
+   * answered — the tool result then prints its summary alone instead of the
+   * same diff again. One claim per prompt: an auto-approved call never
+   * matches, so its diff still shows.
+   */
+  previewShown(preview: string): boolean {
+    if (!preview || !this.shown.has(preview)) return false;
+    this.shown.delete(preview);
+    return true;
   }
 
   private mode(tool: ToolDef): PermissionMode {
@@ -74,37 +98,43 @@ export class PermissionBroker {
   private async prompt(tool: ToolDef, args: Record<string, any>, preview?: string): Promise<boolean> {
     const title =
       tool.risk === "shell"
-        ? "Run this command?"
+        ? t("Run this command?", "Выполнить эту команду?")
         : tool.name === "write"
-          ? "Write this file?"
+          ? t("Write this file?", "Записать этот файл?")
           : tool.name === "edit"
-            ? "Apply this edit?"
-            : `Allow ${tool.name}?`;
+            ? t("Apply this edit?", "Применить эту правку?")
+            : t(`Allow ${tool.name}?`, `Разрешить ${tool.name}?`);
 
     line();
-    rule(c.brightYellow(" permission required "));
-    line(`  ${c.bold(title)}  ${c.gray(tool.name)}`);
+    rule(c.brightYellow(t(" permission required ", " нужно подтверждение ")));
+    padded(`${c.bold(title)}  ${c.gray(tool.name)}`);
     const target = args.path ?? args.command ?? tool.summarize?.(args) ?? "";
     // A prompt nobody sees is a turn that never finishes: tell the host that
     // this pane is blocked on a human.
     this.onWaiting?.(tool.name, String(target || title));
-    if (target) line(`  ${c.dim(truncate(String(target), 100))}`);
+    if (target) padded(c.dim(truncate(String(target), 100)));
     if (preview) {
       line();
+      this.noteShown(preview);
       const lines = preview.split("\n");
-      for (const l of lines.slice(0, 30)) line("  " + l);
-      if (lines.length > 30) line(c.gray(`  … ${lines.length - 30} more lines`));
+      // A diff arrives already laid out and clipped; anything else is raw text
+      // that would otherwise wrap in column 1, outside the margins.
+      const styled = preview.includes(ESC);
+      for (const l of lines.slice(0, 30)) {
+        line("  " + (styled ? l : c.dim(clip(l, contentWidth() - 2))));
+      }
+      if (lines.length > 30) line(c.gray(t(`  … ${lines.length - 30} more lines`, `  … ещё строк: ${lines.length - 30}`)));
     }
     line();
 
     const answer = await this.exclusive(() =>
       choose<"once" | "always" | "reject">(
         [
-          { value: "once", label: "Allow", key: "y", tone: "ok" },
-          { value: "always", label: `Always allow ${tool.name} this session`, key: "a", tone: "warn" },
-          { value: "reject", label: "Reject", key: "n", tone: "danger" },
+          { value: "once", label: t("Allow", "Разрешить"), key: "y", tone: "ok" },
+          { value: "always", label: t(`Always allow ${tool.name} this session`, `Всегда разрешать ${tool.name} в этой сессии`), key: "a", tone: "warn" },
+          { value: "reject", label: t("Reject", "Отклонить"), key: "n", tone: "danger" },
         ],
-        { initial: "once", fallback: "reject" },
+        { initial: "once", fallback: "reject", cancel: () => this.onCancel?.() },
       ),
     );
     line();

@@ -9,7 +9,7 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { configDir } from "../config.js";
+import { configDir, loadConfig } from "../config.js";
 
 export interface Skill {
   name: string;
@@ -19,6 +19,14 @@ export interface Skill {
   scope: "user" | "project";
   /** Extra files bundled next to SKILL.md, surfaced to the model as paths. */
   resources: string[];
+  /**
+   * Words and phrases that make the skill fire without the model choosing it.
+   * The description is written for the model and is in English; a request is
+   * not, so auto-selection needs the words the user actually types.
+   */
+  triggers: string[];
+  /** `auto: off` in the frontmatter leaves this skill to the model alone. */
+  auto: boolean;
 }
 
 /** Minimal frontmatter parser — enough for `key: value` and folded strings. */
@@ -69,7 +77,10 @@ function loadFrom(root: string, scope: Skill["scope"]): Skill[] {
     }
     const { data, body } = parseFrontmatter(raw);
     const name = (data.name || e.name).trim();
-    const description = (data.description || "").trim();
+    // `description_ru` and friends are optional: a skill that has none still
+    // works, it just describes itself in English wherever it appears.
+    const lang = loadConfig().lang;
+    const description = (data[`description_${lang}`] || data.description || "").trim();
     if (!description) continue; // description is what makes a skill discoverable
     let resources: string[] = [];
     try {
@@ -81,7 +92,13 @@ function loadFrom(root: string, scope: Skill["scope"]): Skill[] {
     } catch {
       /* optional */
     }
-    skills.push({ name, description, body: body.trim(), dir, scope, resources });
+    const triggers = (data.triggers || "")
+      .split(",")
+      .map((t) => t.trim().toLowerCase())
+      .filter(Boolean);
+    const auto = !/^(off|false|no|manual)$/i.test((data.auto || "").trim());
+
+    skills.push({ name, description, body: body.trim(), dir, scope, resources, triggers, auto });
   }
   return skills;
 }
@@ -89,6 +106,7 @@ function loadFrom(root: string, scope: Skill["scope"]): Skill[] {
 const TEMPLATE = (name: string, description: string) => `---
 name: ${name}
 description: ${description}
+triggers:
 ---
 
 # ${name}
@@ -99,6 +117,11 @@ matches the description above. Write the procedure, not the theory.
 
 The description line decides everything: the model picks the skill from it.
 Write WHEN to apply it ("when asked to review changes"), not what it is.
+
+"triggers" is a comma-separated list of words the user would actually type, in
+every language you work in. A request that hits one loads this skill by itself,
+with no tool call. Leave it empty to let the model do the choosing, and add
+"auto: off" to keep this skill out of auto-selection entirely.
 -->
 
 ## When to apply

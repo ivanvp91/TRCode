@@ -69,6 +69,27 @@ send(CR);
 await p;
 ok("рамка растёт под несколько строк", rows >= 3, `строк ввода в рамке: ${rows}`);
 
+// ── the arrows inside a multi-line draft ──────────────────────────────────
+const UP = ESC + "[A";
+const DOWN = ESC + "[B";
+
+// Up from the second line lands on the first, at the same column — it does
+// not recall history, which would throw the draft away.
+await run("↑ ходит по строкам черновика", ["раз", LF, "два", UP, "!", CR], "раз!\nдва");
+await run("↓ возвращается на строку ниже", ["раз", LF, "два", UP, DOWN, "!", CR], "раз\nдва!");
+// A shorter line above: the column clamps to its end rather than overshooting.
+await run("↑ прижимает колонку к концу строки", ["ab", LF, "cdef", UP, "!", CR], "ab!\ncdef");
+// Nothing above the first line — from there the arrow is the shell's again.
+{
+  const withHistory = new InputEditor({
+    status: () => ({ left: "L", hint: "H", context: "C" }),
+    history: ["былое"],
+  });
+  const p2 = withHistory.read();
+  send(UP, CR);
+  ok("с первой строки ↑ уходит в историю", (await p2) === "былое");
+}
+
 // A sequence pinned via /keys must work too.
 const { setExtraNewlineKeys } = await import("../dist/ui/editor.js");
 setExtraNewlineKeys([ESC + "[99~"]);
