@@ -68,7 +68,13 @@ export function toResponsesInput(messages: Message[]): { instructions: string; i
 
     input.push({
       role: "user",
-      content: [{ type: "input_text", text: String(m.content ?? "") }],
+      content: [
+        { type: "input_text", text: String(m.content ?? "") },
+        ...(m.images ?? []).map((img) => ({
+          type: "input_image" as const,
+          image_url: `data:${img.mime};base64,${img.data}`,
+        })),
+      ],
     });
   }
 
@@ -156,7 +162,7 @@ export class ResponsesStreamParser {
     return {
       toolCalls,
       usage: this.usage,
-      finishReason: toolCalls.length ? "tool_calls" : this.finish || "stop",
+      finishReason: this.finish === "length" ? "length" : toolCalls.length ? "tool_calls" : this.finish || "stop",
     };
   }
 }

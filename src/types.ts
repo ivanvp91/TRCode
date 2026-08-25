@@ -9,12 +9,21 @@ export interface ToolCall {
   function: { name: string; arguments: string };
 }
 
+/** An image attached to a message: what a vision model reads on the wire. */
+export interface ImageAttachment {
+  /** Image bytes, base64. Kept encoded so no step ever re-reads the file. */
+  data: string;
+  mime: string;
+}
+
 export interface Message {
   role: Role;
   content: string | null;
   name?: string;
   tool_calls?: ToolCall[];
   tool_call_id?: string;
+  /** Screenshots and other images the model should see with this message. */
+  images?: ImageAttachment[];
   /**
    * Local bookkeeping. `hidden` is stripped before hitting the wire; `skill`
    * marks an auto-loaded procedure, which the model must see but which would
@@ -116,6 +125,11 @@ export interface ToolResult {
   display?: string;
   /** "diff" means `display` is already laid out and must be printed verbatim. */
   displayKind?: "text" | "diff";
+  /**
+   * Images for a vision model, sent as part of this tool result. The text
+   * output still describes what happened; these ride along as what it saw.
+   */
+  images?: ImageAttachment[];
 }
 
 export interface ToolContext {

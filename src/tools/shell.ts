@@ -102,7 +102,7 @@ function launcher(): { cmd: string; args: (script: string) => string[] } {
  * end it either. On Windows the tree goes through taskkill; elsewhere the
  * child leads its own process group and the group gets the signal.
  */
-function killTree(child: { pid?: number; kill: (s?: NodeJS.Signals) => boolean }): void {
+export function killTree(child: { pid?: number; kill: (s?: NodeJS.Signals) => boolean }): void {
   if (!child.pid) return void child.kill("SIGKILL");
   if (process.platform === "win32") {
     try {

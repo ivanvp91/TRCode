@@ -5,7 +5,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 
-export const VERSION = "0.1.1";
+export const VERSION = "0.1.2";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";
@@ -233,6 +233,22 @@ export interface Config {
    * while there are none, and most projects accumulate a few. Off with /memory.
    */
   memoryEnabled: boolean;
+  /**
+   * Tool preset for the session. "standard" is everything; "minimal" keeps
+   * only shell and edit, with a short system prompt to match — for quick fixes
+   * on cheap models and for measuring what the rest of the kit costs.
+   */
+  preset: "standard" | "minimal";
+  /**
+   * The run_code tool: a model-written program whose SDK calls (fs, shell, web)
+   * run in a child process while only its return value enters the history.
+   * Off by default — it earns its keep on models that write such programs
+   * reliably; true forces it on for every model, "auto" keeps it off unless a
+   * future release marks specific models as proven. A subagent inherits it.
+   */
+  codeMode: boolean | "auto";
+  /** Ceiling for one run_code program, in ms of wall clock. */
+  codeModeTimeoutMs: number;
 }
 
 const DEFAULTS: Config = {
@@ -330,6 +346,12 @@ const DEFAULTS: Config = {
   // on every request, and a project that never uses a skill pays them anyway.
   skillsEnabled: false,
   memoryEnabled: true,
+  preset: "standard",
+  // Off until a model proves it can write such programs; flip to true in the
+  // config when yours does. The token saving is real only if the program works
+  // on the first try — a broken one costs a step plus the error, every time.
+  codeMode: false,
+  codeModeTimeoutMs: 60_000,
   mcpServers: {},
 };
 

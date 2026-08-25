@@ -4,10 +4,10 @@ import path from "node:path";
 import { spawn } from "node:child_process";
 import { c } from "./ansi.js";
 import { contentWidth, fmtAgo } from "./layout.js";
-import { error, hint, info, line, padded, plural, renderMarkdownBlock, rule, Spinner, success, truncate, warn, wrapText } from "./render.js";
-import { pick, type PickerItem } from "./picker.js";
-import { choose } from "./choice.js";
-import { pickModel, pickModels, pickModelsAcrossProviders } from "./modelpicker.js";
+import { error, expandedBlock, hint, info, line, padded, plural, renderMarkdownBlock, rule, Spinner, success, truncate, warn, wrapText } from "./render.js";
+import { openModal, pick, pickMulti, type ModalAction, type ModalResult, type PickerItem } from "./picker.js";
+import { choose, type Choice } from "./choice.js";
+import { openModelModal, openModelsModal, pickModelsAcrossProviders } from "./modelpicker.js";
 import { askSecret } from "./secret.js";
 import { askLine } from "./prompt.js";
 import { scanKeys } from "./keyscan.js";
@@ -28,10 +28,7 @@ import {
   fetchModels,
   resolveModelId,
   findModel,
-  usableModels,
   incompatibleReason,
-  groupByVendor,
-  groupByModality,
   servesModality,
   contextWindowFor,
   effortFor,
@@ -57,10 +54,12 @@ import { chooseHost, loginProvider } from "./login.js";
 import { AUTO, promptModelFor } from "../agent/promptwriter.js";
 import { Session, type SessionMeta } from "../session/session.js";
 import { compactSession, contextPressure } from "../session/compact.js";
+import { loadProjections } from "../session/projection.js";
 import { pushConsumer } from "./stdin.js";
 import { dropStore, forgetFrom, listCheckpoints, rewindFiles, type Checkpoint } from "../session/checkpoint.js";
 import { collapsedCount, collapsedText } from "./paste.js";
-import { fmtTokens, fmtCost, historyTokens, estimateTokens } from "../usage.js";
+import { dropSessionHistory } from "../session/history.js";
+import { fmtTokens, fmtCost, historyTokens, estimateTokens, dayKey } from "../usage.js";
 import type { ModelUsage } from "../usage.js";
 import { buildSystemPrompt } from "../agent/prompt.js";
 import { runSwarm } from "../agent/swarm.js";
@@ -70,6 +69,8 @@ import { memoryPath, memoryCount } from "../tools/memory.js";
 import { resetPromptSnapshots } from "../agent/prompt.js";
 import { connectMcpServers, mcpClients, stopMcpServers } from "../mcp/client.js";
 import { t, count } from "../i18n.js";
+import { listEntries, getEntry, deleteEntry, type UiEntry } from "../ui-library/store.js";
+import { matchLibrary } from "../ui-library/match.js";
 import type { App } from "./repl.js";
 
 type Group = "main" | "session" | "settings" | "other";
@@ -221,6 +222,981 @@ async function switchToProvider(app: App, def: ProviderDef): Promise<void> {
   warnIfIncompatible(app, id);
   const n = providerModels(app, def.id).length;
   if (n > 1) hint(t(`${n} models here — pick another with /model`, `${count(n, ["model", "models"], ["модель", "модели", "моделей"])} здесь — другую выбрать через /model`));
+}
+
+/**
+ * Re-reads the catalogue from the provider, cache and all bypassed. This is
+ * what `/models` used to be good for; the list itself is now the panel, so the
+ * only part worth keeping is the refresh, and it lives on a button.
+ */
+async function refreshCatalog(app: App, opts: { quiet?: boolean } = {}): Promise<void> {
+  const before = app.catalog.length;
+  const sp = new Spinner(t("refreshing the model catalog", "обновляю каталог моделей"));
+  sp.start();
+  try {
+    app.catalog = await fetchModels({ force: true });
+  } finally {
+    sp.stop();
+  }
+  app.rebuildTools();
+  if (opts.quiet) return;
+  const delta = app.catalog.length - before;
+  const change = delta ? ` (${delta > 0 ? "+" : ""}${delta})` : "";
+  success(
+    t(
+      `Catalog refreshed: ${app.catalog.length} models${change}.`,
+      `Каталог обновлён: ${count(app.catalog.length, ["model", "models"], ["модель", "модели", "моделей"])}${change}.`,
+    ),
+  );
+}
+
+/** Pins the default provider — what a new session opens on. */
+function setDefaultProvider(app: App, def: ProviderDef): void {
+  if (!modeFor(def.id)) {
+    return error(t(`${def.label} is not connected — /provider ${def.id} connects it.`, `${def.label} не подключён — подключит /provider ${def.id}.`));
+  }
+  // The remembered model is what a new session will open on, so pin the
+  // current one when defaulting to the provider we are already using.
+  if (def.id === currentProviderId(app)) rememberCurrent(app);
+  saveConfig({ defaultProvider: def.id });
+  app.cfg = loadConfig();
+  success(t(`Default provider: ${c.brightYellow(def.label)}`, `Поставщик по умолчанию: ${c.brightYellow(def.label)}`));
+  hint(t(`New sessions start on ${providerState(def.id).model ?? defaultModelFor(app, def.id) ?? loadConfig().model}.`, `Новые сессии будут открываться на ${providerState(def.id).model ?? defaultModelFor(app, def.id) ?? loadConfig().model}.`));
+}
+
+/**
+ * Points a provider at another host. The credential is untouched: the host a
+ * key belongs to is not always the one a provider defaults to, and getting it
+ * wrong is reported as a rejected key rather than as a wrong address.
+ */
+async function setProviderHost(app: App, def: ProviderDef, given?: string): Promise<void> {
+  if (def.id === DEFAULT_PROVIDER) {
+    return error(t("TokenRouter's host lives in the config: baseUrl.", "Хост TokenRouter задаётся в конфиге: baseUrl."));
+  }
+  const url = given ?? (await chooseHost(def, (fn) => app.exclusiveInput(fn)));
+  if (url === null) return;
+  if (url) rememberBaseUrl(def.id, url);
+  app.cfg = loadConfig();
+  await refreshCatalog(app, { quiet: true });
+  const now = modeConfig(def.id, "apikey")?.baseUrl;
+  success(t(`${def.label} host: ${now}`, `Сервер ${def.label}: ${now}`));
+  if (modeFor(def.id)) hint(t(`The key stays as it is — /login ${def.id} replaces it.`, `Ключ остаётся прежним — заменить: /login ${def.id}.`));
+}
+
+/** Drops a provider's credential, and the session's model with it if need be. */
+async function logoutFromProvider(app: App, def: ProviderDef): Promise<void> {
+  if (def.id === DEFAULT_PROVIDER) return error(t("Remove the TokenRouter key with: trc auth logout", "Ключ TokenRouter удаляется так: trc auth logout"));
+  if (!clearCredentials(def.id)) return warn(t(`${def.label} was not connected.`, `${def.label} не был подключён.`));
+  await refreshCatalog(app, { quiet: true });
+  success(t(`${def.label} disconnected.`, `${def.label} отключён.`));
+  // The session was talking to it; leaving the model in place would only
+  // produce a 401 on the next turn.
+  if (currentProviderId(app) === def.id) {
+    app.session.model = loadConfig().model;
+    app.session.save();
+    app.rebuildTools();
+    info(t(`Model: ${app.session.model}`, `Модель: ${app.session.model}`));
+  }
+}
+
+/**
+ * The model panel. A button changes what the list is scoped to and the panel
+ * comes straight back, so widening to every provider or re-reading the
+ * catalogue never costs a re-typed command.
+ */
+async function modelModal(app: App, opts: { all?: boolean } = {}): Promise<void> {
+  let all = opts.all === true;
+  for (;;) {
+    const cfg = loadConfig();
+    const provider = currentProviderId(app);
+    const label = providerById(provider)?.label ?? provider;
+    const mine = providerModels(app, provider);
+    // Scoped to the provider in use: the other providers' models cannot be
+    // served by it, and listing them only invites a 404.
+    const scoped = all || !mine.length ? app.catalog : mine;
+
+    const res = await app.exclusiveInput(() =>
+      openModelModal({
+        catalog: scoped,
+        current: app.session.model,
+        defaultModel: cfg.model,
+        title: t("Model", "Модель"),
+        subtitle: t(
+          `${all ? "Every provider" : label} · ${scoped.length} models · ★ default · ● in use`,
+          `${all ? "Все поставщики" : label} · ${scoped.length} · ★ по умолчанию · ● текущая`,
+        ),
+        actions: [
+          { id: "refresh", label: t("Refresh", "Обновить"), hotkey: "r" },
+          all
+            ? { id: "scope", label: t(`Only ${label}`, `Только ${label}`), hotkey: "o" }
+            : { id: "scope", label: t("All providers", "Все поставщики"), hotkey: "a" },
+          { id: "default", label: t("Make default", "По умолчанию"), hotkey: "d" },
+          { id: "provider", label: t("Provider…", "Поставщик…"), hotkey: "p" },
+        ],
+      }),
+    );
+    if (!res) return;
+
+    if (res.kind === "action") {
+      if (res.id === "refresh") {
+        await refreshCatalog(app);
+        continue;
+      }
+      if (res.id === "scope") {
+        all = !all;
+        continue;
+      }
+      if (res.id === "provider") {
+        await providerModal(app);
+        continue;
+      }
+      if (res.id === "default") {
+        if (!res.value) continue;
+        saveConfig({ model: res.value });
+        app.cfg = loadConfig();
+        setModel(app, res.value);
+        warnIfIncompatible(app, res.value);
+        success(t(`Default model: ${c.brightYellow(res.value)}`, `Модель по умолчанию: ${c.brightYellow(res.value)}`));
+        hint(t(`Written to ${configPath()}. Applies to this session too.`, `Записано в ${configPath()}. Действует и в этой сессии.`));
+        return;
+      }
+      continue;
+    }
+
+    setModel(app, res.value);
+    warnIfIncompatible(app, res.value);
+    const aliasFor = Object.entries(cfg.aliases).find(([, v]) => v === res.value)?.[0];
+    if (aliasFor) hint(t(`alias: /model ${aliasFor}`, `алиас: /model ${aliasFor}`));
+    if (res.value !== cfg.model) hint(t("make it the default: /default", "сделать моделью по умолчанию: /default"));
+    return;
+  }
+}
+
+/** The provider panel: connect, switch, re-point or disconnect, all in place. */
+async function providerModal(app: App): Promise<void> {
+  for (;;) {
+    const cfg = loadConfig();
+    const here = currentProviderId(app);
+    const def = providerById(cfg.defaultProvider ?? DEFAULT_PROVIDER);
+    const res = await app.exclusiveInput(() =>
+      openModal({
+        title: t("Provider", "Поставщик"),
+        subtitle: t(
+          `In use: ${providerLabel(here)} · default: ${def?.label ?? "—"} · Enter switches this session`,
+          `Сейчас: ${providerLabel(here)} · по умолчанию: ${def?.label ?? "—"} · Enter переключит сессию`,
+        ),
+        items: providerItems(app),
+        initial: here,
+        search: false,
+        actions: [
+          { id: "default", label: t("Make default", "По умолчанию"), hotkey: "d" },
+          { id: "host", label: t("Host…", "Сервер…"), hotkey: "h" },
+          { id: "refresh", label: t("Refresh models", "Обновить модели"), hotkey: "r" },
+          { id: "logout", label: t("Disconnect", "Отключить"), hotkey: "x", tone: "danger" },
+        ],
+      }),
+    );
+    if (!res) return;
+
+    const target = res.value ? providerById(res.value) : undefined;
+    if (res.kind === "action") {
+      if (res.id === "refresh") {
+        await refreshCatalog(app);
+        continue;
+      }
+      if (!target) continue;
+      if (res.id === "default") setDefaultProvider(app, target);
+      else if (res.id === "host") await setProviderHost(app, target);
+      else if (res.id === "logout") await logoutFromProvider(app, target);
+      continue;
+    }
+
+    if (target) await switchToProvider(app, target);
+    return;
+  }
+}
+
+
+// ── /brain ────────────────────────────────────────────────────────────────
+
+/** The panel as it stands, minus anything this client can no longer reach. */
+function brainPanel(app: App): string[] {
+  return loadConfig().brainModels.filter((m) => app.catalog.some((x) => x.id === m));
+}
+
+function brainNeedsPanel(): void {
+  error(
+    t(
+      "A panel needs at least two models that this client can reach.",
+      "Совету нужны хотя бы две модели, доступные этому клиенту.",
+    ),
+  );
+  hint(t("Choose them with /brain models", "Выбрать: /brain models"));
+}
+
+/** Who sits on the panel — one multi-select spanning every connected host. */
+async function brainPanelModal(app: App): Promise<void> {
+  const cfg = loadConfig();
+  const picked = await app.exclusiveInput(() =>
+    pickModelsAcrossProviders({
+      catalog: app.catalog,
+      current: app.session.model,
+      defaultModel: app.session.model,
+      selected: cfg.brainModels,
+      allowEmpty: true,
+      title: t("Panel for /brain", "Совет моделей для /brain"),
+      subtitle: t(
+        "Space marks a model, ←→ switches provider, Enter confirms. Two or three is a panel; more is mostly repetition.",
+        "Пробел отмечает модель, ←→ переключает поставщика, Enter подтверждает. Двух-трёх достаточно; дальше — повторы.",
+      ),
+    }),
+  );
+  if (picked === null) return;
+  saveConfig({ brainModels: picked }, { replace: ["brainModels"] });
+  app.cfg = loadConfig();
+  if (!picked.length) return void success(t("Panel cleared.", "Совет очищен."));
+  success(t(`Panel: ${picked.map(wireModelId).join(", ")}`, `Совет: ${picked.map(wireModelId).join(", ")}`));
+}
+
+/** The panel as it stands, and the question to put to it. */
+async function brainModal(app: App): Promise<void> {
+  for (;;) {
+    const configured = loadConfig().brainModels;
+    const reachable = brainPanel(app);
+    const items: PickerItem[] = configured.map((id) => ({
+      value: id,
+      label: wireModelId(id).padEnd(28),
+      hint: reachable.includes(id)
+        ? c.dim(providerLabel(splitModelId(id).providerId))
+        : c.red(t("not reachable from here", "отсюда недоступна")),
+    }));
+
+    const res = await app.exclusiveInput(() =>
+      openModal({
+        title: t("Brain", "Совет моделей"),
+        subtitle: t(
+          "They answer separately, read each other, and one writes the result. Enter puts a question to them.",
+          "Они отвечают порознь, читают друг друга, одна сводит итог. Enter — задать им вопрос.",
+        ),
+        items,
+        search: false,
+        empty: t("No panel yet — choose the models first.", "Совета пока нет — сначала выберите модели."),
+        actions: [
+          { id: "ask", label: t("Ask…", "Спросить…"), hotkey: "a", disabled: reachable.length < 2 },
+          { id: "models", label: t("Choose models…", "Выбрать модели…"), hotkey: "c" },
+          {
+            id: "clear",
+            label: t("Clear", "Очистить"),
+            hotkey: "x",
+            tone: "danger",
+            disabled: !configured.length,
+          },
+        ],
+      }),
+    );
+    if (!res) return;
+
+    if (res.kind === "action") {
+      if (res.id === "models") {
+        await brainPanelModal(app);
+        continue;
+      }
+      if (res.id === "clear") {
+        saveConfig({ brainModels: [] }, { replace: ["brainModels"] });
+        app.cfg = loadConfig();
+        success(t("Panel cleared.", "Совет очищен."));
+        continue;
+      }
+    }
+
+    // "Ask", and Enter on a row, are the same thing: the panel answers as a
+    // panel, so which row the cursor was on never mattered.
+    const panel = brainPanel(app);
+    if (panel.length < 2) {
+      brainNeedsPanel();
+      return;
+    }
+    const question = await app.exclusiveInput(() => askLine(t("The question:", "Вопрос:"), ""));
+    if (!question) return;
+    await app.runBrain(question, panel);
+    return;
+  }
+}
+
+// ── /subagents ────────────────────────────────────────────────────────────
+
+/** Only what this key can actually launch a subagent on — the tool's own rule. */
+function subagentPool(app: App, providerId: string) {
+  return providerModels(app, providerId).filter((m) => m.chatCapable !== false && servesModality(m, "text"));
+}
+
+function noSubagentModels(providerId: string): void {
+  error(
+    t(
+      `${providerLabel(providerId)} has no model a subagent could run on.`,
+      `У ${providerLabel(providerId)} нет моделей для субагентов.`,
+    ),
+  );
+}
+
+/** Puts one more model on the list without walking the whole catalogue. */
+function addSubagentModel(app: App, named: string): void {
+  const provider = currentProviderId(app);
+  const pool = subagentPool(app, provider);
+  if (!pool.length) return noSubagentModels(provider);
+
+  let added: string;
+  try {
+    added = resolveModelId(named, app.catalog);
+  } catch (err) {
+    return void error((err as Error).message);
+  }
+  if (!pool.some((m) => m.id === added)) {
+    return void error(
+      t(
+        `${added} is not a model of ${providerLabel(provider)} a subagent could run on.`,
+        `${added} — не модель ${providerLabel(provider)}, на которой может работать субагент.`,
+      ),
+    );
+  }
+  const current = loadConfig().subagentModels?.[provider] ?? [];
+  saveConfig({ subagentModels: { [provider]: [...new Set([...current, added])] } });
+  app.cfg = loadConfig();
+  app.rebuildTools();
+  success(
+    t(
+      `${providerLabel(provider)}: subagents also run on ${wireModelId(added)}.`,
+      `${providerLabel(provider)}: субагенты работают также на ${wireModelId(added)}.`,
+    ),
+  );
+}
+
+function resetSubagentModels(app: App): void {
+  const provider = currentProviderId(app);
+  const next = { ...loadConfig().subagentModels };
+  delete next[provider];
+  saveConfig({ subagentModels: next }, { replace: ["subagentModels"] });
+  app.cfg = loadConfig();
+  app.rebuildTools();
+  success(
+    t(
+      `${providerLabel(provider)}: subagents run on the session's model only.`,
+      `${providerLabel(provider)}: субагенты работают только на модели сессии.`,
+    ),
+  );
+}
+
+async function subagentsModal(app: App): Promise<void> {
+  for (;;) {
+    const provider = currentProviderId(app);
+    const pool = subagentPool(app, provider);
+    if (!pool.length) return noSubagentModels(provider);
+    const current = loadConfig().subagentModels?.[provider] ?? [];
+
+    const res = await app.exclusiveInput(() =>
+      openModelsModal({
+        catalog: pool,
+        current: app.session.model,
+        defaultModel: app.session.model,
+        selected: current,
+        allowEmpty: true,
+        title: t("Models for subagents", "Модели для субагентов"),
+        subtitle: t(
+          `${providerLabel(provider)} · Space marks a model, Enter confirms. Nothing marked — the session's model only.`,
+          `${providerLabel(provider)} · Пробел отмечает модель, Enter подтверждает. Ничего не отмечено — только модель сессии.`,
+        ),
+        actions: [
+          { id: "auto", label: t("Session model only", "Только модель сессии"), hotkey: "a" },
+          { id: "refresh", label: t("Refresh", "Обновить"), hotkey: "r" },
+        ],
+      }),
+    );
+    if (!res) return;
+
+    if (res.kind === "action") {
+      if (res.id === "auto") return resetSubagentModels(app);
+      if (res.id === "refresh") {
+        await refreshCatalog(app);
+        continue;
+      }
+      continue;
+    }
+
+    saveConfig({ subagentModels: { [provider]: res.values } });
+    app.cfg = loadConfig();
+    app.rebuildTools();
+    if (!res.values.length) {
+      return void success(
+        t(`${providerLabel(provider)}: the session's model only.`, `${providerLabel(provider)}: только модель сессии.`),
+      );
+    }
+    return void success(
+      t(
+        `Subagents on ${providerLabel(provider)}: ${res.values.map(wireModelId).join(", ")}`,
+        `Субагенты у ${providerLabel(provider)}: ${res.values.map(wireModelId).join(", ")}`,
+      ),
+    );
+  }
+}
+
+// ── /skills ───────────────────────────────────────────────────────────────
+
+/** Opens a file in the user's editor, or names it when there is none set. */
+async function openInEditor(app: App, file: string): Promise<boolean> {
+  const editor = process.env.VISUAL || process.env.EDITOR;
+  if (!editor) {
+    info(file);
+    hint(t("EDITOR is not set — open the file in your own editor.", "EDITOR не задан — откройте файл своим редактором."));
+    return false;
+  }
+  await app.exclusiveInput(
+    () =>
+      new Promise<void>((resolve) => {
+        const child = spawn(editor, [file], { stdio: "inherit" });
+        child.on("close", () => resolve());
+        child.on("error", (err: Error) => {
+          error(t(`Could not launch ${editor}: ${err.message}`, `Не удалось запустить ${editor}: ${err.message}`));
+          resolve();
+        });
+      }),
+  );
+  return true;
+}
+
+function setSkillsEnabled(app: App, on: boolean): void {
+  app.cfg = saveConfig({ skillsEnabled: on });
+  app.rebuildTools();
+  if (on) {
+    success(
+      t(
+        "Skills are on — the catalog and the skill tool join every request.",
+        "Навыки включены — каталог и тулз skill добавляются в каждый запрос.",
+      ),
+    );
+  } else {
+    success(
+      t(
+        "Skills are off — they no longer cost tokens on requests.",
+        "Навыки выключены — они больше не тратят токены в запросах.",
+      ),
+    );
+  }
+}
+
+async function editSkill(app: App, name: string | null): Promise<boolean> {
+  const skill = app.skills.find((s) => s.name === name);
+  if (!skill) {
+    error(t(`Skill not found: ${name ?? "(no name given)"}`, `Навык не найден: ${name ?? "(имя не указано)"}`));
+    return false;
+  }
+  const opened = await openInEditor(app, path.join(skill.dir, "SKILL.md"));
+  app.rebuildTools();
+  if (opened) success(t("Skills reloaded.", "Навыки перечитаны."));
+  return opened;
+}
+
+/** The brief the agent is handed when it writes a skill for a task. */
+function skillGenPrompt(task: string): string {
+  return (
+    `Write a trcode skill for this task: "${task}".\n\n` +
+    `A skill is a folder .trcode/skills/<name>/SKILL.md with frontmatter:\n` +
+    `---\nname: <short-name>\ndescription: <WHEN to apply it, one sentence>\n` +
+    `triggers: <comma-separated words a user would type for this, in every language they work in>\n---\n\n` +
+    `Study the repository first so the procedure rests on this project's real commands and files ` +
+    `rather than generalities. The body is a concrete procedure, what not to do, and the answer format. ` +
+    `Keep it under 50 lines. Create the file with write.`
+  );
+}
+
+async function skillsModal(app: App): Promise<void> {
+  for (;;) {
+    app.rebuildTools();
+    const cfg = loadConfig();
+    const enabled = cfg.skillsEnabled === true;
+    const autoOn = cfg.skillAuto !== false;
+    const withTriggers = app.skills.filter((s) => s.auto && s.triggers.length).length;
+
+    const items: PickerItem[] = app.skills.map((s) => ({
+      value: s.name,
+      label:
+        (enabled && autoOn && s.auto && s.triggers.length ? c.brightYellow("⚡ ") : "  ") + s.name.padEnd(22),
+      hint:
+        (s.scope === "project" ? c.brightGreen("project") : c.gray("global")) +
+        (enabled && app.loadedSkills.has(s.name) ? c.green(" ·loaded") : ""),
+      badge: truncate(s.description, Math.max(20, contentWidth() - 58)),
+    }));
+
+    const res = await app.exclusiveInput(() =>
+      openModal({
+        title: t("Skills", "Навыки"),
+        subtitle: enabled
+          ? t(
+              `On · ${withTriggers} of ${app.skills.length} fire on their own trigger words (⚡, auto-selection ${autoOn ? "on" : "off"}) · Enter edits`,
+              `Включены · ${withTriggers} из ${app.skills.length} срабатывают по своим словам (⚡, автовыбор ${autoOn ? "вкл" : "выкл"}) · Enter — правка`,
+            )
+          : t(
+              "Off — nothing about them is sent with requests, so they cost nothing.",
+              "Выключены — в запросы ничего не отправляется, и они ничего не стоят.",
+            ),
+        items,
+        empty: t("No skills yet — create one, or let the agent write it.", "Навыков пока нет — создайте или попросите агента."),
+        actions: [
+          {
+            id: "toggle",
+            label: enabled ? t("Turn off", "Выключить") : t("Turn on", "Включить"),
+            hotkey: "t",
+            tone: enabled ? "warn" : "ok",
+          },
+          {
+            id: "auto",
+            label: autoOn ? t("Auto-select off", "Автовыбор выкл") : t("Auto-select on", "Автовыбор вкл"),
+            hotkey: "u",
+            disabled: !enabled,
+          },
+          { id: "new", label: t("New…", "Создать…"), hotkey: "n" },
+          { id: "edit", label: t("Edit", "Править"), hotkey: "e", disabled: !app.skills.length },
+          { id: "gen", label: t("Generate…", "Сгенерировать…"), hotkey: "g" },
+        ],
+      }),
+    );
+    if (!res) return;
+
+    if (res.kind === "item") {
+      await editSkill(app, res.value);
+      continue;
+    }
+
+    if (res.id === "toggle") {
+      setSkillsEnabled(app, !enabled);
+      continue;
+    }
+    if (res.id === "auto") {
+      app.cfg = saveConfig({ skillAuto: !autoOn });
+      success(t(`Skill auto-selection ${!autoOn ? "on" : "off"}.`, `Автовыбор навыков: ${!autoOn ? "вкл" : "выкл"}.`));
+      continue;
+    }
+    if (res.id === "edit") {
+      await editSkill(app, res.value);
+      continue;
+    }
+    if (res.id === "new") {
+      const name = await app.exclusiveInput(() => askLine(t("Name:", "Имя:"), ""));
+      if (!name) continue;
+      const description = (await app.exclusiveInput(() => askLine(t("When to apply it:", "Когда применять:"), ""))) ?? "";
+      const { file, existed } = createSkill({ cwd: app.cwd, name: name.trim(), description, scope: "project" });
+      app.rebuildTools();
+      if (existed) warn(t(`That skill already exists: ${file}`, `Такой навык уже есть: ${file}`));
+      else success(t(`Created ${file}`, `Создан ${file}`));
+      hint(
+        t(
+          "The description line is what matters: the model decides whether to load the skill from it.",
+          "Главная строка — описание: по нему модель решает, загружать ли навык.",
+        ),
+      );
+      continue;
+    }
+    if (res.id === "gen") {
+      const task = await app.exclusiveInput(() => askLine(t("The task to automate:", "Задача для автоматизации:"), ""));
+      if (!task) continue;
+      await app.turn(skillGenPrompt(task));
+      app.rebuildTools();
+      return;
+    }
+  }
+}
+
+
+// ── /stat ─────────────────────────────────────────────────────────────────
+
+const STAT_PERIODS = [
+  { key: "today", label: () => t("Today", "Сегодня") },
+  { key: "week", label: () => t("Week", "Неделя") },
+  { key: "month", label: () => t("Month", "Месяц") },
+  { key: "all", label: () => t("All time", "Всё время") },
+] as const;
+
+type StatPeriod = (typeof STAT_PERIODS)[number]["key"];
+
+function statSince(p: StatPeriod): number {
+  if (p === "all") return 0;
+  const d = new Date();
+  if (p === "today") d.setHours(0, 0, 0, 0);
+  else if (p === "week") d.setDate(d.getDate() - 7);
+  else d.setDate(d.getDate() - 30);
+  return d.getTime();
+}
+
+/**
+ * The first local day that still belongs to the period, as a daily-bucket key.
+ * Calendar days, not rolling 24h windows: a bucket holds a whole day, and
+ * slicing one would need timestamps it does not store.
+ */
+function statDayCutoff(p: StatPeriod): string {
+  const back = p === "today" ? 0 : p === "week" ? 6 : 29;
+  const d = new Date();
+  d.setDate(d.getDate() - back);
+  return dayKey(d.getTime());
+}
+
+/**
+ * The share of one row that falls inside the period.
+ *
+ * A row is a whole session's aggregate, so lastUsed alone cannot say which
+ * part of it belongs to "today": a session that ran for a month and made its
+ * last request this morning used to show its entire month under Today.
+ * Daily buckets give the true share. A row recorded before daily accounting
+ * existed falls back to the session file's own date — closer than lastUsed,
+ * which is only when the session was last touched.
+ */
+export function periodSlice(u: ModelUsage, p: StatPeriod): ModelUsage | null {
+  if (p === "all") return u;
+  if (!u.daily) {
+    const cutoff = statDayCutoff(p);
+    // The session id opens with YYYYMMDD — the day the session was created,
+    // which is the best a legacy row can be dated by.
+    const created = sessionDayOf(u);
+    if (created) return created >= cutoff ? u : null;
+    return !u.lastUsed || u.lastUsed >= statSince(p) ? u : null;
+  }
+  const cutoff = statDayCutoff(p);
+  let requests = 0, input = 0, output = 0, cached = 0, reasoning = 0, costUsd = 0;
+  let hit = false;
+  for (const [k, d] of Object.entries(u.daily)) {
+    if (k < cutoff) continue;
+    hit = true;
+    requests += d.requests;
+    input += d.input;
+    output += d.output;
+    cached += d.cached;
+    reasoning += d.reasoning ?? 0;
+    costUsd += d.costUsd;
+  }
+  if (!hit) return null;
+  return { model: u.model, requests, input, output, cached, reasoning, costUsd, priceUnknown: u.priceUnknown, lastUsed: u.lastUsed };
+}
+
+/** Every stored request row; the live session's rows replace what is on disk. */
+function loadUsageRows(app: App): ModelUsage[] {
+  const out: ModelUsage[] = [];
+  let dir: string;
+  try {
+    dir = sessionsDir(app.cwd);
+  } catch {
+    return [];
+  }
+  // Skip the live session's own file, not every file that shares a model with
+  // it: dropping rows by model threw away other sessions' history — and with
+  // it most of the period totals — whenever the running model was reused.
+  const liveFile = `${app.session.id}.json`;
+  for (const n of fs.readdirSync(dir)) {
+    if (!n.endsWith(".json") || n === liveFile) continue;
+    try {
+      const data = JSON.parse(fs.readFileSync(path.join(dir, n), "utf8"));
+      for (const u of data.usage ?? []) out.push({ ...u, sessionFile: n });    } catch {
+      /* skip corrupt files */
+    }
+  }
+  for (const u of app.usage.all()) out.push({ ...u, sessionFile: `${app.session.id}.json` });
+  return out;
+}
+
+/** The YYYY-MM-DD a stored row's session was created, from its file name. */
+function sessionDayOf(u: ModelUsage & { sessionFile?: string }): string {
+  const stem = (u.sessionFile ?? "").slice(0, 12);
+  if (!/^\d{8}-/.test(stem)) return "";
+  return `${stem.slice(0, 4)}-${stem.slice(4, 6)}-${stem.slice(6, 8)}`;
+}
+
+/** Folds raw per-session rows into one ModelUsage per model. */
+export function foldUsage(rows: ModelUsage[]): Map<string, ModelUsage> {
+  const m = new Map<string, ModelUsage>();
+  for (const u of rows) {
+    // A fresh accumulator, not a copy of the row: the loop below adds the row
+    // itself, and seeding with it counted the first session twice.
+    const e = m.get(u.model) ?? {
+      model: u.model,
+      requests: 0,
+      input: 0,
+      output: 0,
+      cached: 0,
+      reasoning: 0,
+      costUsd: 0,
+      priceUnknown: u.priceUnknown,
+    };
+    for (const k of ["requests", "input", "output", "cached", "reasoning", "costUsd"] as const) e[k] += u[k];
+    e.priceUnknown = e.priceUnknown || u.priceUnknown;
+    e.lastUsed = Math.max(e.lastUsed ?? 0, u.lastUsed ?? 0);
+    m.set(u.model, e);
+  }
+  return m;
+}
+
+/** The one-line summary that sits above the table. */
+function usageTotals(rows: Map<string, ModelUsage>): string {
+  let input = 0, output = 0, cached = 0, cost = 0, reqs = 0, models = 0, unknown = false;
+  for (const u of rows.values()) {
+    input += u.input;
+    output += u.output;
+    cached += u.cached;
+    cost += u.costUsd;
+    reqs += u.requests;
+    models++;
+    unknown = unknown || u.priceUnknown;
+  }
+  const fresh = Math.max(0, input - cached);
+  const cachedPct = cached && input ? Math.round((cached / input) * 100) : 0;
+  return (
+    `${c.gray(t("models", "моделей"))} ${c.bold(String(models))}   ` +
+    `${c.gray(t("reqs", "запросов"))} ${c.bold(String(reqs))}   ` +
+    `${c.gray("↑")} ${fmtTokens(fresh)} ${c.gray(`(${cachedPct}% cached)`)}   ` +
+    `${c.gray("↓")} ${fmtTokens(output)}   ` +
+    `${c.gray(t("cost", "стоимость"))} ${c.bold(c.brightGreen(fmtCost(cost, unknown)))}`
+  );
+}
+
+/** The table body: a section per provider, its models, then a subtotal row. */
+function usageRows(folded: Map<string, ModelUsage>, only: string | null): PickerItem[] {
+  const byProvider = new Map<string, ModelUsage[]>();
+  for (const u of folded.values()) {
+    const pid = splitModelId(u.model).providerId;
+    if (only && pid !== only) continue;
+    (byProvider.get(pid) ?? byProvider.set(pid, []).get(pid)!).push(u);
+  }
+
+  // Each token cell carries its share of the row's total, so a glance tells
+  // which side of the traffic — fresh input, cache reads, output — dominates.
+  // Column widths come from the widest value in the table: a fixed width that
+  // fits "1.2k" clips "245.04M(97%)" into the next column, and the row stops
+  // being readable.
+  const shown = [...folded.values()].filter((u) => !only || splitModelId(u.model).providerId === only);
+  const cellText = (n: number, total: number): string => (n > 0 && total > 0 ? fmtTokens(n) + `(${Math.round((n / total) * 100)}%)` : "—");
+  const widths = { req: 3, input: 6, cached: 6, output: 6, reasoning: 9 };
+  for (const u of shown) {
+    const total = u.input + u.output + (u.reasoning ?? 0);
+    widths.req = Math.max(widths.req, String(u.requests).length);
+    widths.input = Math.max(widths.input, cellText(Math.max(0, u.input - u.cached), total).length);
+    widths.cached = Math.max(widths.cached, cellText(u.cached, total).length);
+    widths.output = Math.max(widths.output, cellText(u.output, total).length);
+    widths.reasoning = Math.max(widths.reasoning, cellText(u.reasoning ?? 0, total).length);
+  }
+  const cellOf = (u: { requests: number; input: number; cached: number; output: number; reasoning: number }): string => {
+    const total = u.input + u.output + (u.reasoning ?? 0);
+    return (
+      `${String(u.requests).padStart(widths.req)} ` +
+      `${cellText(Math.max(0, u.input - u.cached), total).padStart(widths.input)} ` +
+      `${cellText(u.cached, total).padStart(widths.cached)} ` +
+      `${cellText(u.output, total).padStart(widths.output)} ` +
+      `${cellText(u.reasoning ?? 0, total).padStart(widths.reasoning)}`
+    );
+  };
+  const tableWidth = widths.req + widths.input + widths.cached + widths.output + widths.reasoning + 5;
+  const nameWidth = Math.max(12, Math.min(30, contentWidth() - tableWidth - 9));
+
+  const items: PickerItem[] = [];
+  for (const pid of [...byProvider.keys()].sort()) {
+    const list = byProvider.get(pid)!.sort((a, b) => b.costUsd - a.costUsd);
+    items.push({ value: `__${pid}`, label: "", header: providerLabel(pid) });
+    items.push({
+      value: `__head-${pid}`,
+      label: c.gray(
+        `${"model".padEnd(nameWidth)} ${"req".padStart(widths.req)} ${"input*".padStart(widths.input)} ${"cached".padStart(widths.cached)} ${"output".padStart(widths.output)} ${"reasoning".padStart(widths.reasoning)}`,
+      ),
+    });
+    let cost = 0;
+    let unknown = false;
+    for (const u of list) {
+      cost += u.costUsd;
+      unknown = unknown || u.priceUnknown;
+      items.push({
+        value: u.model,
+        label: truncate(wireModelId(u.model), nameWidth).padEnd(nameWidth) + " " + cellOf(u),
+        badge: c.gray(fmtCost(u.costUsd, u.priceUnknown).padStart(9)),
+      });
+    }
+    const sub = list.reduce(
+      (a, u) => ({
+        requests: a.requests + u.requests,
+        input: a.input + u.input,
+        cached: a.cached + u.cached,
+        output: a.output + u.output,
+        reasoning: a.reasoning + (u.reasoning ?? 0),
+      }),
+      { requests: 0, input: 0, cached: 0, output: 0, reasoning: 0 },
+    );
+    items.push({
+      value: `__sub-${pid}`,
+      label: c.gray(t("subtotal", "итого").padEnd(nameWidth) + " " + cellOf(sub)),
+      badge: c.bold(fmtCost(cost, unknown).padStart(9)),
+    });
+  }
+  return items;
+}
+
+/**
+ * The usage panel. The periods are its tabs and the providers its buttons, so
+ * the two questions this report ever answers — since when, and whose key — are
+ * both a keypress away instead of a re-run of the command.
+ */
+async function statModal(app: App): Promise<void> {
+  const all = loadUsageRows(app);
+  if (!all.length) {
+    line();
+    return void hint(t("No usage recorded yet.", "Расход пока не записан."));
+  }
+
+  // Every provider that ever appears, so the buttons do not come and go as
+  // the period changes — a button that vanishes is one you cannot press back.
+  const everyProvider = [...new Set(all.map((u) => splitModelId(u.model).providerId))].sort();
+  // Slice each session's row to the period before folding: the fold throws
+  // the daily buckets away, so they have to be read while they are still there.
+  const foldFor = (p: string): Map<string, ModelUsage> => {
+    const period = (p || "all") as StatPeriod;
+    return foldUsage(all.map((u) => periodSlice(u, period)).filter((u): u is ModelUsage => u !== null));
+  };
+
+  let period: StatPeriod = "all";
+  let only: string | null = null;
+
+  for (;;) {
+    const scope = (rows: Map<string, ModelUsage>): Map<string, ModelUsage> =>
+      only ? new Map([...rows].filter(([m]) => splitModelId(m).providerId === only)) : rows;
+
+    const actions: ModalAction[] = [
+      ...(only ? [{ id: "__all", label: t("All providers", "Все поставщики") }] : []),
+      ...everyProvider.filter((pid) => pid !== only).map((pid) => ({ id: pid, label: providerLabel(pid) })),
+    ];
+
+    const res: ModalResult | null = await app.exclusiveInput(() =>
+      openModal({
+        title: t("Usage", "Расход"),
+        subtitle: t(
+          "input* counts fresh tokens only — cache reads are the cached column. ←→ changes the period.",
+          "input* — только чистые токены, чтения из кеша в колонке cached. ←→ меняет период.",
+        ),
+        notes: (tabKey) => {
+          const rows = scope(foldFor(tabKey));
+          return rows.size ? [usageTotals(rows)] : [];
+        },
+        tabs: STAT_PERIODS.map((p) => ({ key: p.key, label: p.label() })),
+        initialTab: period,
+        items: (tabKey) => usageRows(foldFor(tabKey), only),
+        readOnly: true,
+        search: false,
+        empty: t("No usage in this period.", "За этот период расхода нет."),
+        actions: actions.length > 1 ? actions : [],
+      }),
+    );
+    if (!res || res.kind !== "action") return;
+    // The panel reopens on the period it was left on, not on the one it opened
+    // with: switching provider must not throw the period away.
+    period = (res.tab || period) as StatPeriod;
+    only = res.id === "__all" ? null : res.id;
+  }
+}
+
+
+// ── /uilib ────────────────────────────────────────────────────────────────
+
+/**
+ * The library panel. Capture, blend and removal are the typed sub-commands
+ * turned into buttons; Enter on a row shows what that mockup actually says,
+ * which is the one thing a bare listing could never do.
+ */
+async function uiLibraryModal(app: App): Promise<void> {
+  for (;;) {
+    const entries = listEntries();
+    const items: PickerItem[] = entries.map((e) => ({
+      value: e.slug,
+      label: e.title.padEnd(22),
+      hint: c.dim(e.keywords.slice(0, 6).join(" ")),
+      badge: truncate(e.summary, Math.max(16, contentWidth() - 64)),
+    }));
+
+    const res = await app.exclusiveInput(() =>
+      openModal({
+        title: t("UI library", "Библиотека UI"),
+        subtitle: t(
+          "Saved mockups. A design request offers them by itself; Enter opens one's brief.",
+          "Сохранённые макеты. Запрос на дизайн предложит их сам; Enter открывает бриф.",
+        ),
+        items,
+        empty: t(
+          "The library is empty — capture a design from a live site to start.",
+          "Библиотека пуста — сохраните дизайн с живого сайта.",
+        ),
+        actions: [
+          { id: "add", label: t("Capture a site…", "Сохранить сайт…"), hotkey: "c" },
+          { id: "blend", label: t("Blend…", "Смешать…"), hotkey: "b", disabled: entries.length < 2 },
+          { id: "match", label: t("Match a request…", "Подобрать под запрос…"), hotkey: "m", disabled: !entries.length },
+          { id: "delete", label: t("Remove", "Удалить"), hotkey: "r", tone: "danger", disabled: !entries.length },
+        ],
+      }),
+    );
+    if (!res) return;
+
+    if (res.kind === "item") {
+      showUiEntry(res.value);
+      continue;
+    }
+
+    if (res.id === "add") {
+      const url = await app.exclusiveInput(() => askLine(t("Site to capture:", "Сайт для захвата:"), "https://"));
+      if (!url || !/^https?:\/\/\S+$/i.test(url.trim())) {
+        if (url) error(t("That is not a URL.", "Это не URL."));
+        continue;
+      }
+      app.pendingUilibGate = (proposal) => app.confirmUiEntry(proposal);
+      app.skipNextDesignMatch = true;
+      await app.turn(uilibCapturePrompt(url.trim(), ""));
+      return;
+    }
+    if (res.id === "blend") {
+      const picked = await blendUiEntries(app);
+      if (!picked || picked === "none") continue;
+      startBlendTurn(app, picked);
+      return;
+    }
+    if (res.id === "match") {
+      const q = await app.exclusiveInput(() => askLine(t("Describe the design:", "Опишите дизайн:"), ""));
+      if (!q) continue;
+      renderMatches(app, q);
+      continue;
+    }
+    if (res.id === "delete" && res.value) {
+      const entry = entries.find((e) => e.slug === res.value);
+      if (!entry) continue;
+      const sure = await app.exclusiveInput(() =>
+        choose<"yes" | "no">(
+          [
+            { value: "no", label: t("Keep", "Оставить"), key: "n" },
+            { value: "yes", label: t("Remove", "Удалить"), key: "y", tone: "danger" },
+          ],
+          {
+            initial: "no",
+            fallback: "no",
+            cancel: () => {},
+            hint: t(`remove ${entry.title}?`, `удалить ${entry.title}?`),
+          },
+        ),
+      );
+      if (sure === "yes" && deleteEntry(entry.slug)) {
+        success(t(`Removed ${entry.title}.`, `Удалено: ${entry.title}.`));
+      }
+      continue;
+    }
+  }
+}
+
+/** The brief itself, rendered as the markdown it is. */
+function showUiEntry(slug: string): void {
+  const found = getEntry(slug);
+  if (!found) return void error(t(`No such entry: ${slug}`, `Такого макета нет: ${slug}`));
+  line();
+  rule(c.brightCyan(` ${found.entry.title} `));
+  for (const l of renderMarkdownBlock(found.brief, { width: contentWidth() })) line(l);
+  line();
+  if (found.entry.source) hint(t(`from ${found.entry.source}`, `источник: ${found.entry.source}`));
+  hint(t("A design request will offer this style by itself.", "Запрос на дизайн предложит этот стиль сам."));
 }
 
 /** Says so plainly when a chosen model cannot be driven through this client. */
@@ -404,6 +1380,7 @@ async function browseSessions(app: App, mode: "resume" | "manage"): Promise<void
         // The snapshots exist to undo that session's edits; without it they
         // are unreachable bytes on disk.
         dropStore(app.cwd, loaded.id);
+        dropSessionHistory(app.cwd, loaded.id);
         if (Session.remove(app.cwd, loaded.id)) success(t(`Deleted ${loaded.id}`, `Удалена ${loaded.id}`));
         else error(t(`Could not delete ${loaded.id}`, `Не удалось удалить ${loaded.id}`));
       }
@@ -472,16 +1449,40 @@ async function rewindTurn(app: App, rest: string): Promise<void> {
   }
   line();
 
-  const what = await choose<"files" | "both" | "history" | "cancel">(
+  const what = await choose<"files" | "both" | "history" | "fork" | "cancel">(
     [
       { value: "files", label: t("Files only", "Только файлы"), key: "f" },
       { value: "both", label: t("Files and conversation", "Файлы и разговор"), key: "b", tone: "warn" },
       { value: "history", label: t("Conversation only", "Только разговор"), key: "c", tone: "warn" },
+      {
+        value: "fork",
+        label: t("Fork here instead (nothing is undone)", "Ветка отсюда вместо отката (ничего не отменяется)"),
+        key: "k",
+      },
       { value: "cancel", label: t("Cancel", "Отмена"), key: "n", tone: "danger" },
     ],
     { initial: "files", fallback: "cancel" },
   );
   if (what === "cancel") return;
+  if (what === "fork") {
+    // A branch, not an undo: the original keeps its history and its files.
+    const forked = Session.forkFrom(app.session, chosen.at);
+    if (!forked || !forked.messages.length) return info(t("Nothing before that point to carry over.", "До этой точки ничего переносить."));
+    forked.save();
+    success(t(`Forked into ${forked.id} (${forked.messages.length} messages). Original untouched.`, `Ветка ${forked.id} (${forked.messages.length} сообщ.). Оригинал не тронут.`));
+    const go = await choose<"switch" | "stay">(
+      [
+        { value: "switch", label: t("Switch to the fork now", "Перейти в ветку сейчас"), key: "s" },
+        { value: "stay", label: t("Stay here", "Остаться здесь"), key: "n" },
+      ],
+      { initial: "switch", fallback: "stay" },
+    );
+    if (go === "switch") {
+      adoptSession(app, forked);
+      app.replayHistory();
+    }
+    return;
+  }
 
   if (what !== "history") {
     const res = rewindFiles(app.session, chosen.turn);
@@ -534,6 +1535,96 @@ async function rewindTurn(app: App, rest: string): Promise<void> {
         `Re-read any of them before editing — what you last wrote there is gone.`,
     });
     app.session.save();
+  }
+}
+
+/**
+ * Branch the session at a past turn. Unlike /rewind nothing is undone: the
+ * original session and its files stay as they are, and the user is moved into
+ * a new session whose history ends just before the chosen turn — "what if I
+ * had asked differently there" without losing the road already taken.
+ */
+async function forkTurn(app: App, rest: string): Promise<void> {
+  const points = listCheckpoints(app.session);
+  const messages = app.session.messages;
+  if (messages.length < 2) {
+    return info(
+      t(
+        "Nothing to branch — this session has no history yet.",
+        "Ветвить нечего — в этой сессии пока нет истории.",
+      ),
+    );
+  }
+
+  const arg = rest.trim().toLowerCase();
+  let at: number;
+  let label: string;
+  if (arg === "start" || arg === "0") {
+    at = 0;
+    label = t("the very beginning", "самое начало");
+  } else {
+    // Turns with file edits first; when none exist, offer plain turn bounds
+    // from user-message starts so an all-talk session can still be branched.
+    const cuts = new Map<number, string>();
+    for (let i = 0; i < messages.length; i++) {
+      if (messages[i].role === "user" && typeof messages[i].content === "string") {
+        cuts.set(i, truncate(String(messages[i].content).replace(/\s+/g, " "), 46));
+      }
+    }
+    for (const p of points) cuts.set(p.at, truncate(p.prompt || t("(no prompt)", "(без запроса)"), 46));
+
+    let chosenKey: string | undefined;
+    if (/^\d+$/.test(arg)) {
+      chosenKey = arg;
+    } else {
+      const items = [...cuts.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(
+          ([idx, prompt]): PickerItem => ({
+            value: String(idx),
+            label: prompt.padEnd(47),
+            hint: c.gray(`#${idx}`),
+          }),
+        );
+      const picked = await pick({
+        title: t("Branch from where?", "Ветвить от какого места?"),
+        items,
+      });
+      if (picked === null) return;
+      chosenKey = picked;
+    }
+    if (!chosenKey) return;
+    at = Number(chosenKey);
+    if (!Number.isInteger(at) || at < 0 || at >= messages.length) {
+      return error(t(`No such position in the history: ${arg}`, `Такой позиции в истории нет: ${arg}`));
+    }
+    label = truncate(cuts.get(at) ?? `#${at}`, 60);
+  }
+
+  const forked = Session.forkFrom(app.session, at);
+  if (!forked || !forked.messages.length) {
+    return info(t("Nothing before that point to carry over.", "До этой точки ничего переносить."));
+  }
+  forked.save();
+
+  padded(t(`Branching from: ${label}`, `Ветвление от: ${label}`));
+  success(
+    t(
+      `Forked into ${forked.id} — ${forked.messages.length} ${plural(forked.messages.length, "message", "messages")}. The original ${app.session.id} is untouched.`,
+      `Ветка ${forked.id} — ${count(forked.messages.length, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}. Оригинал ${app.session.id} не тронут.`,
+    ),
+  );
+
+  const go = await choose<"switch" | "stay">(
+    [
+      { value: "switch", label: t("Switch to the fork now", "Перейти в ветку сейчас"), key: "s" },
+      { value: "stay", label: t("Stay here", "Остаться здесь"), key: "n" },
+    ],
+    { initial: "switch", fallback: "stay" },
+  );
+  if (go === "switch") {
+    adoptSession(app, forked);
+    app.replayHistory();
   }
 }
 
@@ -602,32 +1693,42 @@ async function ensureWriterChosen(app: App): Promise<boolean> {
   if (loadConfig().promptModels?.[provider]) return true;
 
   const fallback = promptModelFor(app.session.model, app.catalog);
-  line();
-  padded(c.bold(t("Which model should write the briefs?", "Какая модель будет писать задания?")));
-  hint(
-    t(
-      "A small one is enough, and it is cheaper than letting the big one guess.",
-      "Хватит маленькой — это дешевле, чем давать большой домысливать.",
-    ),
-  );
-  const answer = await app.exclusiveInput(() =>
-    choose<"pick" | "default">(
-      [
-        { value: "pick", label: t("Choose one", "Выбрать"), key: "c", tone: "ok" },
-        { value: "default", label: t(`Keep ${wireModelId(fallback)}`, `Оставить ${wireModelId(fallback)}`), key: "d" },
+  const res = await app.exclusiveInput(() =>
+    openModal({
+      title: t("Prompt model", "Модель промптов"),
+      subtitle: t(
+        "Which model should write the briefs? A small one is enough, and it is cheaper than letting the big one guess.",
+        "Какая модель будет писать задания? Хватит маленькой — это дешевле, чем давать большой домысливать.",
+      ),
+      items: [
+        {
+          value: "default",
+          label: t(`Keep ${wireModelId(fallback)}`, `Оставить ${wireModelId(fallback)}`),
+          hint: t("the default writer, asked once", "модель по умолчанию, спрашивается один раз"),
+        },
+        {
+          value: "pick",
+          label: t("Choose one…", "Выбрать…"),
+          hint: t("pick from the list", "выбрать из списка"),
+        },
       ],
-      { initial: "pick", fallback: "default" },
-    ),
+      search: false,
+      actions: [{ id: "auto", label: t("Auto (default)", "Авто (по умолчанию)"), hotkey: "a" }],
+    }),
   );
-  if (answer === "pick") {
+  if (!res) return false;
+  if (res.kind === "action" && res.id === "auto" || (res.kind === "item" && res.value === "default")) {
+    saveConfig({ promptModels: { [provider]: AUTO } });
+    app.cfg = loadConfig();
+    hint(t(`Writing with ${fallback}. Change it with /prompt models.`, `Пишет ${fallback}. Сменить: /prompt models.`));
+    return true;
+  }
+  if (res.kind === "item" && res.value === "pick") {
     await chooseWriter(app, "");
     // Backing out of the list is not an answer; ask again next time.
     return Boolean(loadConfig().promptModels?.[provider]);
   }
-  saveConfig({ promptModels: { [provider]: AUTO } });
-  app.cfg = loadConfig();
-  hint(t(`Writing with ${fallback}. Change it with /prompt models.`, `Пишет ${fallback}. Сменить: /prompt models.`));
-  return true;
+  return false;
 }
 
 async function chooseWriter(app: App, named: string): Promise<void> {
@@ -646,45 +1747,108 @@ async function chooseWriter(app: App, named: string): Promise<void> {
     return;
   }
 
-  let id: string | null = null;
   if (named) {
+    let id: string;
     try {
       id = resolveModelId(named, app.catalog);
     } catch (err) {
       return void error((err as Error).message);
     }
-  } else {
-    // Only models this key can call, and only ones that can answer in text: a
-    // writer is a chat turn like any other.
-    const pool = providerModels(app, provider).filter(
-      (m) => m.chatCapable !== false && servesModality(m, "text"),
-    );
-    if (!pool.length) {
-      return void error(t(`${providerLabel(provider)} has no model that could write prompts.`, `У ${providerLabel(provider)} нет модели, которая могла бы писать промпты.`));
+    if (splitModelId(id).providerId !== provider) {
+      return void error(
+        t(
+          `${id} belongs to another provider — a writer has to be one this key can call.`,
+          `${id} у другого поставщика — писать промпты должна модель, доступная этому ключу.`,
+        ),
+      );
     }
-    line();
-    hint(t("The model that writes prompts for this provider", "Модель, которая пишет промпты у этого поставщика"));
-    id = await app.exclusiveInput(() =>
-      pickModel({
-        catalog: pool,
-        current: promptModelFor(app.session.model, app.catalog),
-        defaultModel: app.session.model,
-      }),
-    );
-    if (!id) return;
+    saveConfig({ promptModels: { [provider]: id } });
+    app.cfg = loadConfig();
+    success(t(`${providerLabel(provider)} writes prompts with ${id}.`, `${providerLabel(provider)}: промпты пишет ${id}.`));
+    return;
   }
 
-  if (splitModelId(id).providerId !== provider) {
-    return void error(
-      t(
-        `${id} belongs to another provider — a writer has to be one this key can call.`,
-        `${id} у другого поставщика — писать промпты должна модель, доступная этому ключу.`,
-      ),
+  // The same panel /model shows, scoped to this provider and with the writer's
+  // own buttons along the foot. A button changes what is on offer and the
+  // panel comes straight back, so widening to every provider or re-reading the
+  // catalogue never costs a re-typed command.
+  let all = false;
+  for (;;) {
+    const mine = providerModels(app, provider);
+    // Scoped to the provider in use by default: its key cannot call the other
+    // hosts' models, and listing them only invites a 404. The scope button is
+    // there for the times the catalogue for this host came up empty.
+    const scoped = all || !mine.length ? app.catalog : mine;
+    const pool = scoped.filter((m) => m.chatCapable !== false && servesModality(m, "text"));
+    const label = providerById(provider)?.label ?? provider;
+    const writer = cfg.promptModels?.[provider];
+    const current = writer && writer !== AUTO ? writer : promptModelFor(app.session.model, app.catalog);
+
+    if (!pool.length) {
+      await refreshCatalog(app);
+      continue;
+    }
+
+    const res = await app.exclusiveInput(() =>
+      openModelModal({
+        catalog: pool,
+        current,
+        defaultModel: app.session.model,
+        title: t("Prompt model", "Модель промптов"),
+        subtitle: t(
+          `${all ? "Every provider" : label} · ★ session model · ● in use · a small one is enough`,
+          `${all ? "Все поставщики" : label} · ★ модель сессии · ● текущая · хватит маленькой`,
+        ),
+        actions: [
+          { id: "auto", label: t("Auto (default)", "Авто (по умолчанию)"), hotkey: "a" },
+          { id: "refresh", label: t("Refresh", "Обновить"), hotkey: "r" },
+          all
+            ? { id: "scope", label: t(`Only ${label}`, `Только ${label}`), hotkey: "o" }
+            : { id: "scope", label: t("All providers", "Все поставщики"), hotkey: "s" },
+        ],
+      }),
     );
+    if (!res) return;
+
+    if (res.kind === "action") {
+      if (res.id === "refresh") {
+        await refreshCatalog(app);
+        continue;
+      }
+      if (res.id === "scope") {
+        all = !all;
+        continue;
+      }
+      if (res.id === "auto") {
+        saveConfig({ promptModels: { [provider]: AUTO } });
+        app.cfg = loadConfig();
+        success(
+          t(
+            `${providerLabel(provider)}: the default writer — ${promptModelFor(app.session.model, app.catalog)}.`,
+            `${providerLabel(provider)}: модель по умолчанию — ${promptModelFor(app.session.model, app.catalog)}.`,
+          ),
+        );
+        return;
+      }
+      continue;
+    }
+
+    if (!res.value || splitModelId(res.value).providerId !== provider) {
+      warn(
+        t(
+          `${res.value} belongs to another provider — pin it with /model first.`,
+          `${res.value} у другого поставщика — сначала переключитесь на него через /model.`,
+        ),
+      );
+      continue;
+    }
+    saveConfig({ promptModels: { [provider]: res.value } });
+    app.cfg = loadConfig();
+    success(
+      t(`${providerLabel(provider)} writes prompts with ${res.value}.`, `${providerLabel(provider)}: промпты пишет ${res.value}.`),
+    );
+    return;
   }
-  saveConfig({ promptModels: { [provider]: id } });
-  app.cfg = loadConfig();
-  success(t(`${providerLabel(provider)} writes prompts with ${id}.`, `${providerLabel(provider)}: промпты пишет ${id}.`));
 }
 
 /**
@@ -707,7 +1871,7 @@ function expandCollapsed(rest: string): void {
   const text = collapsedText(id);
   if (!text) return warn(t("Nothing to show.", "Показывать нечего."));
   line();
-  for (const l of renderMarkdownBlock(text)) padded(l);
+  for (const l of expandedBlock(text)) padded(l);
   line();
 }
 
@@ -765,16 +1929,213 @@ async function editTurn(app: App, rest: string): Promise<void> {
   hint(t("Files written after that turn are untouched — /rewind puts those back.", "Файлы, записанные после того хода, не тронуты — их вернёт /rewind."));
 }
 
+/** Ranked matches for an explicit /uilib match — a listing, not a picker. */
+function renderMatches(app: App, q: string): void {
+  const matches = matchLibrary(q);
+  line();
+  if (!matches.length) {
+    hint(t("Nothing in the library matches that.", "Под это в библиотеке совпадений нет."));
+    hint(t("Capture a design first: /uilib add <site-url>", "Сначала сохраните макет: /uilib add <url сайта>"));
+    return;
+  }
+  for (const m of matches) {
+    padded(
+      `${c.bold(m.entry.slug.padEnd(24))} ${c.gray(`score ${String(Math.round(m.score)).padStart(3)}`)}  ` +
+        c.dim(truncate(m.via.slice(0, 4).join(", "), Math.max(16, contentWidth() - 44))),
+    );
+  }
+  line();
+}
+
+/**
+ * The library picker for a design request: one modal with every saved mockup —
+ * ranked by how well it matches the request — over three buttons. "Auto" takes
+ * the best-ranked entry, "Blend" fuses several, "Unique design" draws from
+ * scratch. Returns the picked entry (or several, for a blend), "none" when the
+ * user wants a design from scratch, or null when the panel was dismissed.
+ */
+export async function pickUiEntry(
+  app: App,
+  request: string,
+): Promise<{ entry: UiEntry; brief: string } | { entry: UiEntry; brief: string }[] | "none" | null> {
+  const entries = listEntries();
+  if (!entries.length) return null;
+  // Matched first, in rank order; the rest of the library stays reachable below.
+  const matched = new Set(matchLibrary(request).map((m) => m.entry.slug));
+  const ranked = [
+    ...matchLibrary(request).map((m) => m.entry),
+    ...entries.filter((e) => !matched.has(e.slug)),
+  ];
+  line();
+  hint(t("I can draw it in a style from your UI library:", "Могу нарисовать в стиле из вашей библиотеки макетов:"));
+  const res = await app.exclusiveInput(() =>
+    openModal({
+      title: t("Design reference", "Дизайн-референс"),
+      subtitle: t(
+        "Pick a saved mockup for this request, or let the CLI decide.",
+        "Выберите сохранённый макет под запрос или доверьтесь автоподбору.",
+      ),
+      items: ranked.map((e) => ({
+        value: e.slug,
+        label: e.title.padEnd(22),
+        hint: c.dim(e.keywords.slice(0, 5).join(" ")),
+        badge: truncate(e.summary, Math.max(16, contentWidth() - 64)),
+      })),
+      empty: t("The library is empty — capture a design with /uilib add.", "Библиотека пуста — сохраните макет через /uilib add."),
+      actions: [
+        { id: "auto", label: t("Auto-pick", "Авто-подбор"), hotkey: "a", tone: "ok" },
+        { id: "blend", label: t("Blend several…", "Смешать несколько…"), hotkey: "b", disabled: entries.length < 2 },
+        { id: "scratch", label: t("Unique design", "Уникальный дизайн"), hotkey: "u", tone: "warn" },
+      ],
+    }),
+  );
+  if (!res) return null;
+  if (res.kind === "item") return getEntry(res.value);
+  if (res.id === "auto") return ranked[0] ? getEntry(ranked[0].slug) : null;
+  if (res.id === "blend") return blendUiEntries(app);
+  if (res.id === "scratch") return "none";
+  return null;
+}
+
+/**
+ * Picking several mockups to fuse into one style. The multi-picker returns the
+ * slugs; the confirm step after it is where the user sees what is about to be
+ * blended and can still back out.
+ */
+async function blendUiEntries(app: App): Promise<{ entry: UiEntry; brief: string }[] | "none" | null> {
+  const entries = listEntries();
+  const picked = await app.exclusiveInput(() =>
+    pickMulti({
+      title: t("Blend which mockups?", "Какие макеты смешать?"),
+      items: entries.map((e) => ({ value: e.slug, label: e.title, hint: e.summary })),
+    }),
+  );
+  if (!picked || picked.length < 2) {
+    if (picked?.length === 1) warn(t("Blending needs at least two — picked one.", "Для смешения нужно минимум два — выбран один."));
+    return picked ? "none" : null;
+  }
+  const parts = picked.map((s) => getEntry(s)).filter((p): p is { entry: UiEntry; brief: string } => p !== null);
+  line();
+  padded(
+    c.bold(t("Blend:", "Смешать:")) + " " + parts.map((p) => c.brightCyan(p.entry.title)).join(c.gray(" + ")),
+  );
+  const ok = await app.exclusiveInput(() =>
+    choose<"yes" | "no">(
+      [
+        { value: "yes", label: t("Generate blend", "Сгенерировать смешение"), key: "G", tone: "ok" },
+        { value: "no", label: t("Cancel", "Отмена"), key: "N", tone: "danger" },
+      ],
+      { initial: "yes", fallback: "yes", cancel: () => {} },
+    ),
+  );
+  return ok === "yes" ? parts : "none";
+}
+
+/**
+ * The blend turn: the model synthesises one style from the chosen briefs and
+ * saves it as a new library entry, going through the same propose → confirm
+ * gate as a capture. The blend itself is written into the session history by
+ * the model, so the next "нарисуй дизайн …" matches it like any other entry.
+ */
+function startBlendTurn(app: App, parts: { entry: UiEntry; brief: string }[]): void {
+  const briefs = parts.map((p) => `<source name="${p.entry.title}">\n${p.brief}\n</source>`).join("\n\n");
+  app.pendingUilibGate = (proposal) => app.confirmUiEntry(proposal);
+  app.skipNextDesignMatch = true;
+  app.turn(
+    `Blend these UI library mockups into ONE new coherent design style and save it into the trcode UI library.\n\n` +
+      `${briefs}\n\n` +
+      `Rules:\n` +
+      `- Synthesise a style, do not average: take what each source does best (palette from one, typography from ` +
+      `another, motion from a third…) and resolve their contradictions explicitly.\n` +
+      `- The result must stand on its own: someone who has never seen the sources should be able to use the brief.\n` +
+      `- Propose the entry BEFORE writing anything. Show exactly this form and stop:\n` +
+      `  slug: <short-slug>\n  title: <human label>\n  summary: <one line on the style>\n  keywords: <comma-separated>\n\n` +
+      `Then STOP and end your reply. The CLI will ask the user to confirm, edit or reject the proposal interactively.\n` +
+      `- CONFIRMED arrives with the form unchanged (or corrected, if the user edited it): write two files under ` +
+      `\`~/.trcode/ui-library/<slug>/\`: \`entry.json\` of shape\n` +
+      `{ "slug": "...", "title": "...", "summary": "...", "keywords": ["..."], "addedAt": ${Date.now()} }\n` +
+      `and \`design.md\` — the synthesized design brief, structured by palette / typography / spacing / components / motion.\n` +
+      `- REJECTED means save nothing; acknowledge in one line.`,
+  );
+}
+
+/**
+ * Pulls the four-field proposal form out of the model's reply, so a confirm
+ * can re-send exactly what was approved. Fields it never named stay blank —
+ * the user saw the same reply and confirmed it as it was.
+ */
+export function extractEntryForm(reply: string): string {
+  const fields = ["slug", "title", "summary", "keywords"];
+  const got: string[] = [];
+  for (const line of reply.split("\n")) {
+    const m = /^\s*(slug|title|summary|keywords)\s*[:=]\s*(.*)$/i.exec(line);
+    if (m && !got.some((g) => g.startsWith(`${m[1].toLowerCase()}:`))) {
+      got.push(`${m[1].toLowerCase()}: ${m[2].trim()}`);
+    }
+  }
+  const ordered = fields
+    .map((f) => got.find((g) => g.startsWith(`${f}:`)))
+    .filter((g): g is string => Boolean(g));
+  return ordered.length ? ordered.join("\n") : reply.trim();
+}
+
+/**
+ * The capture prompt: what the agent is to extract from the site and propose.
+ */
+function uilibCapturePrompt(url: string, label: string): string {
+  const name = label || new URL(url).hostname.replace(/^www\./, "");
+  return (
+    `Analyse the visual design of ${url} and save it into the trcode UI library.\n\n` +
+    `Steps:\n` +
+    `1. Map the site first, not just the landing page: fetch ${url} and look for internal pages — ` +
+    `the sitemap at <origin>/sitemap.xml (fetch returns it verbatim as XML), plus nav/footer links on the homepage. ` +
+    `Pick 4-8 representative inner pages (pricing, docs, blog, dashboard, auth, changelog…) and fetch them too: a ` +
+    `design often shows its real system on components the homepage never renders — tables, forms, empty states, ` +
+    `code blocks, badges. The landing page alone is not enough: read at least three inner pages whenever the site ` +
+    `has them, and say so explicitly when there genuinely is nothing else to open. If a page blocks fetching or is ` +
+    `client-rendered, note that in the brief instead of guessing.\n` +
+    `2. Across those pages extract the design system, not the content: colour palette with concrete values, ` +
+    `typography scale, spacing rhythm, corner radii, borders and shadows, button/input/card anatomy, and any signature ` +
+    `visual effects (animations, transitions, glows, gradients) worth copying. Fetching a raw CSS file is fine when it helps.\n` +
+    `3. Decide what kind of product this design fits (SaaS dashboard, landing, docs, terminal app…) and 5-10 keywords ` +
+    `a person would type when asking for such a design, in English and Russian ("saas, dark, dashboard, тёмный…").\n` +
+    `4. Propose the entry BEFORE writing anything. Show exactly this form and stop:\n` +
+    `   slug: <short-slug>\n   title: <human label>\n   summary: <one line on the style>\n` +
+    `   keywords: <comma-separated>\n\n` +
+    `Then STOP and end your reply. The CLI will ask the user to confirm, edit or reject the proposal interactively.\n` +
+    `- CONFIRMED arrives with the form unchanged (or corrected, if the user edited it): write two files under ` +
+    `\`~/.trcode/ui-library/<slug>/\`: \`entry.json\` of shape\n` +
+    `{ "slug": "...", "title": "...", "summary": "...", "keywords": ["..."], "source": "${url}", "addedAt": ${Date.now()} }\n` +
+    `and \`design.md\` — the design brief itself, structured by palette / typography / spacing / components / motion, ` +
+    `concrete enough to reproduce the style without seeing the original site. End it with a "Pages read" list of ` +
+    `the URLs the brief was actually taken from, marking any that could not be fetched — a brief drawn from the ` +
+    `homepage alone is worth less than one drawn from six pages, and the reader has to be able to tell which it ` +
+    `is. Then report where it was saved.\n` +
+    `- REJECTED means save nothing; acknowledge in one line.\n\n` +
+    `The entry name should mention "${name}".`
+  );
+}
+
 const COMMANDS: Command[] = [
   // ── main ────────────────────────────────────────────────────────────────
   {
     name: "/model",
     group: "main",
-    args: () => t("[name|alias|all]", "[имя|алиас|all]"),
-    help: () => t("switch model — the current provider's, or all with `all`", "сменить модель — текущего поставщика, `all` для всех"),
+    args: () => t("[name|alias|all|refresh]", "[имя|алиас|all|refresh]"),
+    help: () =>
+      t(
+        "switch model — this provider's, `all` for every one, `refresh` to re-read the catalog",
+        "сменить модель — текущего поставщика, `all` для всех, `refresh` перечитать каталог",
+      ),
     async run(app, rest) {
       const arg = rest.trim();
-      if (arg && arg !== "all") {
+      // The catalogue is cached, and a provider that has just published a
+      // model is exactly when that shows. This is what /models was for.
+      if (/^(refresh|reload|update|sync)$/i.test(arg)) {
+        await refreshCatalog(app);
+        return void hint(t("Pick one with /model.", "Выбрать: /model."));
+      }
+      if (arg && !/^all$/i.test(arg)) {
         // A name is searched across every provider: naming one is an explicit
         // enough request to cross over.
         const id = resolveModelId(arg, app.catalog);
@@ -784,25 +2145,7 @@ const COMMANDS: Command[] = [
         warnIfIncompatible(app, id);
         return;
       }
-
-      const cfg = loadConfig();
-      // Scoped to the provider in use: the other providers' models cannot be
-      // served by it, and listing them only invites a 404.
-      const provider = currentProviderId(app);
-      const scoped = arg === "all" ? app.catalog : providerModels(app, provider);
-      const catalog = scoped.length ? scoped : app.catalog;
-      const chosen = await app.exclusiveInput(() =>
-        pickModel({ catalog, current: app.session.model, defaultModel: cfg.model }),
-      );
-      if (!chosen) return;
-      setModel(app, chosen);
-      warnIfIncompatible(app, chosen);
-      const aliasFor = Object.entries(cfg.aliases).find(([, v]) => v === chosen)?.[0];
-      if (aliasFor) hint(t(`alias: /model ${aliasFor}`, `алиас: /model ${aliasFor}`));
-      if (arg !== "all" && app.catalog.length > catalog.length) {
-        hint(t(`showing ${catalog.length} from ${providerById(provider)?.label ?? provider} — /model all for every provider`, `показано ${catalog.length} у ${providerById(provider)?.label ?? provider} — /model all для всех поставщиков`));
-      }
-      if (chosen !== cfg.model) hint(t("make it the default: /default", "сделать моделью по умолчанию: /default"));
+      await modelModal(app, { all: /^all$/i.test(arg) });
     },
   },
   {
@@ -817,15 +2160,7 @@ const COMMANDS: Command[] = [
       if (parts[0] === "default") {
         const def = parts[1] ? providerById(parts[1].toLowerCase()) : providerById(currentProviderId(app));
         if (!def) return error(t(`Unknown provider: ${parts[1]}. Available: ${providers().map((p) => p.id).join(", ")}`, `Неизвестный поставщик: ${parts[1]}. Доступны: ${providers().map((p) => p.id).join(", ")}`));
-        if (!modeFor(def.id)) return error(t(`${def.label} is not connected — /provider ${def.id} connects it.`, `${def.label} не подключён — подключит /provider ${def.id}.`));
-        // The remembered model is what a new session will open on, so pin the
-        // current one when defaulting to the provider we are already using.
-        if (def.id === currentProviderId(app)) rememberCurrent(app);
-        saveConfig({ defaultProvider: def.id });
-        app.cfg = loadConfig();
-        success(t(`Default provider: ${c.brightYellow(def.label)}`, `Поставщик по умолчанию: ${c.brightYellow(def.label)}`));
-        hint(t(`New sessions start on ${providerState(def.id).model ?? defaultModelFor(app, def.id) ?? loadConfig().model}.`, `Новые сессии будут открываться на ${providerState(def.id).model ?? defaultModelFor(app, def.id) ?? loadConfig().model}.`));
-        return;
+        return setDefaultProvider(app, def);
       }
 
       // The host a key belongs to is not always the one a provider defaults
@@ -835,38 +2170,13 @@ const COMMANDS: Command[] = [
         const named = parts.slice(1).find((p) => !/^https?:\/\//i.test(p));
         const def = named ? providerById(named.toLowerCase()) : providerById(currentProviderId(app));
         if (!def) return error(t(`Unknown provider: ${named}. Available: ${providers().map((p) => p.id).join(", ")}`, `Неизвестный поставщик: ${named}. Доступны: ${providers().map((p) => p.id).join(", ")}`));
-        if (def.id === DEFAULT_PROVIDER) {
-          return error(t("TokenRouter's host lives in the config: baseUrl.", "Хост TokenRouter задаётся в конфиге: baseUrl."));
-        }
-        const given = parts.find((p) => /^https?:\/\//i.test(p));
-        const url = given ?? (await chooseHost(def, (fn) => app.exclusiveInput(fn)));
-        if (url === null) return;
-        if (url) rememberBaseUrl(def.id, url);
-        app.cfg = loadConfig();
-        app.catalog = await fetchModels({ force: true });
-        app.rebuildTools();
-        const now = modeConfig(def.id, "apikey")?.baseUrl;
-        success(t(`${def.label} host: ${now}`, `Сервер ${def.label}: ${now}`));
-        if (modeFor(def.id)) hint(t(`The key stays as it is — /login ${def.id} replaces it.`, `Ключ остаётся прежним — заменить: /login ${def.id}.`));
-        return;
+        return setProviderHost(app, def, parts.find((p) => /^https?:\/\//i.test(p)));
       }
 
       if (parts[0] === "logout") {
         const def = parts[1] ? providerById(parts[1].toLowerCase()) : undefined;
         if (!def) return error(t(`Which provider? ${others.map((p) => p.id).join(", ") || "none to disconnect"}`, `Какого поставщика? ${others.map((p) => p.id).join(", ") || "отключать нечего"}`));
-        if (def.id === DEFAULT_PROVIDER) return error(t("Remove the TokenRouter key with: trc auth logout", "Ключ TokenRouter удаляется так: trc auth logout"));
-        if (!clearCredentials(def.id)) return warn(t(`${def.label} was not connected.`, `${def.label} не был подключён.`));
-        app.catalog = await fetchModels({ force: true });
-        success(t(`${def.label} disconnected.`, `${def.label} отключён.`));
-        // The session was talking to it; leaving the model in place would only
-        // produce a 401 on the next turn.
-        if (currentProviderId(app) === def.id) {
-          app.session.model = loadConfig().model;
-          app.session.save();
-          app.rebuildTools();
-          info(t(`Model: ${app.session.model}`, `Модель: ${app.session.model}`));
-        }
-        return;
+        return logoutFromProvider(app, def);
       }
 
       if (parts[0]) {
@@ -875,11 +2185,7 @@ const COMMANDS: Command[] = [
         return switchToProvider(app, def);
       }
 
-      const chosen = await app.exclusiveInput(() =>
-        pick({ title: t("Provider", "Поставщик"), items: providerItems(app), initial: currentProviderId(app) }),
-      );
-      if (!chosen) return;
-      await switchToProvider(app, providerById(chosen)!);
+      await providerModal(app);
     },
   },
   {
@@ -1035,6 +2341,64 @@ const COMMANDS: Command[] = [
     },
   },
   {
+    name: "/uilib",
+    group: "main",
+    args: () =>
+      t(
+        "[add <site-url> | match <request> | blend | rm <slug>]  ·  bare /uilib lists the library",
+        "[add <url сайта> | match <запрос> | blend | rm <слаг>]  ·  без аргументов — список библиотеки",
+      ),
+    help: () =>
+      t(
+        "UI mockup library: capture a site's design, then reuse it in design requests",
+        "библиотека UI-макетов: сохранить дизайн сайта и потом применять его в запросах",
+      ),
+    async run(app, rest) {
+      const parts = rest.trim().split(/\s+/).filter(Boolean);
+      const sub = parts[0]?.toLowerCase();
+
+      // Capture: the agent analyses the site, proposes an entry, the user
+      // confirms or edits it. Everything interactive stays here; the agent only
+      // writes the brief it is told to write.
+      if (sub === "add" || sub === "capture") {
+        const url = parts[1];
+        if (!url || !/^https?:\/\//i.test(url)) {
+          return error(t("Give the site: /uilib add https://example.com", "Укажите сайт: /uilib add https://example.com"));
+        }
+        const label = parts.slice(2).join(" ");
+        app.pendingUilibGate = (proposal) => app.confirmUiEntry(proposal);
+        app.skipNextDesignMatch = true;
+        await app.turn(uilibCapturePrompt(url, label));
+        return;
+      }
+
+      if (sub === "rm" || sub === "remove" || sub === "delete") {
+        const slug = parts[1];
+        if (!slug) return error(t("Which one: /uilib rm <slug>", "Какой удалить: /uilib rm <слаг>"));
+        const ok = deleteEntry(slug);
+        return ok
+          ? success(t(`Removed ${slug}.`, `Удалено: ${slug}.`))
+          : error(t(`No such entry: ${slug}`, `Такого макета нет: ${slug}`));
+      }
+
+      if (sub === "match") {
+        const q = parts.slice(1).join(" ");
+        if (!q) return error(t('What to match: /uilib match "saas dashboard dark"', 'Что сопоставить: /uilib match "saas dashboard dark"'));
+        return renderMatches(app, q);
+      }
+
+      if (sub === "blend") {
+        const picked = await blendUiEntries(app);
+        if (!picked || picked === "none") return;
+        return startBlendTurn(app, picked);
+      }
+
+      if (sub) return error(t(`Unknown subcommand: ${sub}`, `Неизвестная подкоманда: ${sub}`));
+
+      await uiLibraryModal(app);
+    },
+  },
+  {
     name: "/swarm",
     group: "main",
     args: () => t("<task>", "<задача>"),
@@ -1119,6 +2483,15 @@ const COMMANDS: Command[] = [
     },
   },
   {
+    name: "/fork",
+    group: "session",
+    args: () => t("[turn]", "[ход]"),
+    help: () => t("branch the current session at a past turn; the original stays intact", "ветвление текущей сессии от прошлого хода; оригинал не трогается"),
+    async run(app, rest) {
+      await forkTurn(app, rest);
+    },
+  },
+  {
     name: "/rename",
     group: "session",
     args: () => t("[title]", "[название]"),
@@ -1142,49 +2515,13 @@ const COMMANDS: Command[] = [
       ),
     async run(app, rest) {
       const arg = rest.trim();
-      const cfg = loadConfig();
-
-      if (/^models?$/i.test(arg)) {
-        line();
-        hint(
-          t(
-            "Space marks a model, ←/→ switches provider, Enter confirms. Two or three is a panel; more is mostly repetition.",
-            "Пробел отмечает модель, ←/→ переключает поставщика, Enter подтверждает. Двух-трёх достаточно; дальше — повторы.",
-          ),
-        );
-        const picked = await app.exclusiveInput(() =>
-          pickModelsAcrossProviders({
-            catalog: app.catalog,
-            current: app.session.model,
-            defaultModel: app.session.model,
-            selected: cfg.brainModels,
-            title: t("Panel for /brain", "Совет моделей для /brain"),
-          }),
-        );
-        if (picked === null) return;
-        saveConfig({ brainModels: picked }, { replace: ["brainModels"] });
-        app.cfg = loadConfig();
-        if (!picked.length) return void success(t("Panel cleared.", "Совет очищен."));
-        return void success(
-          t(`Panel: ${picked.map(wireModelId).join(", ")}`, `Совет: ${picked.map(wireModelId).join(", ")}`),
-        );
+      if (/^models?$/i.test(arg)) return void (await brainPanelModal(app));
+      if (arg) {
+        const panel = brainPanel(app);
+        if (panel.length < 2) return void brainNeedsPanel();
+        return void (await app.runBrain(arg, panel));
       }
-
-      const panel = cfg.brainModels.filter((m) => app.catalog.some((x) => x.id === m));
-      if (panel.length < 2) {
-        error(
-          t(
-            "A panel needs at least two models that this client can reach.",
-            "Совету нужны хотя бы две модели, доступные этому клиенту.",
-          ),
-        );
-        return void hint(t("Choose them with /brain models", "Выбрать: /brain models"));
-      }
-
-      const question = arg || (await app.exclusiveInput(() => askLine(t("The question:", "Вопрос:"), "")));
-      if (!question) return;
-
-      await app.runBrain(question, panel);
+      await brainModal(app);
     },
   },
   {
@@ -1197,103 +2534,15 @@ const COMMANDS: Command[] = [
         "какие модели доступны субагентам: `model [id]` добавляет одну, `auto` сбрасывает на модель сессии",
       ),
     async run(app, rest) {
-      const provider = currentProviderId(app);
-      const cfg = loadConfig();
-      const current = cfg.subagentModels?.[provider] ?? [];
-
-      // Only what this key can actually launch a subagent on — the same rule
-      // the tool itself applies.
-      const pool = providerModels(app, provider).filter(
-        (m) => m.chatCapable !== false && servesModality(m, "text"),
-      );
+      const arg = rest.trim();
 
       // /subagents model [id] — put one more model on the list without walking
-      // the whole catalog; without an id it falls through to the chooser.
-      if (/^models?\s+\S/i.test(rest.trim())) {
-        if (!pool.length) {
-          return void error(
-            t(`${providerLabel(provider)} has no model a subagent could run on.`, `У ${providerLabel(provider)} нет моделей для субагентов.`),
-          );
-        }
-        const named = rest.trim().replace(/^models?\s+/i, "").trim();
-        let added: string;
-        try {
-          added = resolveModelId(named, app.catalog);
-        } catch (err) {
-          return void error((err as Error).message);
-        }
-        if (!pool.some((m) => m.id === added)) {
-          return void error(
-            t(
-              `${added} is not a model of ${providerLabel(provider)} a subagent could run on.`,
-              `${added} — не модель ${providerLabel(provider)}, на которой может работать субагент.`,
-            ),
-          );
-        }
-        const next = [...new Set([...current, added])];
-        saveConfig({ subagentModels: { [provider]: next } });
-        app.cfg = loadConfig();
-        app.rebuildTools();
-        return void success(
-          t(
-            `${providerLabel(provider)}: subagents also run on ${wireModelId(added)}.`,
-            `${providerLabel(provider)}: субагенты работают также на ${wireModelId(added)}.`,
-          ),
-        );
+      // the whole catalogue; without an id it falls through to the panel.
+      if (/^models?\s+\S/i.test(arg)) {
+        return void addSubagentModel(app, arg.replace(/^models?\s+/i, "").trim());
       }
-
-      if (/^(auto|reset|any|all)$/i.test(rest.trim())) {
-        const next = { ...cfg.subagentModels };
-        delete next[provider];
-        saveConfig({ subagentModels: next }, { replace: ["subagentModels"] });
-        app.cfg = loadConfig();
-        app.rebuildTools();
-        return void success(
-          t(
-            `${providerLabel(provider)}: subagents run on the session's model only.`,
-            `${providerLabel(provider)}: субагенты работают только на модели сессии.`,
-          ),
-        );
-      }
-
-      if (!pool.length) {
-        return void error(
-          t(`${providerLabel(provider)} has no model a subagent could run on.`, `У ${providerLabel(provider)} нет моделей для субагентов.`),
-        );
-      }
-
-      line();
-      hint(
-        t(
-          "Space marks the models a subagent may run on, Enter confirms. Nothing marked — the session's model only.",
-          "Пробел отмечает модели, на которых можно запускать субагентов, Enter подтверждает. Ничего не отмечено — только модель сессии.",
-        ),
-      );
-      const picked = await app.exclusiveInput(() =>
-        pickModels({
-          catalog: pool,
-          current: app.session.model,
-          defaultModel: app.session.model,
-          selected: current,
-          title: t("Models for subagents", "Модели для субагентов"),
-        }),
-      );
-      if (picked === null) return;
-
-      saveConfig({ subagentModels: { [provider]: picked } });
-      app.cfg = loadConfig();
-      app.rebuildTools();
-      if (!picked.length) {
-        return void success(
-          t(`${providerLabel(provider)}: the session's model only.`, `${providerLabel(provider)}: только модель сессии.`),
-        );
-      }
-      success(
-        t(
-          `Subagents on ${providerLabel(provider)}: ${picked.map(wireModelId).join(", ")}`,
-          `Субагенты у ${providerLabel(provider)}: ${picked.map(wireModelId).join(", ")}`,
-        ),
-      );
+      if (/^(auto|reset|any|all)$/i.test(arg)) return void resetSubagentModels(app);
+      await subagentsModal(app);
     },
   },
   {
@@ -1529,163 +2778,52 @@ const COMMANDS: Command[] = [
     group: "session",
     help: () => t("usage by provider and model, with period filters", "расход по провайдерам и моделям, с фильтром по периоду"),
     async run(app) {
-      /** Every stored request row; per-model rows keep their lastUsed. */
-      const loadAll = (): ModelUsage[] => {
-        const out: ModelUsage[] = [];
-        let dir: string;
-        try {
-          dir = sessionsDir(app.cwd);
-        } catch {
-          return [];
-        }
-        for (const n of fs.readdirSync(dir)) {
-          if (!n.endsWith(".json")) continue;
-          try {
-            const data = JSON.parse(fs.readFileSync(path.join(dir, n), "utf8"));
-            for (const u of data.usage ?? []) out.push(u);
-          } catch {
-            /* skip corrupt files */
-          }
-        }
-        // The live session's numbers are fresher than its last save: its rows
-        // replace whatever the file on disk still holds.
-        return out.filter((u) => !app.usage.all().some((l) => l.model === u.model)).concat(app.usage.all());
-      };
-
-      const PERIODS = [
-        { value: "today" as const, label: "Today", key: "t" },
-        { value: "week" as const, label: "Week", key: "w" },
-        { value: "month" as const, label: "Month", key: "m" },
-        { value: "all" as const, label: "All time", key: "a" },
-      ];
-      const sinceOf = (p: (typeof PERIODS)[number]["value"]): number => {
-        if (p === "all") return 0;
-        const d = new Date();
-        if (p === "today") d.setHours(0, 0, 0, 0);
-        else if (p === "week") d.setDate(d.getDate() - 7);
-        else d.setDate(d.getDate() - 30);
-        return d.getTime();
-      };
-
-      const all = loadAll();
+      await statModal(app);
+    },
+  },
+  {
+    name: "/trace",
+    group: "session",
+    args: () => "[n]",
+    help: () => t("what the model was sent on each step: system, schemas, history, injected", "что уходило модели на каждом шаге: промпт, схемы, история, инъекции"),
+    async run(app, rest) {
+      const all = loadProjections(app.cwd, app.session.id);
       line();
-      rule(c.brightCyan(" usage "));
+      rule(c.brightCyan(" request trace "));
       if (!all.length) {
-        hint("No usage recorded yet.");
+        hint(t(
+          "No requests logged yet — projections appear after the first turn of this session.",
+          "Запросов ещё не было — проекции появятся после первого хода этой сессии.",
+        ));
         line();
         return;
       }
-
-      /** Folds raw per-session rows into one ModelUsage per model. */
-      const fold = (rows: ModelUsage[]): Map<string, ModelUsage> => {
-        const m = new Map<string, ModelUsage>();
-        for (const u of rows) {
-          const e = m.get(u.model) ?? { ...u };
-          for (const k of ["requests", "input", "output", "cached", "reasoning", "costUsd"] as const) e[k] += u[k];
-          e.priceUnknown = e.priceUnknown || u.priceUnknown;
-          e.lastUsed = Math.max(e.lastUsed ?? 0, u.lastUsed ?? 0);
-          m.set(u.model, e);
-        }
-        return m;
-      };
-
-      const totalsLine = (rows: Map<string, ModelUsage>): void => {
-        let input = 0, output = 0, cached = 0, reasoning = 0, cost = 0, reqs = 0, unknown = false, models = 0;
-        for (const u of rows.values()) {
-          input += u.input; output += u.output; cached += u.cached;
-          reasoning += u.reasoning ?? 0; cost += u.costUsd; reqs += u.requests;
-          models++;
-          unknown = unknown || u.priceUnknown;
-        }
-        const fresh = Math.max(0, input - cached);
-        padded(
-          `${c.gray("models")} ${String(models).padStart(4)}  ${c.gray("reqs")} ${String(reqs).padStart(5)}  ` +
-            `${c.gray("↑")} ${fmtTokens(fresh)} ${c.gray(`(${cached && input ? Math.round((cached / input) * 100) : 0}% cached)`.padEnd(13))}` +
-            `${c.gray("↓")} ${fmtTokens(output)}  ` +
-            `${c.gray("cost")} ${c.bold(fmtCost(cost, unknown))}`,
-        );
-      };
-
-      // Overview first: everything on record.
-      totalsLine(fold(all));
-      hint(t("input* is fresh tokens only, cache reads are in the cached column.", "input* — только чистые токены, чтения из кеша — в колонке cached."));
-
-      const renderTable = (rows: Map<string, ModelUsage>): void => {
-        const byProvider = new Map<string, ModelUsage[]>();
-        for (const u of rows.values()) {
-          const pid = splitModelId(u.model).providerId;
-          (byProvider.get(pid) ?? byProvider.set(pid, []).get(pid)!).push(u);
-        }
-        const row =
-          (label: string, u: { requests: number; input: number; cached: number; output: number; reasoning: number }) =>
-            `${label.padEnd(32)} ${String(u.requests).padStart(5)} ${fmtTokens(Math.max(0, u.input - u.cached)).padStart(9)} ` +
-            `${(u.cached ? fmtTokens(u.cached) : "—").padStart(9)} ${fmtTokens(u.output).padStart(9)} ` +
-            `${(u.reasoning ? fmtTokens(u.reasoning) : "—").padStart(10)}`;
-        const header =
-          c.gray(`${"model".padEnd(32)} ${"reqs".padStart(5)} ${"input*".padStart(9)} ${"cached".padStart(9)} ${"output".padStart(9)} ${"reasoning".padStart(10)}`);
-        for (const pid of [...byProvider.keys()].sort()) {
-          line();
-          padded(c.bold(c.brightBlue(providerLabel(pid))));
-          padded(header);
-          let cost = 0;
-          let unknown = false;
-          const list = byProvider.get(pid)!;
-          for (const u of list) {
-            padded(row(u.model.includes(":") ? u.model.slice(u.model.indexOf(":") + 1) : u.model, u));
-            cost += u.costUsd;
-            unknown = unknown || u.priceUnknown;
-          }
-          const sub = list.reduce(
-            (a, u) => ({
-              requests: a.requests + u.requests,
-              input: a.input + u.input,
-              cached: a.cached + u.cached,
-              output: a.output + u.output,
-              reasoning: a.reasoning + (u.reasoning ?? 0),
-            }),
-            { requests: 0, input: 0, cached: 0, output: 0, reasoning: 0 },
-          );
-          padded(c.gray("─".repeat(Math.min(80, contentWidth()))));
-          padded(c.gray(row("subtotal", sub)) + c.gray(`   cost ${fmtCost(cost, unknown)}`));
-        }
-      };
-
-      // Drill down: pick a period, then a provider. Esc keeps it closed.
-      const period = await choose(PERIODS.map((p) => ({ ...p, label: p.label === "All time" ? t("All time", "Всё время") : p.value === "today" ? t("Today", "Сегодня") : p.value === "week" ? t("Week", "Неделя") : t("Month", "Месяц"), key: p.key })), {
-        fallback: "all",
-        initial: "all",
-        cancel: () => {},
-      });
-      const since = sinceOf(period);
-
-      const inPeriod = all.filter((u) => !u.lastUsed || u.lastUsed >= since);
-      const folded = fold(inPeriod);
-      if (!folded.size) {
-        line();
-        hint(t("No usage in this period.", "За этот период расхода нет."));
-        line();
-        return;
-      }
-
-      const providers = [...new Set([...folded.values()].map((u) => splitModelId(u.model).providerId))].sort();
-      const provChoices = [
-        ...(providers.length > 1
-          ? [{ value: "__all__" as const, label: t("All providers", "Все провайдеры"), key: "A" }]
-          : []),
-        ...providers.map((pid) => ({ value: pid, label: providerLabel(pid), key: pid[0]?.toUpperCase() })),
-      ];
-      const picked = providers.length > 1
-        ? await choose(provChoices, { fallback: "__all__", initial: "__all__", cancel: () => {} })
-        : providers[0];
-
-      line();
-      const periodLabel = period === "today" ? t("today", "сегодня") : period === "week" ? t("last 7 days", "7 дней") : period === "month" ? t("last 30 days", "30 дней") : t("all time", "всё время");
-      rule(c.brightCyan(` ${periodLabel} `));
-      renderTable(
-        picked === "__all__"
-          ? folded
-          : new Map([...folded].filter(([model]) => splitModelId(model).providerId === picked)),
+      const n = Math.max(1, Math.min(50, Number.parseInt(rest, 10) || 10));
+      const rows = all.slice(-n);
+      padded(
+        c.gray(
+          `${"step".padStart(4)} ${"time".padStart(8)} ${"system".padStart(8)} ${"schemas".padStart(8)} ` +
+            `${"history".padStart(9)} ${"injected".padStart(9)} ${"trim→".padStart(7)} ${"cached".padStart(7)} ${"model"}`,
+        ),
       );
+      for (const p of rows) {
+        const inj = p.injected.length ? fmtTokens(p.injected.reduce((s, i) => s + i.tokens, 0)) : "—";
+        const time = new Date(p.ts).toTimeString().slice(0, 5);
+        const cached = p.cachedTokens ? fmtTokens(p.cachedTokens) : "—";
+        padded(
+          `${String(p.step).padStart(4)} ${time.padStart(8)} ${fmtTokens(p.systemTokens).padStart(8)} ` +
+            `${fmtTokens(p.schemaTokens).padStart(8)} ${fmtTokens(p.historyTokens).padStart(9)} ` +
+            `${inj.padStart(9)} ${(p.trimmed ? `-${fmtTokens(p.trimSaved)}` : "—").padStart(7)} ` +
+            `${cached.padStart(7)} ${c.gray(p.model)}`,
+        );
+      }
+      // The injected column hides what it was; name it when there is anything.
+      const sources = new Set(rows.flatMap((p) => p.injected.map((i) => i.source)));
+      if (sources.size) hint(t(`Injected: ${[...sources].join(", ")}.`, `Инъекции: ${[...sources].join(", ")}.`));
+      hint(t(
+        "~estimates per request; history is what travelled after trim. /trace <n> for more steps.",
+        "~оценки на запрос; history — то, что ушло после trim. /trace <n> — больше шагов.",
+      ));
       line();
     },
   },
@@ -1788,68 +2926,6 @@ const COMMANDS: Command[] = [
       app.session.save();
       success(t(`Default model: ${c.brightYellow(target)}`, `Модель по умолчанию: ${c.brightYellow(target)}`));
       hint(`Written to ${configPath()}. Applies to this session too.`);
-    },
-  },
-  {
-    name: "/models",
-    group: "settings",
-    args: "[all]",
-    help: () => t("catalog of the current provider, by vendor — `all` for every provider", "каталог текущего поставщика по вендорам — `all` для всех"),
-    async run(app, rest) {
-      const showAll = /^all$/i.test(rest.trim());
-      const sp = new Spinner("fetching the model catalog");
-      sp.start();
-      app.catalog = await fetchModels({ force: true });
-      sp.stop();
-      app.rebuildTools();
-
-      // Scoped like /model: the other providers cannot serve this session, so
-      // listing them among the ones that can is a way to pick a 404.
-      const provider = currentProviderId(app);
-      const mine = providerModels(app, provider);
-      const pool = showAll || !mine.length ? app.catalog : mine;
-      const shown = pool;
-      // The routing prefix is dropped: within one provider every row carries
-      // the same one, and across providers the host gets its own column rather
-      // than a repeated prefix in front of every name.
-      const bare = (id: string) => splitModelId(id).model;
-      const hosts = new Set(shown.map((m) => splitModelId(m.id).providerId));
-      const width = Math.min(34, Math.max(12, ...shown.map((m) => bare(m.id).length + 1)));
-
-      // Type first, vendor inside it — the same split the catalog tags models
-      // with. Only the text section can serve a session, so it comes first and
-      // the rest are named for what they are rather than hidden as a count.
-      for (const type of groupByModality(shown)) {
-        line();
-        padded(c.bold(c.brightYellow(`[${type.label}]`)) + c.gray(`  ${type.models.length}`));
-        for (const group of groupByVendor(type.models)) {
-          line();
-          padded(c.gray("──── ") + c.bold(c.brightBlue(group.vendor)) + c.gray(" " + "─".repeat(Math.max(2, 30 - group.vendor.length))));
-          for (const m of group.models) {
-            const cur = m.id === app.session.model ? c.brightCyan("❯ ") : "  ";
-            const why = incompatibleReason(m);
-            const ctxWin = m.contextWindow ? `ctx ${fmtTokens(m.contextWindow)}` : "";
-            const host = hosts.size > 1 ? providerLabel(splitModelId(m.id).providerId) : "";
-            const tail = why ? c.red(why) : "";
-            padded(`${cur}${bare(m.id).padEnd(width)} ${c.gray(ctxWin.padEnd(11))} ${c.dim(host.padEnd(14))} ${tail}`);
-          }
-        }
-      }
-
-      line();
-      const byType = groupByModality(shown)
-        .map((g) => `${g.label}: ${g.models.length}`)
-        .join(" · ");
-      info(
-        showAll
-          ? `${shown.length} models, every provider — ${byType}`
-          : `${shown.length} models at ${providerLabel(provider)} — ${byType}`,
-      );
-      const unusable = shown.length - usableModels(shown).length;
-      if (unusable > 0) hint(`${unusable} of them cannot be driven from here — the reason is on the row`);
-      if (!showAll && app.catalog.length > pool.length) {
-        hint(`${app.catalog.length - pool.length} more at other providers — /models all · switch with /provider`);
-      }
     },
   },
   {
@@ -2040,14 +3116,8 @@ const COMMANDS: Command[] = [
       const sub = parts[0]?.toLowerCase();
 
       if (sub === "on" || sub === "off") {
-        app.cfg = saveConfig({ skillsEnabled: sub === "on" });
-        app.rebuildTools();
-        if (sub === "on") {
-          success(t("Skills are on — the catalog and the skill tool join every request.", "Навыки включены — каталог и тулз skill добавляются в каждый запрос."));
-          hint(t(`Off again with: /skills off.`, `Выключить обратно: /skills off.`));
-        } else {
-          success(t("Skills are off — they no longer cost tokens on requests.", "Навыки выключены — они больше не тратят токены в запросах."));
-        }
+        setSkillsEnabled(app, sub === "on");
+        if (sub === "on") hint(t("Off again with: /skills off.", "Выключить обратно: /skills off."));
         return;
       }
 
@@ -2072,29 +3142,7 @@ const COMMANDS: Command[] = [
       }
 
       if (sub === "edit") {
-        const name = parts[1];
-        const skill = app.skills.find((s) => s.name === name);
-        if (!skill) return error(t(`Skill not found: ${name ?? "(no name given)"}`, `Навык не найден: ${name ?? "(имя не указано)"}`));
-        const file = path.join(skill.dir, "SKILL.md");
-        const editor = process.env.VISUAL || process.env.EDITOR;
-        if (!editor) {
-          info(file);
-          hint("EDITOR is not set — open the file in your own editor.");
-          return;
-        }
-        await app.exclusiveInput(
-          () =>
-            new Promise<void>((resolve) => {
-              const child = spawn(editor, [file], { stdio: "inherit" });
-              child.on("close", () => resolve());
-              child.on("error", (err: Error) => {
-                error(t(`Could not launch ${editor}: ${err.message}`, `Не удалось запустить ${editor}: ${err.message}`));
-                resolve();
-              });
-            }),
-        );
-        app.rebuildTools();
-        success(t("Skills reloaded.", "Навыки перечитаны."));
+        await editSkill(app, parts[1] ?? null);
         return;
       }
 
@@ -2123,50 +3171,51 @@ const COMMANDS: Command[] = [
       if (sub === "gen") {
         const task = parts.slice(1).join(" ");
         if (!task) return error(t("Describe the task: /skills gen review pull requests", "Опишите задачу: /skills gen ревью пул-реквестов"));
-        await app.turn(
-          `Write a trcode skill for this task: "${task}".\n\n` +
-            `A skill is a folder .trcode/skills/<name>/SKILL.md with frontmatter:\n` +
-            `---\nname: <short-name>\ndescription: <WHEN to apply it, one sentence>\n` +
-            `triggers: <comma-separated words a user would type for this, in every language they work in>\n---\n\n` +
-            `Study the repository first so the procedure rests on this project's real commands and files ` +
-            `rather than generalities. The body is a concrete procedure, what not to do, and the answer format. ` +
-            `Keep it under 50 lines. Create the file with write.`,
-        );
+        await app.turn(skillGenPrompt(task));
         app.rebuildTools();
         return;
       }
 
-      app.rebuildTools();
-      if (!app.skills.length) {
-        info(t("No skills yet.", "Навыков пока нет."));
-        hint("Scaffold one: /skills new <name> [description]");
-        hint("Or let the agent write it: /skills gen <task to automate>");
-        return;
+      await skillsModal(app);
+    },
+  },
+  {
+    name: "/preset",
+    group: "other",
+    args: () => t("[standard | minimal]", "[standard | minimal]"),
+    help: () => t("tool set for this session: full or just shell+edit", "набор инструментов сессии: полный или только shell+edit"),
+    async run(app, rest) {
+      const want = rest.trim().toLowerCase();
+      if (want && !["standard", "minimal"].includes(want)) {
+        return error(t("Use: /preset standard | minimal", "Использование: /preset standard | minimal"));
       }
-      const enabled = app.cfg.skillsEnabled === true;
-      line();
-      const autoOn = app.cfg.skillAuto !== false;
-      for (const s of app.skills) {
-        const scope = s.scope === "project" ? c.brightGreen("project") : c.gray("global");
-        const mark = enabled && autoOn && s.auto && s.triggers.length ? c.brightYellow("⚡") : " ";
-        const loaded = enabled && app.loadedSkills.has(s.name) ? c.green(" ·loaded") : "";
-        padded(
-          `${mark} ${c.bold(s.name.padEnd(20))} ${scope.padEnd(20)}${loaded} ` +
-            c.dim(truncate(s.description, contentWidth() - 50)),
+      const target = (want || "standard") as "standard" | "minimal";
+      if (!want) {
+        info(
+          t(
+            `Preset: ${app.preset}. /preset minimal keeps only shell and edit; /preset standard brings everything back.`,
+            `Пресет: ${app.preset}. /preset minimal оставляет только shell и edit; /preset standard возвращает всё.`,
+          ),
         );
-      }
-      line();
-      if (!enabled) {
-        warn(t("Skills are off — they are not sent with requests.", "Навыки выключены — в запросы они не отправляются."));
-        hint(t("Turn them on when you need them: /skills on", "Включить, когда понадобятся: /skills on"));
         return;
       }
-      hint(
-        `⚡ = fires by itself on its trigger words (auto-selection is ${autoOn ? "on" : "off"}: /skills auto ${autoOn ? "off" : "on"}).`,
-      );
-      hint("Anything else the model loads itself when the task matches the description.");
-      hint("New: /skills new <name> · Edit: /skills edit <name> · Generate: /skills gen <task>");
-      hint(t("Turn off to stop paying for them: /skills off", "Выключить, чтобы не платить за них: /skills off"));
+      if (target === app.preset) {
+        return info(t(`Already on ${target}.`, `Уже включён ${target}.`));
+      }
+      app.presetOverride = target;
+      // The preset decides both halves of a request: the tool list and the
+      // base prompt. Both changed, so the cached prefix is void either way —
+      // saying it beats the user wondering why the next request billed fresh.
+      app.rebuildTools();
+      resetPromptSnapshots();
+      app.session.save();
+      if (target === "minimal") {
+        success(t("Minimal preset: two tools (shell, edit) and a short prompt.", "Минимальный пресет: два инструмента (shell, edit) и короткий промпт."));
+        hint(t("Back with: /preset standard", "Вернуть: /preset standard"));
+      } else {
+        success(t("Standard preset: the full tool set and prompt are back.", "Стандартный пресет: полный набор инструментов и промпт возвращены."));
+      }
+      warn(t("The prompt changed — the next request rebuilds the cache from scratch.", "Промпт сменился — следующий запрос соберёт кэш заново."));
     },
   },
   {

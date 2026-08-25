@@ -1,6 +1,14 @@
 /** The /model chooser: modality tabs, vendor sections, newest first. */
 import { c } from "./ansi.js";
-import { pick, pickMulti, type PickerItem, type PickerTab } from "./picker.js";
+import {
+  openModal,
+  pick,
+  pickMulti,
+  type ModalAction,
+  type ModalResult,
+  type PickerItem,
+  type PickerTab,
+} from "./picker.js";
 import { fmtTokens } from "../usage.js";
 import { MODALITIES, groupByVendor, incompatibleReason, servesModality, usableModels } from "../provider/models.js";
 import { providerLabel, splitModelId, wireModelId } from "../provider/registry.js";
@@ -12,6 +20,12 @@ export interface ModelPickerOptions {
   defaultModel: string;
   /** Heading for the list; the default names it "Models". */
   title?: string;
+  /** One line under the title — what this list is scoped to, usually. */
+  subtitle?: string;
+  /** Buttons along the foot of the panel. */
+  actions?: ModalAction[];
+  /** Multi-select only: Enter with nothing marked answers with an empty set. */
+  allowEmpty?: boolean;
   /** Show every modality, including models this client cannot drive. */
   includeIncompatible?: boolean;
 }
@@ -56,25 +70,44 @@ function rowsFor(opts: ModelPickerOptions, modality: string): PickerItem[] {
   return rows;
 }
 
-export async function pickModel(opts: ModelPickerOptions): Promise<string | null> {
+/** Tabs by output type, counted, with the empty ones dropped. */
+function modalityTabs(opts: ModelPickerOptions): PickerTab[] {
   const counts = new Map<string, number>();
   for (const mo of MODALITIES) {
     const n = opts.catalog.filter((m) => servesModality(m, mo.key)).length;
     if (n) counts.set(mo.key, n);
   }
-
-  const tabs: PickerTab[] = MODALITIES.filter((mo) => counts.get(mo.key)).map((mo) => ({
+  return MODALITIES.filter((mo) => counts.get(mo.key)).map((mo) => ({
     key: mo.key,
     label: mo.label,
     count: mo.key === "text" && !opts.includeIncompatible ? usableModels(opts.catalog).length : counts.get(mo.key),
   }));
+}
 
+/**
+ * The panel itself, buttons and all. The caller loops on the result: a button
+ * changes what the list is showing and the panel comes straight back up, so
+ * refreshing a catalogue or widening the scope never costs a re-typed command.
+ */
+export function openModelModal(opts: ModelPickerOptions): Promise<ModalResult | null> {
   const currentModality = opts.catalog.find((m) => m.id === opts.current)?.modality ?? "text";
-
-  return pick({
-    title: "Models",
-    tabs,
+  return openModal({
+    title: opts.title ?? "Models",
+    subtitle: opts.subtitle,
+    tabs: modalityTabs(opts),
     initialTab: currentModality,
+    initial: opts.current,
+    actions: opts.actions,
+    items: (tabKey) => rowsFor(opts, tabKey || "text"),
+  });
+}
+
+export async function pickModel(opts: ModelPickerOptions): Promise<string | null> {
+  return pick({
+    title: opts.title ?? "Models",
+    subtitle: opts.subtitle,
+    tabs: modalityTabs(opts),
+    initialTab: opts.catalog.find((m) => m.id === opts.current)?.modality ?? "text",
     initial: opts.current,
     items: (tabKey) => rowsFor(opts, tabKey || "text"),
   });
@@ -87,9 +120,28 @@ export async function pickModel(opts: ModelPickerOptions): Promise<string | null
 export async function pickModels(opts: ModelPickerOptions & { selected?: string[] }): Promise<string[] | null> {
   return pickMulti({
     title: opts.title ?? "Models",
+    subtitle: opts.subtitle,
     items: rowsFor(opts, "text"),
     initial: opts.current,
     selected: opts.selected,
+    allowEmpty: opts.allowEmpty,
+    actions: opts.actions,
+  });
+}
+
+/** The multi-select panel with its buttons, for callers that act on them. */
+export function openModelsModal(
+  opts: ModelPickerOptions & { selected?: string[] },
+): Promise<ModalResult | null> {
+  return openModal({
+    title: opts.title ?? "Models",
+    subtitle: opts.subtitle,
+    items: rowsFor(opts, "text"),
+    initial: opts.current,
+    selected: opts.selected,
+    allowEmpty: opts.allowEmpty,
+    actions: opts.actions,
+    multi: true,
   });
 }
 
@@ -113,10 +165,13 @@ export async function pickModelsAcrossProviders(
 
   return pickMulti({
     title: opts.title ?? "Models",
+    subtitle: opts.subtitle,
     tabs,
     initialTab: providers.includes(here) ? here : providers[0],
     initial: opts.current,
     selected: opts.selected,
+    allowEmpty: opts.allowEmpty,
+    actions: opts.actions,
     items: (tabKey) =>
       rowsFor(
         { ...opts, catalog: text.filter((m) => splitModelId(m.id).providerId === (tabKey || providers[0])) },

@@ -36,6 +36,7 @@ interface Args {
   prompt?: string;
   model?: string;
   effort?: Effort;
+  preset?: "standard" | "minimal";
   baseUrl?: string;
   cwd: string;
   headless: boolean;
@@ -382,6 +383,7 @@ function maskKey(key: string): string {
 async function headless(args: Args): Promise<number> {
   const app = new App({ cwd: args.cwd, model: args.model, autoApprove: args.autoApprove });
   app.broker.interactive = false;
+  if (args.preset) app.presetOverride = args.preset;
   await app.init();
   if (args.effort) app.effortOverride = args.effort;
 
@@ -519,6 +521,7 @@ async function main(): Promise<void> {
   }
 
   const app = new App({ cwd: args.cwd, model: args.model, autoApprove: args.autoApprove, session });
+  if (args.preset) app.presetOverride = args.preset;
   await app.init();
   if (args.effort) app.effortOverride = args.effort;
 

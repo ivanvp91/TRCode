@@ -1,9 +1,32 @@
-/** Interactive list picker: arrow keys, type-to-filter, sections, tabs. */
+/**
+ * The modal chooser: a bordered panel with a search field, optional sections,
+ * a scrolling list and a row of buttons.
+ *
+ * Everything a command used to print as a wall of text — a catalogue, a list
+ * of skills, the models a subagent may use — is shown here instead, and the
+ * sub-commands that used to be typed (`add`, `auto`, `refresh`) are the
+ * buttons along the bottom. They stay commands on the command line; the panel
+ * is for the times you do not remember which word it was.
+ */
 import { t } from "../i18n.js";
-import { c, clipAnsi, cursor } from "./ansi.js";
+import { c, clipAnsi, cursor, width } from "./ansi.js";
 import { contentWidth, indent } from "./layout.js";
 import { line, out } from "./render.js";
 import { pushConsumer } from "./stdin.js";
+import {
+  innerWidth,
+  modalBottom,
+  modalButtons,
+  modalField,
+  modalFooter,
+  modalKeys,
+  modalRow,
+  modalSearchPlaceholder,
+  modalSep,
+  modalTabs,
+  modalTop,
+  type ModalAction,
+} from "./modal.js";
 
 const CTRL_C = String.fromCharCode(3);
 const CTRL_U = String.fromCharCode(21);
@@ -14,9 +37,12 @@ const UP = ESC + "[A";
 const DOWN = ESC + "[B";
 const RIGHT = ESC + "[C";
 const LEFT = ESC + "[D";
+const SHIFT_TAB = ESC + "[Z";
 const TAB = String.fromCharCode(9);
 /** Written this way so the source file stays plain text. */
 const CONTROL_CHARS = new RegExp("[" + String.fromCharCode(0) + "-" + String.fromCharCode(31) + DEL + "]", "g");
+
+export type { ModalAction };
 
 export interface PickerItem {
   value: string;
@@ -42,11 +68,40 @@ export interface PickerOptions {
   initialTab?: string;
   initial?: string;
   pageSize?: number;
+  /** Buttons along the foot of the panel — the typed sub-commands, clickable. */
+  actions?: ModalAction[];
+  /** One line of explanation under the title. */
+  subtitle?: string;
+  /**
+   * Already-styled rows drawn between the subtitle and the list — a totals
+   * line, a legend. Passed through untouched, so the caller keeps its colours.
+   */
+  notes?: string[] | ((tabKey: string) => string[]);
+  /**
+   * A panel that reports rather than asks: no cursor on the rows, Enter
+   * closes it. The arrows still scroll, and the buttons still work.
+   */
+  readOnly?: boolean;
+  /** Force the search field on or off; by default it appears for long lists. */
+  search?: boolean;
+  /** Shown in place of the list when there is nothing to show. */
+  empty?: string;
+  /**
+   * Multi-select only: Enter with nothing marked answers with an empty set
+   * rather than the row under the cursor. For the lists where "none" is a
+   * real answer — no panel, no extra subagent models — and not an accident.
+   */
+  allowEmpty?: boolean;
 }
+
+/** What the panel was closed with. */
+export type ModalResult =
+  | { kind: "item"; value: string; values: string[]; tab: string }
+  | { kind: "action"; id: string; value: string | null; values: string[]; tab: string };
 
 /** Returns the chosen value, or null when cancelled. */
 export function pick(opts: PickerOptions): Promise<string | null> {
-  return run(opts, false) as Promise<string | null>;
+  return openModal(opts).then((r) => (r && r.kind === "item" ? r.value : null));
 }
 
 /**
@@ -55,29 +110,43 @@ export function pick(opts: PickerOptions): Promise<string | null> {
  * used for one thing does not need a different key to answer with one thing.
  */
 export function pickMulti(opts: PickerOptions & { selected?: string[] }): Promise<string[] | null> {
-  return run(opts, true) as Promise<string[] | null>;
+  return openModal({ ...opts, multi: true }).then((r) => (r && r.kind === "item" ? r.values : null));
 }
 
-function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Promise<string | string[] | null> {
+/**
+ * The full panel: the answer is either a row or a button, and the caller
+ * decides what to do about either. A button carries the row that was under
+ * the cursor, because "delete" and "edit" are about the row you are looking at.
+ */
+export function openModal(
+  opts: PickerOptions & { multi?: boolean; selected?: string[] },
+): Promise<ModalResult | null> {
   const stdin = process.stdin;
+  const multi = opts.multi === true;
   const tabs = opts.tabs ?? [];
+  const actions = (opts.actions ?? []).filter(Boolean);
   const resolveItems = (tabKey: string): PickerItem[] =>
     typeof opts.items === "function" ? opts.items(tabKey) : opts.items;
 
-  let tabIndex = Math.max(0, tabs.findIndex((t) => t.key === opts.initialTab));
+  let tabIndex = Math.max(0, tabs.findIndex((tab) => tab.key === opts.initialTab));
   if (!tabs.length) tabIndex = 0;
 
   if (!stdin.isTTY) return Promise.resolve(null);
   const chosen = new Set<string>(opts.selected ?? []);
 
   return new Promise((resolve) => {
-    // Chrome above and below the page: title, tabs, search field, key hints
-    // and the position counter.
-    const pageSize = Math.min(opts.pageSize ?? 14, Math.max(4, (process.stdout.rows || 24) - 10));
     let filter = "";
     let all: PickerItem[] = resolveItems(tabs[tabIndex]?.key ?? "");
     let index = 0;
     let rendered = 0;
+    /** The list owns the keyboard until Tab hands it to the buttons. */
+    let focus: "list" | "buttons" = "list";
+    let buttonIdx = actions.findIndex((a) => !a.disabled);
+    if (buttonIdx < 0) buttonIdx = 0;
+
+    const totalItems = () => all.filter((it) => !it.header).length;
+    /** Short lists are their own index; a field over four rows is clutter. */
+    const searchOn = () => opts.search ?? totalItems() > 4;
 
     /**
      * Every word has to appear somewhere in the row, in any order: with 500
@@ -85,7 +154,7 @@ function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Pro
      * and a plain substring search finds nothing for it.
      */
     const matches = (it: PickerItem, words: string[]): boolean => {
-      const hay = `${it.label} ${it.value}`.toLowerCase();
+      const hay = `${it.label} ${it.value} ${it.hint ?? ""}`.toLowerCase();
       return words.every((w) => hay.includes(w));
     };
 
@@ -129,6 +198,13 @@ function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Pro
       index = sel[(at + dir + sel.length) % sel.length];
     };
 
+    const moveButton = (dir: 1 | -1) => {
+      const usable = actions.map((a, i) => (a.disabled ? -1 : i)).filter((i) => i !== -1);
+      if (!usable.length) return;
+      const at = usable.indexOf(buttonIdx);
+      buttonIdx = usable[(at + dir + usable.length) % usable.length];
+    };
+
     const switchTab = (dir: 1 | -1) => {
       if (tabs.length < 2) return;
       tabIndex = (tabIndex + dir + tabs.length) % tabs.length;
@@ -136,6 +212,11 @@ function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Pro
       filter = "";
       index = 0;
       syncIndex(visible());
+    };
+
+    const currentValue = (): string | null => {
+      const item = visible()[index];
+      return item && !item.header ? item.value : null;
     };
 
     const clear = () => {
@@ -151,67 +232,92 @@ function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Pro
       const rows = visible();
       syncIndex(rows);
       const w = contentWidth();
+      const inner = innerWidth(w);
       const buf: string[] = [];
 
-      buf.push(c.bold(opts.title));
-      if (tabs.length) {
-        const strip = tabs
-          .map((t, i) => {
-            const text = ` ${t.label}${t.count !== undefined ? ` ${t.count}` : ""} `;
-            return i === tabIndex ? c.inverse(c.bold(text)) : c.gray(`[${text.trim()}]`);
-          })
-          .join(" ");
-        buf.push(strip + c.gray("   ←/→ or Tab to switch type"));
+      buf.push(modalTop(w, opts.title));
+      buf.push(modalRow(w));
+      if (opts.subtitle) {
+        for (const l of wrapPlain(opts.subtitle, inner)) buf.push(modalRow(w, c.dim(l)));
+        buf.push(modalRow(w));
       }
-      // The search field sits above the list, where the typing goes. Hiding it
-      // in the footer made a long list look unsearchable — the whole point is
-      // that it is visible before anyone thinks to try typing into it.
+      const notes = typeof opts.notes === "function" ? opts.notes(tabs[tabIndex]?.key ?? "") : opts.notes;
+      if (notes?.length) {
+        for (const l of notes) buf.push(modalRow(w, l));
+        buf.push(modalRow(w));
+      }
+      for (const l of modalTabs(w, tabs, tabIndex)) buf.push(l);
+
       const matched = selectableIdx(rows).length;
-      const totalItems = all.filter((it) => !it.header).length;
-      const counter = filter ? `${matched}/${totalItems}` : String(totalItems);
-      const field = filter
-        ? c.brightYellow(filter) + c.brightCyan("▏")
-        : c.dim(t("search — just type", "поиск — просто печатайте"));
-      const searchWidth = Math.max(10, w - counter.length - 6);
-      buf.push(c.brightCyan("⌕ ") + clipAnsi(field, searchWidth).padEnd(0) + c.gray(`  ${counter}`));
-      buf.push(
-        c.gray(
-          multi
-            ? t(
-                "↑↓ move · Space mark · Enter confirm · Esc cancel · ^U clear",
-                "↑↓ выбор · Пробел отметить · Enter подтвердить · Esc отмена · ^U очистить",
-              )
-            : t(
-                "↑↓ move · Enter select · Esc cancel · ^U clear",
-                "↑↓ выбор · Enter выбрать · Esc отмена · ^U очистить",
-              ),
-        ),
-      );
+      const counter = filter ? `${matched}/${totalItems()}` : String(totalItems());
+      if (searchOn()) {
+        for (const l of modalField(w, {
+          text: filter,
+          placeholder: modalSearchPlaceholder(),
+          counter,
+          focused: focus === "list",
+        })) {
+          buf.push(l);
+        }
+        buf.push(modalRow(w));
+      }
+
+      // What is left for the list once the chrome above and below is counted.
+      const buttonRows = modalButtons(w, actions, focus === "buttons" ? buttonIdx : null);
+      const chromeBelow = 1 /* pad */ + (buttonRows.length ? buttonRows.length + 1 : 0) + 1 /* footer */ + 1 /* bottom */;
+      const room = Math.max(4, (process.stdout.rows || 24) - buf.length - chromeBelow - 3);
+      const pageSize = Math.min(opts.pageSize ?? 14, room);
 
       // Keep the cursor roughly centred without slicing off headers.
       const start = Math.max(0, Math.min(index - Math.floor(pageSize / 2), Math.max(0, rows.length - pageSize)));
       const page = rows.slice(start, start + pageSize);
 
-      if (!page.length) buf.push(c.dim("  nothing matches"));
+      if (!page.length) {
+        buf.push(modalRow(w, c.dim(filter ? t("nothing matches", "ничего не найдено") : (opts.empty ?? t("nothing here yet", "здесь пока пусто")))));
+      }
 
       for (const [i, item] of page.entries()) {
         const abs = start + i;
         if (item.header) {
-          const dashes = "─".repeat(Math.max(2, Math.min(24, w - item.header.length - 8)));
-          buf.push(c.gray(` ── `) + c.bold(c.brightBlue(item.header)) + c.gray(` ${dashes}`));
+          buf.push(modalSep(w, item.header));
           continue;
         }
-        const active = abs === index;
-        const marker = active ? c.brightCyan("❯ ") : "  ";
+        const active = abs === index && focus === "list" && !opts.readOnly;
+        const marker = abs === index && !opts.readOnly ? c.brightCyan("❯ ") : "  ";
         const box = multi ? (chosen.has(item.value) ? c.brightGreen("[x] ") : c.gray("[ ] ")) : "";
         const name = active ? c.bold(c.brightCyan(item.label)) : item.label;
         const hint = item.hint ? c.dim(" " + item.hint) : "";
         const badge = item.badge ? c.gray(" " + item.badge) : "";
-        buf.push(`${marker}${box}${clipAnsi(name + hint + badge, w - 4 - (multi ? 4 : 0))}`);
+        buf.push(modalRow(w, `${marker}${box}${clipAnsi(name + hint + badge, inner - 2 - (multi ? 4 : 0))}`));
+      }
+
+      buf.push(modalRow(w));
+      if (buttonRows.length) {
+        buf.push(modalSep(w));
+        for (const l of buttonRows) buf.push(l);
       }
 
       const total = selectableIdx(rows).length;
-      if (total > page.length) buf.push(c.gray(`  ${selectableIdx(rows).indexOf(index) + 1}/${total}`));
+      const keys =
+        focus === "buttons"
+          ? [modalKeys.move().replace("↑↓", "←→"), t("Enter run", "Enter выполнить"), modalKeys.back(), modalKeys.close()].join(" · ")
+          : opts.readOnly
+            ? [modalKeys.scroll(), tabs.length > 1 ? modalKeys.tabs() : "", buttonRows.length ? modalKeys.buttons() : "", modalKeys.close()]
+                .filter(Boolean)
+                .join(" · ")
+            : [
+              modalKeys.move(),
+              multi ? modalKeys.mark() : "",
+              multi ? modalKeys.confirm() : modalKeys.select(),
+              tabs.length > 1 ? modalKeys.tabs() : "",
+              buttonRows.length ? modalKeys.buttons() : "",
+              modalKeys.close(),
+            ]
+              .filter(Boolean)
+              .join(" · ");
+      const position = total > page.length ? `${selectableIdx(rows).indexOf(index) + 1}/${total}` : "";
+      buf.push(modalFooter(w, keys, position));
+      buf.push(modalBottom(w));
 
       for (const l of buf) line(indent + l);
       rendered = buf.length;
@@ -227,26 +333,99 @@ function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Pro
     }
     draw();
 
-    const finish = (value: string | string[] | null) => {
+    const finish = (value: ModalResult | null) => {
       release();
       clear();
       cursor.show();
       resolve(value);
     };
 
+    const activeTab = () => tabs[tabIndex]?.key ?? "";
+
+    const answerItem = () => {
+      const here = currentValue();
+      if (!multi) return finish(here === null ? null : { kind: "item", value: here, values: here ? [here] : [], tab: activeTab() });
+      // Nothing marked: the row under the cursor is the answer, so one list
+      // serves both jobs without a second key to learn.
+      const values = chosen.size ? [...chosen] : opts.allowEmpty ? [] : here ? [here] : [];
+      return finish({ kind: "item", value: values[0] ?? "", values, tab: activeTab() });
+    };
+
+    const runAction = (id: string) =>
+      finish({ kind: "action", id, value: currentValue(), values: [...chosen], tab: activeTab() });
+
     const onData = (buf: Buffer) => {
       const s = buf.toString("utf8");
 
       if (s === CTRL_C || s === ESC) return finish(null);
-      if (s === "\r" || s === "\n") {
-        const rows = visible();
-        const item = rows[index];
-        const here = item && !item.header ? item.value : null;
-        if (!multi) return finish(here);
-        // Nothing marked: the row under the cursor is the answer, so one list
-        // serves both jobs without a second key to learn.
-        return finish(chosen.size ? [...chosen] : here ? [here] : []);
+
+      // Alt+key reaches a button from anywhere: the search field owns every
+      // bare letter, and a terminal spells Alt+x as ESC followed by x. The
+      // number is the reliable half — a Russian label has no Latin letter to
+      // underline — and the letter is there for the labels that do.
+      if (s.length === 2 && s[0] === ESC && /[a-zA-Zа-яА-Я0-9]/.test(s[1])) {
+        const n = Number(s[1]);
+        const byNumber = Number.isInteger(n) && n >= 1 ? actions[n - 1] : undefined;
+        const hit =
+          byNumber ?? actions.find((a) => a.hotkey && a.hotkey.toLowerCase() === s[1].toLowerCase());
+        if (hit && !hit.disabled) return runAction(hit.id);
+        return;
       }
+
+      if (s === SHIFT_TAB) {
+        if (!actions.length) return switchTab(-1), draw();
+        if (focus === "buttons") {
+          const usable = actions.map((a, i) => (a.disabled ? -1 : i)).filter((i) => i !== -1);
+          if (buttonIdx === usable[0]) focus = "list";
+          else moveButton(-1);
+        } else {
+          focus = "buttons";
+          buttonIdx = Math.max(0, actions.map((a, i) => (a.disabled ? -1 : i)).filter((i) => i !== -1).pop() ?? 0);
+        }
+        return draw();
+      }
+
+      if (s === TAB) {
+        if (!actions.length) return switchTab(1), draw();
+        if (focus === "list") {
+          focus = "buttons";
+          const usable = actions.map((a, i) => (a.disabled ? -1 : i)).filter((i) => i !== -1);
+          buttonIdx = usable[0] ?? 0;
+        } else {
+          const usable = actions.map((a, i) => (a.disabled ? -1 : i)).filter((i) => i !== -1);
+          if (buttonIdx === usable[usable.length - 1]) focus = "list";
+          else moveButton(1);
+        }
+        return draw();
+      }
+
+      if (focus === "buttons") {
+        if (s === "\r" || s === "\n") {
+          const a = actions[buttonIdx];
+          return a && !a.disabled ? runAction(a.id) : undefined;
+        }
+        if (s === LEFT) return moveButton(-1), draw();
+        if (s === RIGHT) return moveButton(1), draw();
+        if (s === UP || s === DOWN) {
+          focus = "list";
+          return draw();
+        }
+        // Anything typed is a search: the field is where letters belong, and
+        // wanting to type is wanting the list back.
+        if (!s.startsWith(ESC)) {
+          const text = s.replace(CONTROL_CHARS, "");
+          if (text) {
+            focus = "list";
+            filter += text;
+            return draw();
+          }
+        }
+        return;
+      }
+
+      // A panel that only reports has nothing to answer with: Enter closes it,
+      // the way Esc does.
+      if (s === "\r" || s === "\n") return opts.readOnly ? finish(null) : answerItem();
       if (s === " " && multi) {
         const item = visible()[index];
         if (item && !item.header) {
@@ -258,7 +437,7 @@ function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Pro
       if (s === UP) return move(-1), draw();
       if (s === DOWN) return move(1), draw();
       if (s === LEFT) return switchTab(-1), draw();
-      if (s === RIGHT || s === TAB) return switchTab(1), draw();
+      if (s === RIGHT) return switchTab(1), draw();
       if (s === DEL || s === BACKSPACE) {
         filter = filter.slice(0, -1);
         return draw();
@@ -270,7 +449,6 @@ function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Pro
       // Anything left that is not an escape sequence is text for the search.
       // Taken as a chunk rather than a character: a pasted model name arrives
       // in one read, and a one-character rule dropped the whole paste.
-      if (s === " " && multi) return; // handled above; never search text here
       if (s.startsWith(ESC)) return;
       const text = s.replace(CONTROL_CHARS, "");
       if (text) {
@@ -281,6 +459,23 @@ function run(opts: PickerOptions & { selected?: string[] }, multi: boolean): Pro
 
     release = pushConsumer(onData);
   });
+}
+
+/** Plain-text wrap for the subtitle; the styling here is ours, not the caller's. */
+function wrapPlain(s: string, max: number): string[] {
+  const words = s.split(/\s+/).filter(Boolean);
+  const lines: string[] = [];
+  let cur = "";
+  for (const word of words) {
+    if (cur && width(cur) + 1 + width(word) > max) {
+      lines.push(cur);
+      cur = word;
+    } else {
+      cur = cur ? `${cur} ${word}` : word;
+    }
+  }
+  if (cur) lines.push(cur);
+  return lines.length ? lines : [""];
 }
 
 /** Fallback for non-TTY: prints a numbered list, no interaction. */

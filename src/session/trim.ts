@@ -61,6 +61,8 @@ function sizeOf(messages: Message[]): number {
   let n = 0;
   for (const m of messages) {
     n += estimateTokens(String(m.content ?? ""));
+    // Base64 is charged at roughly its byte count: ~4 chars per token group.
+    for (const img of m.images ?? []) n += Math.ceil(img.data.length / 4);
     for (const tc of m.tool_calls ?? []) n += estimateTokens(tc.function.arguments) + 12;
   }
   return n;
@@ -105,7 +107,23 @@ function repeatStub(m: Message): Message {
   return {
     ...m,
     content: `[identical to the earlier ${m.name ?? "tool"} result above — unchanged since then]`,
+    images: undefined,
   };
+}
+
+/**
+ * An image read stays readable only while it is fresh: the base64 rides along
+ * on every later step at full width, and a 2 MB screenshot is tens of
+ * thousands of tokens the model has already described in text. Old results
+ * keep the caption, lose the pixels.
+ */
+function imageStub(m: Message): Message {
+  const n = m.images?.length ?? 0;
+  return { ...m, images: undefined, content: `${String(m.content ?? "")}\n… [${n} image(s) attached earlier were dropped to save context; call read_image again if you still need them.]` };
+}
+
+function hasImages(m: Message): boolean {
+  return Boolean(m.images?.length);
 }
 
 export function trimForRequest(messages: Message[], opts: TrimOptions): TrimResult {
@@ -161,6 +179,16 @@ export function trimForRequest(messages: Message[], opts: TrimOptions): TrimResu
       if (String(m.content ?? "").length <= maxResult) continue;
       shorten(i, Math.min(2000, Math.floor(maxResult / 4)));
     }
+  }
+
+  // Pass 1.5: images outside the recent tail, regardless of size. The pixels
+  // are the single most expensive thing in an old result and the least needed.
+  for (let i = 0; i < cutoff; i++) {
+    const m = out[i];
+    if (m.role !== "tool" || !hasImages(m)) continue;
+    const stub = imageStub(m);
+    out[i] = stub;
+    trimmed++;
   }
 
   // Pass 2: the budget. Entered only when the request is genuinely over, and

@@ -29,7 +29,9 @@ process.stdout.write = (chunk) => {
   painted += String(chunk);
   return true;
 };
-const strip = (s) => s.replace(new RegExp(ESC + "\\[[0-9;]*[A-Za-z]", "g"), "");
+// Private modes (cursor hide/show) too: left in, they pad the row they sit on
+// and the frame looks ragged when it is not.
+const strip = (s) => s.replace(new RegExp(ESC + "\\[\\??[0-9;]*[A-Za-z]", "g"), "");
 const screen = () => strip(painted);
 const reset = () => {
   painted = "";
@@ -135,6 +137,116 @@ check("Enter returns the full id, prefix and all", value === "moonshotai/kimi-k3
   type(CR);
   const picked = await one;
   check("nothing marked — the cursor row answers", JSON.stringify(picked) === JSON.stringify(["moonshotai/kimi-k3"]), JSON.stringify(picked));
+}
+
+// ── the panel: a frame, buttons, and the keys that reach them ──────────────
+
+const { openModal } = await import("../dist/ui/picker.js");
+const TAB = String.fromCharCode(9);
+const SHIFT_TAB = ESC + "[Z";
+const ACTIONS = [
+  { id: "refresh", label: "Refresh" },
+  { id: "scope", label: "All providers" },
+  { id: "wipe", label: "Delete", tone: "danger", disabled: true },
+];
+
+// The chrome: a titled frame around everything, and the buttons inside it.
+{
+  reset();
+  const m = openModal({ title: "Models", subtitle: "one line about it", items, actions: ACTIONS });
+  const s = screen();
+  check("the panel is a bordered frame", /╭─/.test(s) && /╰/.test(s), s.split(NL)[0]);
+  check("the title sits in the border", /╭─ Models/.test(s), s.split(NL)[0]);
+  check("the subtitle is under it", s.includes("one line about it"));
+  check("the buttons are drawn", s.includes("Refresh") && s.includes("All providers"), s);
+  check("and are numbered, so alt+№ is visible", /1 Refresh/.test(s) && /2 All providers/.test(s), s);
+  type(ESC);
+  await m;
+}
+
+// Every row of the frame is the same width — an off-by-one shows as a ragged
+// right edge, which is exactly what a border is for.
+{
+  reset();
+  const m = openModal({ title: "Models", items, actions: ACTIONS });
+  const rows = screen().split(NL).filter((l) => /[╭│├╰]/.test(l));
+  const widths = new Set(rows.map((l) => [...l.trimEnd()].length));
+  check("every frame row is the same width", widths.size === 1, JSON.stringify([...widths]));
+  type(ESC);
+  await m;
+}
+
+// Tab hands the keyboard to the buttons; Enter there runs one.
+{
+  reset();
+  const m = openModal({ title: "Models", items, actions: ACTIONS });
+  type(TAB);
+  check("Tab moves the focus to the buttons", /Enter run|Enter выполнить/.test(screen()), screen().split(NL).slice(-3).join(" | "));
+  type(CR);
+  const res = await m;
+  check("Enter on a button returns that action", res?.kind === "action" && res.id === "refresh", JSON.stringify(res));
+  check("and carries the row under the cursor", res?.value === "alibabacloud:qwen3.8-max", JSON.stringify(res));
+}
+
+// Alt+number reaches a button from the list, where typing is search.
+{
+  reset();
+  const m = openModal({ title: "Models", items, actions: ACTIONS });
+  type("qwen");
+  type(ESC + "2");
+  const res = await m;
+  check("alt+2 runs the second button", res?.kind === "action" && res.id === "scope", JSON.stringify(res));
+}
+
+// A disabled button is shown but never reached.
+{
+  reset();
+  const m = openModal({ title: "Models", items, actions: ACTIONS });
+  type(ESC + "3");
+  let settled = false;
+  m.then(() => (settled = true));
+  await new Promise((r) => setImmediate(r));
+  check("a disabled button does not fire", !settled);
+  type(TAB);
+  type(TAB);
+  type(TAB);
+  check("and Tab skips past it back to the list", /Enter select|Enter выбрать/.test(screen()), screen().split(NL).slice(-3).join(" | "));
+  type(ESC);
+  await m;
+}
+
+// Shift+Tab walks the buttons the other way.
+{
+  reset();
+  const m = openModal({ title: "Models", items, actions: ACTIONS });
+  type(SHIFT_TAB);
+  type(CR);
+  const res = await m;
+  check("shift+Tab lands on the last usable button", res?.kind === "action" && res.id === "scope", JSON.stringify(res));
+}
+
+// A read-only panel reports: no cursor on the rows, Enter closes it.
+{
+  reset();
+  const m = openModal({ title: "Usage", items, readOnly: true, notes: ["totals go here"], search: false });
+  const s = screen();
+  check("notes are drawn above the list", s.includes("totals go here"), s);
+  check("a read-only panel shows no cursor", !s.includes("❯"), s);
+  check("and says the arrows scroll", /scroll|прокрутка/.test(s), s.split(NL).slice(-3).join(" | "));
+  type(CR);
+  const res = await m;
+  check("Enter closes it rather than answering", res === null, JSON.stringify(res));
+}
+
+// "Nothing marked" is a real answer where the caller says it is.
+{
+  const { pickMulti } = await import("../dist/ui/picker.js");
+  reset();
+  const m = pickMulti({ title: "Models", items, selected: ["alibabacloud:qwen3.8-max"], allowEmpty: true });
+  type(" ");             // unmark the one that was marked
+  type(CR);
+  const picked = await m;
+  check("allowEmpty returns an empty set, not the cursor row", JSON.stringify(picked) === "[]", JSON.stringify(picked));
 }
 
 say("");

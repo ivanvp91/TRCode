@@ -1,5 +1,5 @@
 /** Composition of the two status rows drawn under the input frame. */
-import { c, width } from "./ansi.js";
+import { c, clipAnsi, width } from "./ansi.js";
 import { contentWidth } from "./layout.js";
 import { fmtTokens } from "../usage.js";
 import { wireModelId } from "../provider/registry.js";
@@ -56,10 +56,28 @@ export function composeStatus(s: StatusInfo): EditorStatus {
 
   // Esc has nothing to interrupt while the input is idle; the mode toggle is
   // the thing worth advertising here, since it has no other signpost.
-  const hint = c.dim(s.hint ?? t("/ for commands · Shift+Tab for auto-approve · Ctrl+Enter for newline", "/ — команды · Shift+Tab — без подтверждений · Ctrl+Enter — перенос строки"));
+  const w = contentWidth();
+  let hint = c.dim(s.hint ?? t("/ for commands · Shift+Tab for auto-approve · Ctrl+Enter for newline", "/ — команды · Shift+Tab — без подтверждений · Ctrl+Enter — перенос строки"));
+
+  // A long model id plus the full hint can be wider than the row they share —
+  // and a status row that does not fit wraps, which costs the frame above it
+  // its row arithmetic. The hint gives way first: the model and the mode are
+  // state, the hint is only a reminder of keys that keep working unmentioned.
+  // A hint the caller passed is theirs, and is left alone.
+  const fits = (h: string) => width(head) + width(h) + 2 <= w;
+  if (s.hint === undefined) {
+    if (!fits(hint)) hint = c.dim(t("/ for commands · Shift+Tab for auto-approve", "/ — команды · Shift+Tab — без подтверждений"));
+    if (!fits(hint)) hint = c.dim(t("/ for commands", "/ — команды"));
+    // Even the short form does not fit: the model id is that long. The hint
+    // goes rather than the name of the model the turn will be billed to.
+    if (!fits(hint)) hint = "";
+  } else if (!fits(hint)) {
+    // A hint the caller wrote is usually load-bearing — "esc to interrupt" is
+    // the only place that key is advertised — so its tail is cut instead.
+    hint = clipAnsi(hint, Math.max(0, w - width(head) - 2));
+  }
 
   // The path is the only elastic part: shrink it from the left, then drop it.
-  const w = contentWidth();
   const room = w - width(head) - width(hint) - 4;
   let cwdText = s.cwdLabel;
   if (room < 10) cwdText = "";

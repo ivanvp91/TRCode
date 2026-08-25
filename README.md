@@ -111,9 +111,12 @@ thinking, and what it is worth there, does not carry over to the next host. Swit
 provider for the first time picks the alias login created, else the configured default
 when it belongs there, else its first model.
 
-`/model` and `/models` show the current provider's models only — the others cannot serve
-this session, and listing them among the ones that can is a way to pick a 404. `/model all`
-and `/models all` show every provider's; `/model <name>` still finds one anywhere and
+`/model` opens the catalog as a panel: type to filter, ←/→ for the output type, and the
+buttons along the foot do what the sub-commands used to — refresh the catalog, widen the
+list to every provider, pin the default, jump to `/provider`. It shows the current
+provider's models only, since the others cannot serve this session and listing them among
+the ones that can is a way to pick a 404; `/model all` opens it wide, `/model refresh`
+re-reads the catalog past its cache, and `/model <name>` still finds one anywhere and
 switches provider along with it. The provider in use is named in the status line under the
 input, where the routing prefix is dropped as redundant:
 
@@ -315,8 +318,8 @@ trc -e high "a tricky refactor"      # with the maximum reasoning budget
 trc -c                               # continue this project's last session
 ```
 
-Flags: `-m/--model`, `-e/--effort`, `-C/--cwd`, `-c/--continue`, `-r/--resume <id>`,
-`-p/--print`, `--json`, `--base-url <url>`, `--yolo` (no confirmations).
+Flags: `-m/--model`, `-e/--effort`, `--preset standard|minimal`, `-C/--cwd`, `-c/--continue`,
+`-r/--resume <id>`, `-p/--print`, `--json`, `--base-url <url>`, `--yolo` (no confirmations).
 
 ## Commands
 
@@ -338,12 +341,17 @@ insert, Esc to dismiss. `/help` prints the full reference.
 | `/yolo [on\|off]` | skip confirmations — tools run immediately (also Shift+Tab) |
 | `/new` | start a new session |
 
-**Session** — `/sessions`, `/resume [id]`, `/rename [title]`, `/context [<tokens>|auto]`, `/cost`
+**Session** — `/sessions`, `/resume [id]`, `/fork [turn]`, `/rename [title]`, `/context [<tokens>|auto]`, `/cost`, `/trace [n]`
+(`/fork` branches the session at a past turn — the original stays intact, details in
+[Forking a session](#forking-a-session); `/trace` shows what every request actually carried:
+system prompt, tool schemas, history after trim, injections — the projection behind
+[Token spend](#token-spend))
 
-**Settings** — `/lang [en\|ru]`, `/default [name]`, `/models [all]`, `/aliases`, `/permissions`, `/login [provider] [url]`, `/config`, `/cwd`
-(`/models` lists the current provider by type and vendor, `/models all` every provider;
-`/login` connects the one in use unless another is named, and takes a host for the
-providers whose endpoint is per-account)
+**Settings** — `/lang [en\|ru]`, `/default [name]`, `/aliases`, `/permissions`, `/login [provider] [url]`, `/config`, `/cwd`
+(the catalog lives in `/model` — the panel lists the current provider by type and vendor,
+`/model all` every provider, and its Refresh button re-reads it past the cache; `/login`
+connects the one in use unless another is named, and takes a host for the providers whose
+endpoint is per-account)
 
 **Agents** — `/subagents [model [id]\|auto]`, `/prompt <task> \| model [id] \| off\|command\|auto`,
 `/prompt_model [id]`, `/mcp [reload]`
@@ -393,7 +401,9 @@ description_ru: Найти причину бага, падения или упа
 itself in English whichever language is selected. All 13 bundled skills carry a Russian
 description.
 
-**Other** — `/tools`, `/skills`, `/todo`, `/keys`, `/init`, `/clear`, `/version`, `/help`, `/exit`
+**Other** — `/tools`, `/skills`, `/preset [standard\|minimal]`, `/todo`, `/keys`, `/init`, `/clear`, `/version`, `/help`, `/exit`
+(`/preset minimal` keeps only `shell` and `edit` with a short prompt — see
+[Presets](#presets))
 
 ### Keys
 
@@ -654,6 +664,27 @@ if a shell command really is the only way, say which files it will change.
 Snapshots are deleted with their session, and stores whose session is already gone are
 cleaned up at startup.
 
+### Forking a session
+
+`/rewind` undoes; `/fork` branches. Picking **Fork here instead** in the rewind menu — or
+running `/fork` directly — creates a new session carrying the history up to the chosen
+point, while the original stays exactly as it is on disk and in the list:
+
+```
+   Branch from where?
+   ❯ analyse the fx monitor pricing                        #0
+     add pagination to the users list                      #12
+     fix the timezone drift in reports                     #28
+
+    Switch to the fork now  [Stay here]   ←/→ · Enter to confirm
+```
+
+The cut never splits a tool pair — it moves back to before the assistant message that made
+the calls, so a host never sees a history ending in an unanswered `tool_calls`. The fork's
+title carries a `· fork` mark, and `/fork <n>` jumps straight to a position without the
+picker. Typical use: "what if I had asked differently there" without losing the road
+already taken.
+
 ## Token spend
 
 An agent loop resends the whole history on every step, so a long session costs
@@ -758,6 +789,28 @@ tool rounds the last request is a fraction of the bill:
 column — a flat zero there on an Anthropic model means the prefix keeps moving or the
 host is dropping the field.
 
+### What a request is made of
+
+The stored history is not what goes out: trim shortens old results, skills and design
+references are spliced in mid-turn, and the system prompt and tool schemas ride on top of
+every request. `/trace [n]` shows the projection — what each of the last *n* requests
+actually carried:
+
+```
+   step    time   system  schemas  history  injected   trim→  cached  model
+      0   14:03     1.2k     2.8k      1.1k     2.4k        —       —  moonshotai/kimi-k3
+      1   14:03     1.2k     2.8k      4.6k     2.4k  -9.1k    7.2k  moonshotai/kimi-k3
+      2   14:04     1.2k     2.8k      5.0k     2.4k  -12k     9.8k  moonshotai/kimi-k3
+
+   Injected: skill:debugging.
+```
+
+One line per request, appended as the turn runs to `<session-id>.proj.jsonl` beside the
+session file — so it survives a resume and answers "what did the model see at step 3"
+after the fact. The `injected` column names what was spliced in (a skill auto-loaded
+mid-turn, for instance), `trim→` is what trimming saved against sending the history as-is,
+and `cached` is the provider's own number once the response reports it.
+
 ## Models
 
 The TokenRouter catalog holds ~118 namespaced models: `moonshotai/kimi-k3`,
@@ -780,7 +833,7 @@ Native Gemini, image and video generation, audio chat and embeddings are not sup
 those models are hidden from the picker by default, and listed with the reason wherever
 they do appear.
 
-`/models` and `trc models` group the catalog the way it is tagged — **[Text] [Images]
+`/model` and `trc models` group the catalog the way it is tagged — **[Text] [Images]
 [Video] [Audio]** — and by vendor inside each type, so what a model is comes before whose
 it is. The vendor comes from the model id, not from the host it was reached at: a router
 resells a hundred labs' models, and filing all of OpenRouter under "OpenRouter" is a list
@@ -794,37 +847,42 @@ neither types nor vendors (Model Studio) gets both read off the names, and dated
 (`qwen3.7-max-2026-05-17`) sink below the id they are a snapshot of:
 
 ```
-/models          # this provider's catalog, by type then vendor
-/models all      # every provider's
-
-  [Text] 116
-  Qwen
-  ❯ qwen3.8-max              ctx 1M
-    qwen3.7-max              ctx 1M
-    qwen3.7-text-embedding               embeddings
-    qwen3.7-max-2026-05-17   ctx 1M
-  DeepSeek
-    deepseek-v4-pro          ctx 1.05M
-  [Images] 21
-  Qwen
-    qwen-image-3.0                       image output
-  Wan
-    wan2.7-image                         image output
+/model           # this provider's catalog, by type then vendor
+/model all       # every provider's
+/model refresh   # re-read it, past the cache
 ```
 
-`/model` with no argument opens a list with type tabs — **[Text] [Images] [Video] [Audio]**
-(←/→ or Tab) — grouped by vendor, newest first inside a group (by the API's `created`
-field). MoonShot, Anthropic, OpenAI, Qwen and xAI are pinned to the top:
+`/model` with no argument opens the panel: type tabs — **[Text] [Images] [Video] [Audio]**
+(←/→) — grouped by vendor, newest first inside a group (by the API's `created` field), with
+MoonShot, Anthropic, OpenAI, Qwen and xAI pinned to the top. Typing filters; every word has
+to match somewhere in the row, in any order. Tab moves to the buttons, and `alt+`the number
+on a button runs it from anywhere:
 
 ```
-    Models
-   [ Text 528 ] [Images] [Video] [Audio]     ←/→ or Tab to switch type
-    ⌕ qwen max                                                    2/528
-    ↑↓ move · Enter select · Esc cancel · ^U clear
-    ── Qwen ───────────────────
-   ❯ qwen3.8-max                 ●  ctx 1M     Alibaba Cloud
-     qwen3.7-max                    ctx 1M     Alibaba Cloud
+   ╭─ Model ──────────────────────────────────────────────────────────╮
+   │                                                                  │
+   │  Alibaba Cloud · 116 models · ★ default · ● in use               │
+   │                                                                  │
+   │   Text 116  [ Images 21 ]  [ Audio 3 ]                           │
+   │                                                                  │
+   │   ╭──────────────────────────────────────────────────────────╮   │
+   │   │ ⌕ qwen max                                          2/116 │   │
+   │   ╰──────────────────────────────────────────────────────────╯   │
+   │                                                                  │
+   │  ── Qwen ────────────────────────────                            │
+   │  ❯ qwen3.8-max          ● ctx 1M              $0.8/$3.2          │
+   │    qwen3.7-max            ctx 1M              $0.6/$2.4          │
+   │                                                                  │
+   ├──────────────────────────────────────────────────────────────────┤
+   │  [ 1 Refresh ]  [ 2 All providers ]  [ 3 Make default ]          │
+   │  ↑↓ move · Enter select · ←→ section · Tab buttons · Esc close   │
+   ╰──────────────────────────────────────────────────────────────────╯
 ```
+
+The same panel is what `/provider`, `/brain`, `/subagents`, `/skills`, `/uilib` and `/stat`
+open — one frame, one set of keys, and the sub-commands each of them used to take as typed
+words (`add`, `auto`, `refresh`, `on`/`off`) sitting on the buttons. They remain commands
+on the command line; the panel is for the times you do not remember which word it was.
 
 ★ is the default model, ● the current one.
 
@@ -891,14 +949,57 @@ Precedence: `/effort` in the session → `effortByModel[model]` → `effort` →
 
 ## Tools
 
-`read`, `edit`, `write`, `ls`, `glob`, `grep`, `shell`, `web_search`, `fetch`,
-`skill`, `todo`, `task`, plus anything the connected MCP servers provide.
+`read`, `edit`, `write`, `ls`, `glob`, `grep`, `shell`, `read_image`, `web_search`, `fetch`,
+`run_code` (opt-in), `skill`, `todo`, `memory`, `task`, plus anything the connected MCP
+servers provide.
 
 `web_search` queries DuckDuckGo's keyless HTML endpoint — no API key, no account;
 `fetch` downloads a URL and strips the HTML to readable text. Both sit in the
 `network` permission class, so by default every call asks first.
 
+`read_image` puts a picture in front of a vision model: PNG/JPEG/GIF/WebP/BMP up to
+1.6 MB, sent as real image content rather than a path. A host that refuses images is
+remembered, and later reads arrive as text only.
+
 Independent calls in one turn run in parallel (up to 4 at a time).
+
+### run_code: many calls, one step
+
+`run_code` (off by default — `"codeMode": true` in `config.json`) hands the model a
+different shape of work: instead of five rounds of read → result → read, it writes **one
+JavaScript program** whose SDK calls run in a child process, and only the program's
+return value enters the conversation:
+
+```js
+const files = await sdk.glob('src/**/*.ts');
+const out = {};
+for (const f of files) {
+  const t = await sdk.fs.read(f);
+  out[f] = (t.match(/TODO/g) || []).length;
+}
+return out;
+```
+
+The SDK mirrors the dedicated tools — `sdk.fs.read/write/list/glob`, `sdk.shell`,
+`sdk.web.fetch/search` — with the same guardrails: paths cannot leave the working
+directory, shell and web calls ask for permission like their tools do, and writes go
+through the snapshot store so `/rewind` still reaches them. The program runs under a
+timeout (`codeModeTimeoutMs`, 60s) and Esc kills the whole process tree.
+
+The point is the input bill: intermediate outputs never ride along on later steps. A task
+that gathers data across twenty files costs one round trip instead of twenty-plus, and
+what lands in the history is the summary, not the dumps.
+
+### Presets
+
+`/preset minimal` (or `trc --preset minimal`) shrinks the session to two tools — `shell`
+and `edit` — and a short prompt to match: no workspace listing, git state, skills, memory
+or model notes. The full set comes back with `/preset standard`.
+
+Two uses. Quick fixes on a cheap model, where half the tool catalog is noise. And a
+baseline: the first request drops to roughly a third of the usual size, which makes the
+cost of everything else measurable. Switching presets mid-session warns that the next
+request rebuilds the prompt cache from scratch — both halves of the request changed.
 
 ### MCP servers
 
@@ -956,6 +1057,10 @@ Four mechanisms, deliberately distinct:
 | `shell` | `ask` — with the command |
 | `network` (web_search, fetch, MCP tools) | `ask` |
 | `agent` (task) | `allow` |
+
+A `run_code` program asks under its own name for everything risky it does: shell commands
+confirm as `run_code>shell`, web calls as `web_search`/`fetch`. File writes inside the
+program go through the same snapshot store as `write` and `edit`, so `/rewind` covers them.
 
 The confirmation is a row of buttons: **←/→** to move, **Enter** to confirm. The keys
 `y` / `a` / `n` work as shortcuts, Esc rejects. In headless mode without `--yolo`,
@@ -1404,25 +1509,25 @@ npm test
 ```
 
 ```
-PASS  protocol-test.mjs      52/52     PASS  history-test.mjs    9/9
-PASS  provider-test.mjs      95/95     PASS  focus-test.mjs      8/8
-PASS  mode-test.mjs          13/13     PASS  repaint-test.mjs    5/5
+PASS  protocol-test.mjs      60/60     PASS  history-test.mjs    13/13
+PASS  provider-test.mjs     152/152    PASS  focus-test.mjs      8/8
+PASS  mode-test.mjs          13/13     PASS  repaint-test.mjs    15/15
 PASS  lang-test.mjs          13/13     PASS  menu-test.mjs
-PASS  i18n-test.mjs          22/22     PASS  skill-test.mjs
-PASS  diff-test.mjs          30/30
-PASS  thinking-test.mjs      15/15
-PASS  cache-test.mjs         8/8       PASS  resume-test.mjs     39/39
-PASS  shell-output-test.mjs  6/6       PASS  turnbar-test.mjs    24/24
-PASS  prompt-test.mjs        18/18     PASS  transcript-test.mjs 8/8
-PASS  orca-test.mjs          18/18     PASS  keyscan-test.mjs    6/6
-PASS  editor-harness.mjs     11/11     PASS  shutdown-test.mjs   8/8
-PASS  paste-test.mjs         9/9
-PASS  newline-test.mjs       13/13
+PASS  i18n-test.mjs          22/22     PASS  skill-test.mjs      67/67
+PASS  diff-test.mjs          41/41     PASS  uilib-test.mjs      47/47
+PASS  thinking-test.mjs      15/15     PASS  checkpoint-test.mjs 26/26
+PASS  trim-test.mjs          12/12     PASS  resume-test.mjs     44/44
+PASS  cache-test.mjs         25/25     PASS  turnbar-test.mjs    45/45
+PASS  prompt-test.mjs        35/35     PASS  transcript-test.mjs 14/14
+PASS  projection-test.mjs    11/11     PASS  preset-test.mjs     9/9
+PASS  codemode-test.mjs      9/9       PASS  fork-test.mjs       10/10
 ```
 
-The suites cover the wire protocols, provider routing and the OAuth device flow (against a
-throwaway server on localhost), history trimming, plus the terminal behaviour that
-is otherwise painful to verify: paste in four delivery shapes, split escape sequences,
+51 suites in all. The suites cover the wire protocols, provider routing and the OAuth device flow (against a
+throwaway server on localhost), history trimming, the request projection log, the code-mode
+sandbox (path guard, snapshots, timeout, abort), session forking and the tool presets,
+plus the terminal behaviour that is otherwise painful to verify: paste in four delivery
+shapes, split escape sequences,
 Shift+Tab in its three encodings, focus events, frame repainting, multi-line input,
 prompt history, the resume flow and the
 during-turn bar on a virtual screen, and the process actually exiting instead of lingering.
@@ -1514,11 +1619,14 @@ src/
     swarm.ts           /swarm
     orchestrator.ts    /orchestrate
   session/
-    session.ts         history, persistence
+    session.ts         history, persistence, fork
     compact.ts         context compaction
     trim.ts            per-request history trimming
+    projection.ts      per-request token projection log (/trace)
+    checkpoint.ts      file snapshots for /rewind
     history.ts         prompt history across restarts
-  tools/               read, edit, write, ls, glob, grep, shell, skill, todo, memory
+  tools/               read, edit, write, ls, glob, grep, shell, read_image,
+                       run_code (opt-in), skill, todo, memory, task
   skills/loader.ts     skill discovery
   ui/
     highlight.ts       syntax colour for diffs
@@ -1534,6 +1642,12 @@ src/
     turnbar.ts         the bottom bar shown while a turn runs
     orca.ts            pane status reporting for the Orca terminal
     keyscan.ts         /keys inspector
+```
+
+## License
+
+MIT
+yscan.ts         /keys inspector
 ```
 
 ## License

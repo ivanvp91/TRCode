@@ -101,16 +101,22 @@ function drawSeq(lines: string[]): string {
  */
 function repaintSeq(lines: string[]): string {
   const prev = footerRows;
-  // Growing paints extra rows below the old bar and the terminal scrolls —
-  // the input frame walks off the bottom, which is exactly "the box vanished
-  // while the model was thinking". Start `grow` rows higher instead, so the
-  // new lines overwrite the transcript above and the bottom stays put.
+  // A taller bar needs rows that do not exist yet, and where it takes them
+  // from is the whole question. Starting `grow` rows higher took them from the
+  // transcript, and painted the bar over lines that were already written —
+  // most often the echo of the message that had just started the turn, which
+  // is the last thing printed before the reasoning preview grows the bar. The
+  // message was sent, answered, and nowhere on screen.
+  //
+  // The rows are opened at the bottom instead: newlines on the last row scroll
+  // the screen, which moves the transcript up into the scrollback rather than
+  // erasing it, and the bar still ends where it ended before — at the bottom.
   const grow = Math.max(0, lines.length - prev);
-  let body =
-    esc.hide +
-    esc.toColumn(1) +
-    esc.up(footerCursorRow + grow) +
-    lines.map((l) => CLEAR_LINE + l).join("\n");
+  let body = esc.hide + esc.toColumn(1);
+  body += grow
+    ? esc.down(prev - 1 - footerCursorRow) + "\n".repeat(grow) + esc.up(lines.length - 1)
+    : esc.up(footerCursorRow);
+  body += lines.map((l) => CLEAR_LINE + l).join("\n");
   // A shorter bar leaves rows of the taller one below it. That row exists, so
   // stepping onto it to clear downwards cannot scroll the transcript.
   if (lines.length < prev) body += "\n" + esc.clearDown + esc.up(1);
@@ -476,6 +482,19 @@ export function toolDone(ok: boolean, detail: string, kind: "text" | "diff" = "t
         ),
     );
   }
+}
+
+/**
+ * Prints a collapsed block back the way it was remembered.
+ *
+ * A diff is stored already laid out — bands, gutter, padding inside the
+ * colour — and re-wrapping it would count the escape bytes as characters
+ * (`wrapText` does) and break the bands mid-line. Anything carrying escapes
+ * goes straight to the screen; plain text gets the markdown pass.
+ */
+export function expandedBlock(text: string): string[] {
+  if (text.includes("\x1b")) return text.split("\n");
+  return renderMarkdownBlock(text);
 }
 
 /**

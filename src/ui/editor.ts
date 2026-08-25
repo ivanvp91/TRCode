@@ -10,9 +10,9 @@
 import { appendFileSync } from "node:fs";
 import { stashPaste, takeCollapsed } from "./paste.js";
 import { pushConsumer } from "./stdin.js";
-import { c, cursor, esc, width } from "./ansi.js";
-import { contentWidth, indent, PAD_LEFT } from "./layout.js";
-import { line, padded, paintFrame, renderMarkdownBlock } from "./render.js";
+import { c, clipAnsi, cursor, esc, width } from "./ansi.js";
+import { contentWidth, fullWidth, indent, PAD_LEFT } from "./layout.js";
+import { expandedBlock, line, padded, paintFrame } from "./render.js";
 
 const CTRL_A = String.fromCharCode(1);
 const CTRL_C = String.fromCharCode(3);
@@ -551,7 +551,7 @@ export class InputEditor {
             if (!block) return;
             this.erase();
             line();
-            for (const l of renderMarkdownBlock(block.text)) padded(l);
+            for (const l of expandedBlock(block.text)) padded(l);
             line();
             return this.draw();
           }
@@ -744,6 +744,14 @@ export class InputEditor {
     const gap = Math.max(2, w - width(st.left) - width(st.hint));
     lines.push(indent + st.left + " ".repeat(gap) + st.hint);
     lines.push(indent + " ".repeat(Math.max(0, w - width(st.context))) + st.context);
+
+    // Every row below is counted as one, and the walk back up on the next
+    // repaint counts the same way. A row wider than the terminal breaks that:
+    // it takes two physical rows, the walk stops one short, and the repaint
+    // lands below the old frame instead of over it — one ghost frame per
+    // keystroke. Clipping is what keeps a rendered line worth exactly one row.
+    const room = fullWidth();
+    for (const [i, l] of lines.entries()) if (width(l) > room) lines[i] = clipAnsi(l, room);
 
     // The whole repaint goes out as one write. Clearing the old box first and
     // drawing the new one after left a moment with nothing on screen, and on

@@ -18,6 +18,7 @@ import {
   renderMarkdownBlock,
   toolDone,
   rule,
+  success,
   toolStart,
   truncate,
   userEcho,
@@ -26,17 +27,21 @@ import {
 } from "./render.js";
 import { contentWidth, fmtAgo, fmtDuration } from "./layout.js";
 // `t` and `count` are taken in this file by the turn totals.
-import { t as tr, count as nOf } from "../i18n.js";
+import { t as tr, t, count as nOf } from "../i18n.js";
+import { matchLibrary, designInjection, blendInjection, isDesignRequest } from "../ui-library/match.js";
+import { listEntries, getEntry, type UiEntry } from "../ui-library/store.js";
+import { pickUiEntry, extractEntryForm } from "./commands.js";
 import { composeStatus, type StatusInfo } from "./inputbox.js";
 import { expandPastes, rememberCollapsed } from "./paste.js";
 import { InputEditor, PipeReader, setExtraNewlineKeys } from "./editor.js";
 import { choose } from "./choice.js";
+import { askLine } from "./prompt.js";
 import { TurnBar, InterruptWatcher } from "./turnbar.js";
 import { OrcaReporter } from "./orca.js";
 import { pushConsumer } from "./stdin.js";
 import { PermissionBroker } from "./permissions.js";
 import { loadConfig, projectState, VERSION, type Config, type Effort } from "../config.js";
-import { fetchModels, effortFor, usableModels, resolveModelId, findModel, sameModelElsewhere } from "../provider/models.js";
+import { fetchModels, cachedModels, catalogIsFresh, effortFor, usableModels, resolveModelId, findModel, sameModelElsewhere } from "../provider/models.js";
 import { defaultProviderId, hasProvider, modeFor, providerLabel, providerState, splitModelId, wireModelId } from "../provider/registry.js";
 
 /**
@@ -63,12 +68,13 @@ import { buildSystemPrompt } from "../agent/prompt.js";
 import { composePrompt, promptModelFor } from "../agent/promptwriter.js";
 import { runAgent } from "../agent/loop.js";
 import { buildTools, TodoStore } from "../tools/index.js";
+import { shellTool } from "../tools/shell.js";
 import { createSpillStore, type SpillStore } from "../tools/spill.js";
 import { connectMcpServers, mcpPendingCount, mcpSettled } from "../mcp/client.js";
 import { discoverSkills, type Skill } from "../skills/loader.js";
 import { pickSkill, skillInjection, skillInterjector } from "../skills/match.js";
 import { Session } from "../session/session.js";
-import { loadInputHistory, saveInputHistory } from "../session/history.js";
+import { loadInputHistory, saveInputHistory, dropSessionHistory } from "../session/history.js";
 import { compactSession, contextPressure, shouldAutoCompact } from "../session/compact.js";
 import { markTurn, pruneOrphanStores, recordWrite } from "../session/checkpoint.js";
 import { UsageTracker, estimateTokens, fmtTokens } from "../usage.js";
@@ -105,11 +111,24 @@ export class App {
   get memoryOn(): boolean {
     return this.cfg.memoryEnabled !== false;
   }
+  /** The active preset: an explicit override wins over the config value. */
+  get preset(): "standard" | "minimal" {
+    return this.presetOverride ?? this.cfg.preset ?? "standard";
+  }
+  /** Code mode: on when forced on; "auto" stays off until models are vetted. */
+  get codeModeOn(): boolean {
+    return this.cfg.codeMode === true;
+  }
   todo = new TodoStore();
   broker: PermissionBroker;
   usage: UsageTracker;
   readFiles = new Set<string>();
   effortOverride?: Effort;
+  /**
+   * Session tool preset. Config is the default; the CLI flag and /preset write
+   * here, so a resumed session keeps its preset rather than the config's.
+   */
+  presetOverride?: "standard" | "minimal";
   /** Full reasoning of the last turn, for /reasoning. */
   lastReasoning = "";
   /** Skills whose body is already in the history — auto-loaded or asked for. */
@@ -138,6 +157,15 @@ export class App {
   private cacheMissNudged = new Set<string>();
   /** Lines from background work (MCP connects), held while the editor draws. */
   private heldNotices: { kind: "info" | "warn"; text: string }[] = [];
+  /** The empty-UI-library notice is said once per session, not per request. */
+  private uilibNoticeShown = false;
+  /**
+   * Set by the uilib capture/blend prompts: when that turn stops, the entry
+   * form goes through a confirm / edit / reject gate instead of free text.
+   */
+  pendingUilibGate: ((proposal: string) => Promise<void>) | null = null;
+  /** The next turn is a uilib capture/blend — no design-reference matching. */
+  skipNextDesignMatch = false;
   /** Rolling preview of subagent actions; lives in the turn bar, not the transcript. */
   private activityLines: string[] = [];
   private activityActive = 0;
@@ -166,7 +194,9 @@ export class App {
   constructor(opts: { cwd: string; model?: string; autoApprove?: boolean; session?: Session }) {
     this.cwd = opts.cwd;
     this.cfg = loadConfig();
-    this.skills = discoverSkills(this.cwd);
+    // Filled by init()'s rebuildTools(), which scans the skill directories
+    // anyway — doing it here too means walking them twice on every launch.
+    this.skills = [];
     this.broker = new PermissionBroker({
       autoApprove: opts.autoApprove,
       interactive: process.stdin.isTTY,
@@ -178,10 +208,12 @@ export class App {
     // leaves the model going, and the next tool asks again — which is what a
     // stuck session looks like from the outside.
     this.broker.onCancel = () => this.abort?.abort();
-    this.history = loadInputHistory(this.cwd);
-    setExtraNewlineKeys(this.cfg.newlineKeys ?? []);
     this.session = opts.session ?? new Session({ cwd: this.cwd, model: opts.model ?? startingModel(this.cwd) });
     if (opts.model) this.session.model = opts.model;
+    // Recall is scoped to the session: another conversation's prompts are
+    // noise here, the same way another project's are.
+    this.history = loadInputHistory(this.cwd, this.session.id);
+    setExtraNewlineKeys(this.cfg.newlineKeys ?? []);
     // A resumed session keeps its own model, so only a fresh one inherits the
     // remembered reasoning budget — this project's, else the provider's.
     if (!opts.session && !opts.model) {
@@ -193,9 +225,26 @@ export class App {
   async init(): Promise<void> {
     Session.pruneEmpty(this.cwd);
     pruneOrphanStores(this.cwd);
-    this.catalog = await fetchModels();
+    // When every provider's catalog is already on disk this costs a file read;
+    // when one of them would have to be asked over the network, the prompt
+    // opens on the cached catalog instead and the refresh lands behind it. A
+    // provider that is slow, unpaid or down must never delay the input box.
+    const fresh = catalogIsFresh();
+    this.catalog = fresh ? await fetchModels() : cachedModels();
     this.reconcileModel();
     this.rebuildTools();
+    if (!fresh) {
+      void fetchModels()
+        .then((catalog) => {
+          if (!catalog.length) return;
+          this.catalog = catalog;
+          this.reconcileModel();
+          // Tools carry a snapshot of the catalog, so they are rebuilt on the
+          // new one the same way an MCP server joining does it.
+          this.rebuildTools();
+        })
+        .catch(() => {});
+    }
     // MCP servers connect in the background: a cold `npx` can take a minute,
     // and the prompt must not wait on it. Tools join the registry as each
     // server comes up.
@@ -255,6 +304,18 @@ export class App {
       todo: this.todo,
       onTodoChange: () => {},
       cwd: this.memoryOn ? this.cwd : undefined,
+      preset: this.preset,
+      runCode: this.codeModeOn
+        ? {
+            confirmShell: (command) =>
+              this.broker.confirm({ ...shellTool, name: "run_code>shell" }, { command }),
+            confirmWeb: (kind, target) =>
+              this.broker.confirm(
+                { name: kind === "fetch" ? "fetch" : "web_search", risk: "network", parameters: {}, description: "", run: async () => ({ output: "" }) } as any,
+                kind === "fetch" ? { url: target } : { query: target },
+              ),
+          }
+        : undefined,
       subagentDeps: {
         cwd: this.cwd,
         catalog: this.catalog,
@@ -509,18 +570,18 @@ export class App {
     return this.tools;
   }
 
-  /** Remembers a submitted line for arrow-key recall, across restarts. */
+  /** Remembers a submitted line for arrow-key recall, per session, across restarts. */
   private recordInput(text: string): void {
     // Repeating the same line twice adds nothing to recall.
     if (this.history[this.history.length - 1] === text) return;
     this.history.push(text);
     if (this.history.length > 500) this.history.shift();
-    saveInputHistory(this.cwd, this.history);
+    saveInputHistory(this.cwd, this.history, this.session.id);
   }
 
-  /** Input history follows the project, so /cwd reloads it. */
+  /** Input history follows the session, so /new and /resume reload it. */
   reloadHistory(): void {
-    this.history.splice(0, this.history.length, ...loadInputHistory(this.cwd));
+    this.history.splice(0, this.history.length, ...loadInputHistory(this.cwd, this.session.id));
   }
 
   effort(): Effort {
@@ -901,6 +962,152 @@ export class App {
     hint(`⚡ skill ${pick.skill.name} — ${pick.matched.slice(0, 3).join(", ")}`);
   }
 
+  /** The reply just streamed, for the gate that reads the proposed entry form. */
+  private lastAssistantText(): string {
+    const msgs = this.session.history();
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (m.role === "assistant" && typeof m.content === "string" && m.content.trim()) return m.content;
+    }
+    return "";
+  }
+
+  /**
+   * Confirm / edit / reject buttons for a proposed library entry, shown when
+   * the capture or blend turn stops at the form instead of writing files.
+   * Confirm re-sends the form as the user's own message — with corrections,
+   * when any field was edited — so the model writes exactly what was approved.
+   */
+  async confirmUiEntry(proposal: string): Promise<void> {
+    this.pendingUilibGate = null;
+    if (!proposal) return;
+    // A model that ignored "stop and wait" has already written the files;
+    // confirming again would just bounce off an existing folder.
+    const slug = /^\s*(?:[-*]\s*)?slug\s*[:=]\s*["'`]?([\w-]+)/im.exec(proposal)?.[1];
+    if (slug && getEntry(slug)) {
+      hint(t(`Already saved as ${slug}.`, `Уже сохранено как ${slug}.`));
+      return;
+    }
+    line();
+    padded(c.bold(t("Proposed library entry:", "Предложен макет для библиотеки:")));
+    hint(c.gray(t("Confirm saves it; Edit lets you correct the fields first.", "Подтвердить — сохранить; Изменить — сначала поправить поля.")));
+
+    const answer = await this.exclusiveInput(() =>
+      choose<"confirm" | "edit" | "reject">(
+        [
+          { value: "confirm", label: t("Confirm", "Подтвердить"), key: "y", tone: "ok" },
+          { value: "edit", label: t("Edit", "Изменить"), key: "e" },
+          { value: "reject", label: t("Reject", "Отменить"), key: "n", tone: "danger" },
+        ],
+        { initial: "confirm", fallback: "reject", cancel: () => {} },
+      ),
+    );
+
+    // The answer to the gate talks about a mockup and asks for none: without
+    // the flag it goes back through the design matcher on its way out, and
+    // the library offers to draw the very entry being saved. Armed at each
+    // send, not once here, so an edit cancelled halfway leaves nothing armed.
+    if (answer === "reject") {
+      this.skipNextDesignMatch = true;
+      this.queue(t("REJECTED — do not save anything to the UI library.", "ОТМЕНЕНО — ничего не сохраняй в библиотеку макетов."));
+      return;
+    }
+
+    let form = extractEntryForm(proposal);
+    if (answer === "edit") {
+      const edited = await this.editEntryForm(form);
+      if (!edited) return; // cancelled mid-edit
+      form = edited;
+    }
+    this.skipNextDesignMatch = true;
+    this.queue(`CONFIRMED — save it now.\n\n${form}`);
+  }
+
+  /** Steps through the four fields of the proposal, each prefilled. */
+  private async editEntryForm(form: string): Promise<string | null> {
+    const fields = ["slug", "title", "summary", "keywords"];
+    const current: Record<string, string> = {};
+    for (const f of fields) current[f] = "";
+    const lines = form.split("\n").map((l) => l.trim()).filter(Boolean);
+    for (const l of lines) {
+      const m = /^(slug|title|summary|keywords)\s*[:=]\s*(.*)$/i.exec(l);
+      if (m) current[m[1].toLowerCase()] = m[2];
+    }
+    const out: string[] = [];
+    for (const f of fields) {
+      const v = await this.exclusiveInput(() => askLine(`${f}:`, current[f]));
+      if (v === null) return null;
+      out.push(`${f}: ${v}`);
+    }
+    return out.join("\n");
+  }
+
+  /**
+   * The UI library's half of auto-selection: a request that asks for a design
+   * gets the matching saved mockup injected as the visual reference — after
+   * picking it in the library picker, unless there is exactly one hit and it
+   * stands alone by a wide margin, in which case the pick is made for the user.
+   *
+   * An empty library only gets told about once per session: a notice that
+   * repeats on every design request is noise, not discovery.
+   */
+  private async autoLoadDesign(text: string): Promise<void> {
+    // A capture/blend prompt is about the library itself — offering its own
+    // entries as the reference for saving a new one is circular.
+    if (this.skipNextDesignMatch) {
+      this.skipNextDesignMatch = false;
+      return;
+    }
+    // Asking for a design is the gate, not merely mentioning words a saved
+    // entry happens to be keyed on. Every message shares vocabulary with some
+    // mockup — "dark", "saas", "terminal" — and matching on that alone put the
+    // picker in front of conversations that had nothing to do with design.
+    if (!isDesignRequest(text)) return;
+    const entries = listEntries();
+    if (!entries.length) {
+      if (!this.uilibNoticeShown) {
+        this.uilibNoticeShown = true;
+        line();
+        hint(
+          tr(
+            "Your UI library is empty — save a design once and every later \"нарисуй дизайн …\" request can reuse it:",
+            "Ваша библиотека макетов пуста — сохраните дизайн один раз, и каждый следующий запрос «нарисуй дизайн …» сможет его использовать:",
+          ),
+        );
+        hint(c.gray("  /uilib add <site-url>"));
+      }
+      return;
+    }
+    const matches = matchLibrary(text);
+    if (!matches.length) return;
+    const solo = matches[0].score >= 4 && (matches.length === 1 || matches[0].score >= matches[1].score * 2);
+    let picked:
+      | { entry: UiEntry; brief: string }
+      | { entry: UiEntry; brief: string }[]
+      | "none"
+      | null = null;
+    if (solo) {
+      const got = getEntry(matches[0].entry.slug);
+      if (got) {
+        picked = got;
+        success(tr(`design reference: ${got.entry.title}`, `дизайн-референс: ${got.entry.title}`));
+      }
+    } else {
+      picked = await pickUiEntry(this, text);
+    }
+    if (!picked || picked === "none") return;
+    // A blend arrives as several references in one injection; a single pick as one.
+    const parts = Array.isArray(picked) ? picked : [picked];
+    const single = !Array.isArray(picked) ? picked : null;
+    this.session.add({
+      role: "user",
+      content: single
+        ? designInjection(single.entry, single.brief, Boolean(solo))
+        : blendInjection(parts),
+      meta: { skill: `uilib:${parts.map((p) => p.entry.slug).join("+")}` },
+    });
+  }
+
   /**
    * The other half of auto-selection: the same match, run again at every step
    * boundary of the turn.
@@ -974,6 +1181,7 @@ export class App {
     markTurn(this.session, text);
     this.session.add({ role: "user", content: text });
     this.autoLoadSkill(text);
+    await this.autoLoadDesign(text);
 
     this.usage.beginTurn();
     this.lastReasoning = "";
@@ -1061,6 +1269,7 @@ export class App {
         effort: this.effort(),
         toolConcurrency: this.cfg.toolConcurrency,
         interject: this.stepSkills(),
+        projection: { cwd: this.cwd, sessionId: this.session.id },
         // A silent stream is a question, not a verdict: the user can see the
         // clock and decide whether the model is worth waiting for.
         onStall: async (idleMs) => {
@@ -1228,6 +1437,15 @@ export class App {
       endRateWait();
       const { queued, draft } = bar.stop();
       this.bar = null;
+      // The uilib capture/blend gate comes after the bar is gone: its buttons
+      // are plain transcript rows, and drawing them over a live footer is what
+      // printed the button row twice. The answer still goes out as the next
+      // message — the queue below picks it up in the same breath.
+      if (this.pendingUilibGate && !this.abort?.signal.aborted) {
+        const gate = this.pendingUilibGate;
+        this.pendingUilibGate = null;
+        await gate(this.lastAssistantText());
+      }
       // Esc means stop, including whatever was typed while waiting. Sending
       // the queue anyway starts a new turn in the same breath, which reads as
       // Esc having done nothing at all — the queued text is handed back to the
@@ -1305,7 +1523,7 @@ export class App {
         this.session.model = alt;
         this.session.save();
         opts.model = alt;
-        opts.systemPrompt = buildSystemPrompt({ cwd: this.cwd, model: alt, skills: this.activeSkills });
+        opts.systemPrompt = buildSystemPrompt({ cwd: this.cwd, model: alt, skills: this.activeSkills, preset: this.preset });
         opts.effort = this.effort();
         this.rebuildTools();
         opts.tools = this.tools;

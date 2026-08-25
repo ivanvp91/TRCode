@@ -120,6 +120,29 @@ function isCacheComplaint(err: ApiError): boolean {
   return err.status === 400 && /cache_control|cache_creation|ephemeral|extended-cache-ttl/i.test(err.body ?? err.message);
 }
 
+/**
+ * Models learned to refuse multimodal content blocks. The refusal names the
+ * image in its own words ("image_url is not supported", "invalid content
+ * type"); matching loosely costs a false positive only when the request also
+ * carried images, in which case plain text is exactly the right fallback.
+ */
+const imageRejected = new Set<string>();
+
+function hasImages(messages: Message[]): boolean {
+  return messages.some((m) => m.images?.length && !m.meta?.hidden);
+}
+
+function isImageComplaint(err: ApiError): boolean {
+  const body = err.body ?? err.message;
+  // A router refuses one step earlier and under another status: it has no
+  // endpoint that takes pixels, so for this request the model does not exist
+  // ("No endpoints found that support image input"). Insisting on that routing
+  // wording keeps a plain missing-model 404 whose id happens to read "image"
+  // (qwen-image-plus) out of the multimodal path.
+  if (err.status === 404) return /no endpoints?\b|support[^.]{0,24}image|image[^.]{0,24}(input|support)/i.test(body);
+  return err.status === 400 && /image_url|input_image|image\b|multimodal|content type|content_type/i.test(body);
+}
+
 /** Current form for a model, defaulting to the first one we try. */
 function ladderFor(model: string): EffortForm[] {
   return EFFORT_LADDER[protocolForModel(model)] ?? EFFORT_LADDER.openai;
@@ -223,11 +246,19 @@ export function repairToolPairs(messages: Message[]): Message[] {
   return out;
 }
 
-function wireMessages(messages: Message[]): unknown[] {
+function wireMessages(model: string, messages: Message[]): unknown[] {
+  // A model that already refused image blocks gets text only — see postChat.
+  const stripImages = imageRejected.has(model);
   return messages
     .filter((m) => !m.meta?.hidden)
     .map((m) => {
       const out: Record<string, unknown> = { role: m.role, content: m.content ?? "" };
+      if (!stripImages && m.images?.length && (m.role === "tool" || m.role === "user")) {
+        out.content = [
+          ...(m.content ? [{ type: "text", text: m.content }] : []),
+          ...m.images.map((img) => ({ type: "image_url", image_url: { url: `data:${img.mime};base64,${img.data}` } })),
+        ];
+      }
       if (m.name) out.name = m.name;
       if (m.tool_calls?.length) out.tool_calls = m.tool_calls;
       if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
@@ -270,7 +301,7 @@ function buildBody(req: ChatRequest, stream: boolean): Record<string, unknown> {
   const cfg = loadConfig();
   const body: Record<string, unknown> = {
     model: wireModelId(req.model),
-    messages: wireMessages(req.messages),
+    messages: wireMessages(req.model, req.messages),
     stream,
   };
   applyEffort(body, req.model, req.effort);
@@ -515,6 +546,13 @@ async function postChat(req: ChatRequest, stream: boolean): Promise<Response> {
         continue;
       }
       const form = formFor(req.model);
+      // A host that cannot take multimodal content: resend as plain text. The
+      // images stay in the stored history; only this request loses them, and
+      // the model is learned once so later steps do not pay a round-trip.
+      if (err instanceof ApiError && hasImages(req.messages) && !imageRejected.has(req.model) && isImageComplaint(err)) {
+        imageRejected.add(req.model);
+        continue;
+      }
       const worthRetrying =
         err instanceof ApiError &&
         err.status === 400 &&

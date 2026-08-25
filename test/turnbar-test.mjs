@@ -118,6 +118,9 @@ await key("\r"); // queue it
   const t = strip(screen.text());
   check("a queued message is listed", /queued: and what about test/.test(t), t);
   check("the frame is empty again", /│ ❯\s+│/.test(t), t);
+  // The queued row makes the bar one taller, and the row it takes must not be
+  // the last line of the transcript.
+  check("queueing does not eat the line above the bar", /grep\(TurnBar\)/.test(t), t);
 }
 
 await key(ESC);
@@ -225,8 +228,12 @@ line("   after the turn");
   setFooter(null);
 }
 
-// Growing the bar used to paint extra rows below it and the terminal scrolled
-// the input frame off the bottom — the box "vanished" while the model thought.
+// A bar that grows — the reasoning preview arriving, a queued line appearing —
+// needs rows it does not have. Taking them from the transcript above painted
+// the bar over what was already written there: the echo of the message that
+// started the turn is the last thing printed before the preview shows up, and
+// it disappeared. The extra rows are opened underneath instead, so the bar
+// keeps its place at the bottom and the transcript scrolls away intact.
 {
   const { setFooter, refreshFooter } = await import("../dist/ui/render.js");
   const grow = new Screen(100);
@@ -234,16 +241,18 @@ line("   after the turn");
   process.stdout.write = (chunk) => { grow.write(String(chunk)); return true; };
 
   for (let i = 0; i < 8; i++) grow.write("transcript " + i + "\n");
-  const bottomBefore = grow.maxRow;
+  grow.write("   ✦ последнее сообщение пользователя\n");
   let rows = ["  ⠋ thinking", "  ╭────╮", "  │ ❯  │", "  ╰────╯"];
   setFooter(() => rows);
-  const bottomWithBar = grow.maxRow;
   rows = ["  reasoning one", "  reasoning two", "  ⠙ thinking", "  ╭────╮", "  │ ❯  │", "  ╰────╯"];
   refreshFooter();
 
   process.stdout.write = outerWrite;
-  const t = grow.lines().map(strip).join("\n");
-  check("growing the bar does not scroll the frame off", grow.maxRow === bottomWithBar, `before ${bottomBefore} with-bar ${bottomWithBar} after ${grow.maxRow}`);
+  const shown = grow.lines().map(strip);
+  const t = shown.join("\n");
+  check("the echoed message survives the bar growing over it", /✦ последнее сообщение/.test(t), t);
+  check("no transcript line is painted over", shown.filter((l) => /^transcript /.test(l)).length === 8, t);
+  check("the bar still ends at the bottom of the screen", shown.slice(-6).join("\n") === rows.join("\n"), t);
   check("the input frame is still on screen after reasoning arrives", /╭────╮/.test(t) && /│ ❯/.test(t), t);
   setFooter(null);
 }

@@ -279,6 +279,15 @@ const SEED: ModelInfo[] = [
   );
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000;
+/**
+ * How long a provider that refused to list its models is left alone. Without
+ * this, a lapsed subscription or a wrong key costs a live round-trip on every
+ * single launch — the request fails the same way each time, and the fallback
+ * is the seed catalog either way.
+ */
+const FAIL_TTL_MS = 30 * 60 * 1000;
+/** No single provider may hold the catalog — and so the prompt — hostage. */
+const FETCH_TIMEOUT_MS = 4000;
 
 function cacheFile(): string {
   return path.join(ensureDir(configDir()), "models.cache.json");
@@ -288,19 +297,28 @@ interface CacheShape {
   fetchedAt: number;
   baseUrl: string;
   models: ModelInfo[];
+  /** Set when the last attempt failed; cleared by the next success. */
+  failedAt?: number;
 }
 
 /** One entry per provider: they are fetched, and go stale, independently. */
 type CacheFile = Record<string, CacheShape>;
 
+// The file holds every provider's catalog and runs to a few hundred KB, so
+// parsing it once per provider per launch is pure waste. One process never
+// sees another's writes mid-run, so a memo here cannot go stale.
+let cacheMemo: CacheFile | null = null;
+
 function readCacheFile(): CacheFile {
+  if (cacheMemo) return cacheMemo;
   try {
     const raw = JSON.parse(fs.readFileSync(cacheFile(), "utf8"));
     // Pre-multi-provider caches were a bare CacheShape; let those expire.
-    return raw && typeof raw === "object" && !Array.isArray(raw.models) ? (raw as CacheFile) : {};
+    cacheMemo = raw && typeof raw === "object" && !Array.isArray(raw.models) ? (raw as CacheFile) : {};
   } catch {
-    return {};
+    cacheMemo = {};
   }
+  return cacheMemo;
 }
 
 function readCache(providerId: string, baseUrl: string, opts: { stale?: boolean } = {}): ModelInfo[] | null {
@@ -310,14 +328,31 @@ function readCache(providerId: string, baseUrl: string, opts: { stale?: boolean 
   return entry.models?.length ? entry.models : null;
 }
 
-function writeCache(providerId: string, baseUrl: string, models: ModelInfo[]): void {
+/** True while a provider's last refusal is recent enough to trust. */
+function recentlyFailed(providerId: string, baseUrl: string): boolean {
+  const entry = readCacheFile()[providerId];
+  if (!entry || entry.baseUrl !== baseUrl || !entry.failedAt) return false;
+  return Date.now() - entry.failedAt < FAIL_TTL_MS;
+}
+
+function writeCacheEntry(providerId: string, baseUrl: string, patch: Partial<CacheShape>): void {
   try {
     const all = readCacheFile();
-    all[providerId] = { fetchedAt: Date.now(), baseUrl, models };
+    const prev = all[providerId]?.baseUrl === baseUrl ? all[providerId] : undefined;
+    all[providerId] = { fetchedAt: 0, models: [], ...prev, baseUrl, ...patch };
+    cacheMemo = all;
     fs.writeFileSync(cacheFile(), JSON.stringify(all, null, 2));
   } catch {
     /* cache is best-effort */
   }
+}
+
+function writeCache(providerId: string, baseUrl: string, models: ModelInfo[]): void {
+  writeCacheEntry(providerId, baseUrl, { fetchedAt: Date.now(), models, failedAt: undefined });
+}
+
+function markFailed(providerId: string, baseUrl: string): void {
+  writeCacheEntry(providerId, baseUrl, { failedAt: Date.now() });
 }
 
 /**
@@ -476,7 +511,9 @@ function stampProviderFacts(m: ModelInfo, mode: ProviderMode): ModelInfo {
  * The catalog of every connected provider, merged. Each is fetched and cached
  * on its own, so a host being down costs that host's entries and nothing else.
  */
-export async function fetchModels(opts: { force?: boolean; signal?: AbortSignal } = {}): Promise<ModelInfo[]> {
+export async function fetchModels(
+  opts: { force?: boolean; signal?: AbortSignal; cacheOnly?: boolean } = {},
+): Promise<ModelInfo[]> {
   const connected = configuredProviders();
   if (!connected.length) return decorate(SEED);
 
@@ -485,9 +522,41 @@ export async function fetchModels(opts: { force?: boolean; signal?: AbortSignal 
   return decorate(merged.length ? merged : SEED);
 }
 
+/**
+ * The catalog as it stands on disk, without touching the network — what the
+ * prompt opens with. Anything missing or stale is filled in by a background
+ * fetchModels() whose result replaces this one.
+ */
+export function cachedModels(): ModelInfo[] {
+  const connected = configuredProviders();
+  if (!connected.length) return decorate(SEED);
+  const merged = connected.flatMap((p) => {
+    const mode = modeFor(p.id);
+    const modeCfg = mode ? modeConfig(p.id, mode) : null;
+    if (!mode || !modeCfg) return [];
+    return (
+      readCache(p.id, modeCfg.baseUrl, { stale: true }) ??
+      (p.id === DEFAULT_PROVIDER ? SEED : seedModels(p.id, mode))
+    );
+  });
+  return decorate(merged.length ? merged : SEED);
+}
+
+/** True when every connected provider has a fresh catalog already on disk. */
+export function catalogIsFresh(): boolean {
+  const connected = configuredProviders();
+  if (!connected.length) return true;
+  return connected.every((p) => {
+    const mode = modeFor(p.id);
+    const modeCfg = mode ? modeConfig(p.id, mode) : null;
+    if (!mode || !modeCfg || !modeCfg.listModels) return true;
+    return Boolean(readCache(p.id, modeCfg.baseUrl)) || recentlyFailed(p.id, modeCfg.baseUrl);
+  });
+}
+
 async function fetchProviderModels(
   providerId: string,
-  opts: { force?: boolean; signal?: AbortSignal },
+  opts: { force?: boolean; signal?: AbortSignal; cacheOnly?: boolean },
 ): Promise<ModelInfo[]> {
   const mode = modeFor(providerId);
   const modeCfg = mode ? modeConfig(providerId, mode) : null;
@@ -501,12 +570,17 @@ async function fetchProviderModels(
     const hit = readCache(providerId, modeCfg.baseUrl);
     if (hit) return hit;
   }
+  if (opts.cacheOnly) return fallback();
   if (!modeCfg.listModels) return fallback();
+  // An explicit refresh always asks again — the user may have just fixed the
+  // very thing that was failing.
+  if (!opts.force && recentlyFailed(providerId, modeCfg.baseUrl)) return fallback();
 
   try {
     const auth = await resolveAuth(providerId);
     const catalog = modeCfg.catalogPath ?? "models";
-    const res = await fetch(`${auth.baseUrl}/${catalog}`, { headers: auth.headers, signal: opts.signal });
+    const signal = opts.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS);
+    const res = await fetch(`${auth.baseUrl}/${catalog}`, { headers: auth.headers, signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body: any = await res.json();
     const list: any[] = Array.isArray(body) ? body : body?.data ?? [];
@@ -519,6 +593,7 @@ async function fetchProviderModels(
     writeCache(providerId, modeCfg.baseUrl, models);
     return models;
   } catch {
+    markFailed(providerId, modeCfg.baseUrl);
     return fallback();
   }
 }

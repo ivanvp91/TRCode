@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { sessionsDir } from "../config.js";
+import { removeProjection } from "./projection.js";
 import { UsageTracker, historyTokens, type ModelUsage } from "../usage.js";
 import type { Message } from "../types.js";
 
@@ -25,6 +26,12 @@ interface SessionFile {
   messages: Message[];
   usage: ModelUsage[];
 }
+
+/**
+ * Above this, a session file is certainly not empty: metadata and usage on
+ * their own never come near it, and one stored message clears it easily.
+ */
+const EMPTY_SESSION_MAX_BYTES = 8 * 1024;
 
 export class Session {
   readonly id: string;
@@ -148,6 +155,7 @@ export class Session {
   static remove(cwd: string, id: string): boolean {
     try {
       fs.unlinkSync(path.join(sessionsDir(cwd), `${id}.json`));
+      removeProjection(cwd, id);
       return true;
     } catch {
       return false;
@@ -170,6 +178,11 @@ export class Session {
     for (const n of names) {
       const file = path.join(dir, n);
       try {
+        // A session with even one message runs to several KB, so anything
+        // larger than a stub cannot be empty. Reading and parsing every
+        // transcript in the project — some of them hundreds of KB — to learn
+        // that is the slowest thing startup used to do.
+        if (fs.statSync(file).size > EMPTY_SESSION_MAX_BYTES) continue;
         const data = JSON.parse(fs.readFileSync(file, "utf8")) as SessionFile;
         if ((data.messages ?? []).length) continue;
         fs.unlinkSync(file);
@@ -184,6 +197,28 @@ export class Session {
   static latest(cwd: string): Session | null {
     const [top] = Session.list(cwd, 1);
     return top ? Session.load(cwd, top.id) : null;
+  }
+
+  /**
+   * A branch, not a rewind: a new session carrying this one's history up to
+   * `at` messages, while the original stays untouched on disk and keeps its
+   * checkpoint log. Tool-call pairs are never split — the cut moves back to
+   * before the assistant message that issued them, the same rule trim lives
+   * by; a history ending in a dangling tool result is one most hosts refuse.
+   */
+  static forkFrom(source: Session, at: number): Session | null {
+    const messages = source.messages.slice(0, at);
+    // Walk back over a trailing tool run so the cut lands between turns.
+    while (messages.length && messages[messages.length - 1].role === "tool") messages.pop();
+    if (messages.length && messages[messages.length - 1]?.tool_calls) messages.pop();
+    const forked = new Session({
+      cwd: source.cwd,
+      model: source.model,
+      title: (source.title || deriveTitle(source)).slice(0, 110) + " · fork",
+      createdAt: Date.now(),
+    });
+    forked.messages = messages.map((m) => structuredClone(m));
+    return forked;
   }
 }
 

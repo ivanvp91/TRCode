@@ -37,6 +37,9 @@ Every step re-sends the whole conversation, so what you pull in you pay for agai
 - Do not read a file you have already read in this session — it is still above you in the transcript. An old result that was shortened says so in its own text; only then read it again.
 - Prefer edit over rewriting a file with write: a diff costs a fraction of a full copy.
 
+# Images
+A pasted screenshot arrives as "[Image #N]" and a temp-file path — call read_image on that path to see it; the read tool refuses binary. If the model has no vision, say so rather than guess what was on the screen.
+
 # Memory
 - A durable project fact goes to the memory tool the turn you learn it.`;
 
@@ -48,12 +51,27 @@ const SUBAGENT_BASE = `You are a TRCode subagent, launched by the lead agent for
 - If you could not find or verify something, say so explicitly instead of filling the gap with a guess.
 - grep first, then read around the hit with offset/limit. Reading whole files you do not need costs the same on every step of your own loop.`;
 
+/**
+ * The minimal preset has two tools and no safety net of snapshots around them:
+ * no checkpoint previews for shell writes, no read-before-overwrite guard.
+ * State that plainly — a model told what it does not have stops reaching for it.
+ */
+const MINIMAL_BASE = `You are TRCode in minimal mode: exactly two tools, shell and edit.
+
+- Inspect with shell (dir/ls, type/cat, git log), change files with edit only.
+- There is no read tool: to see a file before editing it, print it through shell.
+- There is no write tool: edit replaces exact strings, so quote enough context to hit the right spot.
+- Shell redirects and one-liners that write files are outside the snapshot undo — say so when you use them.
+- Be brief and surgical: this mode exists for small, fast changes.`;
+
 export interface PromptOptions {
   cwd: string;
   model: string;
   skills: Skill[];
   extraInstructions?: string;
   subagent?: boolean;
+  /** "minimal" swaps the full base prompt for the two-tool one. */
+  preset?: "standard" | "minimal";
 }
 
 /**
@@ -199,6 +217,13 @@ function sshHostsLine(): string {
 }
 
 export function buildSystemPrompt(opts: PromptOptions): string {
+  if (opts.preset === "minimal") {
+    // Minimal keeps only the base and the language directive: no listing, git,
+    // skills, memory or model notes — the preset exists to shed exactly these.
+    const parts = [MINIMAL_BASE, `<language>\n${languageDirective(loadConfig().lang)}\n</language>`];
+    if (opts.extraInstructions) parts.push(`<session-instructions>\n${opts.extraInstructions}\n</session-instructions>`);
+    return parts.join("\n\n");
+  }
   const parts = [opts.subagent ? SUBAGENT_BASE : BASE];
 
   // Stated rather than inferred: "answer in the user's language" makes a model

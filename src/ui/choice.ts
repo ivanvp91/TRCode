@@ -1,5 +1,5 @@
 /** Horizontal button row: ← → to move, Enter to confirm, letters as shortcuts. */
-import { c, cursor, width } from "./ansi.js";
+import { c, clipAnsi, cursor, esc, termWidth, width } from "./ansi.js";
 import { indent } from "./layout.js";
 import { line, out } from "./render.js";
 import { pushConsumer } from "./stdin.js";
@@ -33,22 +33,64 @@ export function choose<T extends string>(
 
   return new Promise((resolve) => {
     let index = Math.max(0, choices.findIndex((ch) => ch.value === opts.initial));
-    let drawn = false;
+    /** Physical rows the last paint left on screen — what the next one clears. */
+    let drawnRows = 0;
+
+    /**
+     * The buttons, wrapped into physical rows by hand.
+     *
+     * A row long enough to wrap by itself is the bug this exists to avoid: the
+     * terminal's own wrap puts the cursor on the last row only, so the next
+     * repaint clears that row and leaves every row above it on screen — one
+     * more copy of the buttons per keypress. Wrapping here means the count of
+     * rows is known, and a repaint can clear exactly what it drew. A single
+     * button wider than the terminal is clipped for the same reason: it is the
+     * one case where keeping the button whole would cost the row count.
+     */
+    const buttonRows = (): string[] => {
+      const max = termWidth() - 1;
+      const lead = width(indent);
+      const parts = choices.map((ch, i) => {
+        const tone = ch.tone === "danger" ? c.red : ch.tone === "warn" ? c.yellow : c.green;
+        const text = ` ${ch.label} `;
+        const button = i === index ? c.inverse(c.bold(tone(text))) : c.gray("[") + tone(ch.label) + c.gray("]");
+        return width(button) > max - lead ? clipAnsi(button, max - lead) : button;
+      });
+      const rows: string[] = [];
+      let row = indent;
+      let w = lead;
+      for (const part of parts) {
+        const sep = w > lead ? "  " : "";
+        if (w > lead && w + width(sep) + width(part) > max) {
+          rows.push(row);
+          row = indent + part;
+          w = lead + width(part);
+          continue;
+        }
+        row += sep + part;
+        w += width(sep) + width(part);
+      }
+      // The buttons stay whole; the hint is what yields when the row does not
+      // fit — a clipped hint reads as a styled dash, a clipped button is a
+      // button that cannot be read or picked.
+      const room = max - w - 3;
+      if (room > 4) row += c.gray("   " + clipAnsi(opts.hint ?? "←/→ · Enter to confirm", room));
+      rows.push(row);
+      return rows;
+    };
+
+    /** Back to the top-left of what was drawn, clearing all of it. */
+    const rewind = (): string =>
+      drawnRows ? esc.up(drawnRows - 1) + esc.toColumn(1) + esc.clearDown : "";
 
     const paint = () => {
-      if (drawn) {
-        cursor.clearLine();
-        cursor.toColumn(1);
-      }
-      const buttons = choices
-        .map((ch, i) => {
-          const tone = ch.tone === "danger" ? c.red : ch.tone === "warn" ? c.yellow : c.green;
-          const text = ` ${ch.label} `;
-          return i === index ? c.inverse(c.bold(tone(text))) : c.gray("[") + tone(ch.label) + c.gray("]");
-        })
-        .join("  ");
-      out(indent + buttons + c.gray("   " + (opts.hint ?? "←/→ · Enter to confirm")));
-      drawn = true;
+      // One write, not one per row: a terminal that repaints between two of
+      // them would be caught with the old rows cleared and the new ones not
+      // there yet. Going through out() (not raw stdout) keeps this widget in
+      // sync with render.ts's frame state.
+      const rows = buttonRows();
+      out(rewind() + rows.join("\n"));
+      drawnRows = rows.length;
     };
 
     let release: () => void = () => {};
@@ -57,11 +99,11 @@ export function choose<T extends string>(
 
     const finish = (value: T) => {
       release();
-      cursor.clearLine();
-      cursor.toColumn(1);
       const picked = choices.find((ch) => ch.value === value);
       const tone = picked?.tone === "danger" ? c.red : picked?.tone === "warn" ? c.yellow : c.green;
-      line(indent + tone("▸ " + (picked?.label ?? value)));
+      out(rewind() + indent + tone("▸ " + (picked?.label ?? value)));
+      drawnRows = 0;
+      line();
       cursor.show();
       resolve(value);
     };
@@ -95,4 +137,4 @@ export function choose<T extends string>(
   });
 }
 
-export { width as _width };
+export { termWidth as _width };

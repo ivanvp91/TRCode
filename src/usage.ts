@@ -13,6 +13,25 @@ export interface ModelUsage {
   priceUnknown: boolean;
   /** When this model was last used, so /stat can filter by period. */
   lastUsed?: number;
+  /**
+   * The same counts split by local day (YYYY-MM-DD). A row is a whole
+   * session's aggregate, and lastUsed alone cannot say which part of it
+   * falls into "today" — these buckets can. Rows recorded before daily
+   * accounting existed have none, and fall back to the lastUsed guess.
+   */
+  daily?: Record<string, DayUsage>;
+  /** Which session file the row came from — how /stat dates legacy rows. */
+  sessionFile?: string;
+}
+
+/** One day's share of a model's usage — what /stat periods filter on. */
+export interface DayUsage {
+  requests: number;
+  input: number;
+  output: number;
+  cached: number;
+  reasoning: number;
+  costUsd: number;
 }
 
 export interface TurnTotals {
@@ -24,6 +43,14 @@ export interface TurnTotals {
 }
 
 const zeroTurn = (): TurnTotals => ({ requests: 0, input: 0, cached: 0, output: 0, reasoning: 0 });
+
+/** The local day a timestamp falls on, as the bucket key for `daily`. */
+export function dayKey(at: number): string {
+  const d = new Date(at);
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${d.getFullYear()}-${m}-${day}`;
+}
 
 export class UsageTracker {
   private byModel = new Map<string, ModelUsage>();
@@ -71,6 +98,20 @@ export class UsageTracker {
     entry.costUsd += cost;
     entry.priceUnknown = entry.priceUnknown || !price;
     entry.lastUsed = Math.max(entry.lastUsed ?? 0, at);
+    const day = ((entry.daily ??= {})[dayKey(at)] ??= {
+      requests: 0,
+      input: 0,
+      output: 0,
+      cached: 0,
+      reasoning: 0,
+      costUsd: 0,
+    });
+    day.requests++;
+    day.input += usage.prompt_tokens;
+    day.output += usage.completion_tokens;
+    day.cached += cached;
+    day.reasoning += usage.reasoning_tokens ?? 0;
+    day.costUsd += cost;
     this.byModel.set(model, entry);
 
     this.lastTurn = {
@@ -126,6 +167,18 @@ export class UsageTracker {
       entry.costUsd += u.costUsd;
       entry.priceUnknown = entry.priceUnknown || u.priceUnknown;
       entry.lastUsed = Math.max(entry.lastUsed ?? 0, u.lastUsed ?? 0);
+      if (u.daily) {
+        const dst = (entry.daily ??= {});
+        for (const [k, v] of Object.entries(u.daily)) {
+          const d = (dst[k] ??= { requests: 0, input: 0, output: 0, cached: 0, reasoning: 0, costUsd: 0 });
+          d.requests += v.requests;
+          d.input += v.input;
+          d.output += v.output;
+          d.cached += v.cached;
+          d.reasoning += v.reasoning ?? 0;
+          d.costUsd += v.costUsd;
+        }
+      }
       this.byModel.set(u.model, entry);
     }
   }

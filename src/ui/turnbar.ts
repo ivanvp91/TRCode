@@ -10,7 +10,7 @@
 import { c, clipAnsi, width } from "./ansi.js";
 import { contentWidth, indent, PAD_LEFT } from "./layout.js";
 import { fmtDuration } from "./layout.js";
-import { line, padded, refreshFooter, renderMarkdownBlock, setFooter } from "./render.js";
+import { expandedBlock, line, padded, refreshFooter, setFooter } from "./render.js";
 import { pushConsumer } from "./stdin.js";
 import { cleanPaste, isPartialEscape, isNewlineKey, KEY, locatePos, rowSpansOf, SHIFT_TAB, type EditorStatus } from "./editor.js";
 import { stashPaste, takeCollapsed } from "./paste.js";
@@ -337,7 +337,7 @@ export class TurnBar {
         if (!block) return;
         this.pause();
         line();
-        for (const l of renderMarkdownBlock(block.text)) padded(l);
+        for (const l of expandedBlock(block.text)) padded(l);
         line();
         this.start();
         return;

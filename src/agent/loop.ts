@@ -5,6 +5,13 @@
 import { streamChat, ApiError, describeConnectionDrop, isConnectionDrop } from "../provider/client.js";
 import { loadConfig, type Effort } from "../config.js";
 import { trimForRequest } from "../session/trim.js";
+import {
+  appendProjection,
+  historyWireSize,
+  systemPromptSize,
+  toolSchemaSize,
+  type InjectedContext,
+} from "../session/projection.js";
 import { boundToolOutput } from "../tools/spill.js";
 import { contextWindowFor } from "../provider/models.js";
 import type { Message, ModelInfo, ToolCall, ToolContext, ToolDef, Usage } from "../types.js";
@@ -58,6 +65,12 @@ export interface RunOptions {
    * and by then nothing is looking. See skills/match.ts.
    */
   interject?: (assistant: Message, calls: ToolCall[]) => Message | null;
+  /**
+   * When set, every request appends a projection record — what the model was
+   * actually sent, by component — to the session's .proj.jsonl. Absent for
+   * subagents and one-shot runs: their costs land in the caller's tracker.
+   */
+  projection?: { cwd: string; sessionId: string };
 }
 
 export interface RunResult {
@@ -109,6 +122,8 @@ async function runToolCalls(
   concurrency: number,
   /** Filled as each call finishes, so an interrupt can keep what did. */
   results: Message[] = new Array(calls.length),
+  /** The stream hit the output limit: unparseable args are a cut, not a typo. */
+  truncated = false,
 ): Promise<Message[]> {
   let next = 0;
   // Bounding happens here, once, on the way into the history — and nothing
@@ -135,11 +150,14 @@ async function runToolCalls(
 
       const parsed = parseArgs(call.function.arguments);
       if (!parsed.ok) {
+        const said = truncated
+          ? `The call was cut off at the output limit before its arguments finished (${parsed.error}) — nothing was written or changed. Write it in smaller pieces, or trim the content.`
+          : `Could not parse the arguments: ${parsed.error}. Call again with valid JSON.`;
         results[i] = {
           role: "tool",
           tool_call_id: call.id,
           name: tool.name,
-          content: `Could not parse the arguments: ${parsed.error}. Call again with valid JSON.`,
+          content: said,
         };
         events?.onToolEnd?.(tool, false, parsed.error, call);
         continue;
@@ -159,6 +177,9 @@ async function runToolCalls(
           tool_call_id: call.id,
           name: tool.name,
           content: bound.content,
+          // Screenshots and the like: real image content for a vision model,
+          // not a path it cannot follow. Trim drops them from old results.
+          images: res.images,
         };
         // The user sees what the tool actually produced; only what travels
         // with every later request is bounded.
@@ -219,6 +240,18 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     if (trim.trimmed) events?.onTrim?.(trim.saved, trim.trimmed);
     const wire: Message[] = [{ role: "system", content: opts.systemPrompt }, ...trim.messages];
 
+    // What the model is about to see, by component. The stored history alone
+    // cannot answer that after a resume: trim rewrote old results and the
+    // interjected messages sit in the middle of it. Written once the response
+    // arrives, so the record carries the provider's usage too.
+    let injected: InjectedContext[] = [];
+    if (opts.projection) {
+      for (const m of wire) {
+        const skill = m.meta?.skill as string | undefined;
+        if (skill) injected.push({ source: `skill:${skill}`, tokens: historyWireSize([m]) });
+      }
+    }
+
     let text = "";
     let toolCalls: ToolCall[] = [];
     let finishReason = "stop";
@@ -272,6 +305,22 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
     opts.usage.record(opts.model, usage, opts.catalog, Date.now());
     events?.onUsage?.(opts.model, usage);
+    if (opts.projection) {
+      const { cwd, sessionId } = opts.projection;
+      appendProjection(cwd, sessionId, {
+        step,
+        ts: Date.now(),
+        model: opts.model,
+        systemTokens: systemPromptSize(opts.systemPrompt),
+        schemaTokens: toolSchemaSize(tools),
+        historyTokens: historyWireSize(wire.slice(1)),
+        injected,
+        trimmed: trim.trimmed,
+        trimSaved: trim.saved,
+        promptTokens: usage?.prompt_tokens,
+        cachedTokens: usage?.cached_tokens,
+      });
+    }
 
     const assistantMsg: Message = {
       role: "assistant",
@@ -295,7 +344,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // of an interrupted round are discarded either way.
     const partial: Message[] = new Array(toolCalls.length);
     const toolMessages = await Promise.race([
-      runToolCalls(toolCalls, tools, opts.toolContext, events, opts.toolConcurrency ?? 4, partial),
+      runToolCalls(toolCalls, tools, opts.toolContext, events, opts.toolConcurrency ?? 4, partial, finishReason === "length"),
       whenAborted(opts.signal).then(() => [] as Message[]),
     ]);
     if (opts.signal.aborted) {

@@ -53,6 +53,12 @@ class Screen {
         this.col = 0;
       } else if (ch === "\r") this.col = 0;
       else {
+        // A real terminal wraps at the right edge; without that here an
+        // over-wide row costs nothing and the stacking it causes never shows.
+        if (this.col >= this.cols) {
+          this.row++;
+          this.col = 0;
+        }
         this.at(this.row)[this.col] = ch;
         this.col++;
       }
@@ -150,6 +156,78 @@ ok("после отправки рамка убрана", screen.countTopBorders
 
   send(CR);
   await typing;
+}
+
+// Листание истории с длинной статусной строкой: строка шире терминала
+// переносится, а перенесённая строка — это лишний физический ряд, о котором
+// обратный ход курсора не знает. Каждая перерисовка тогда садилась ниже
+// прошлой рамки, и на экране копился столбик пустых рамок.
+{
+  const wide = new Screen(100);
+  const prevWrite = process.stdout.write;
+  process.stdout.write = (chunk) => {
+    wide.write(String(chunk));
+    return true;
+  };
+
+  const long = new InputEditor({
+    status: () => ({
+      left: "yolo  OpenRouter  nvidia/nemotron-3.5-lightning:free  мышление: high",
+      hint: "/ — команды · Shift+Tab — без подтверждений · Ctrl+Enter — перенос строки",
+      context: "контекст: 0% (524/1M)",
+    }),
+    history: ["первое сообщение", "второе сообщение", "третье сообщение"],
+  });
+  const browsing = long.read();
+  send("x");
+  for (let i = 0; i < 6; i++) send(ESC + "[A");
+  ok("листание истории не копит рамки", wide.countTopBorders() === 1, `рамок: ${wide.countTopBorders()}`);
+  ok("одна строка ввода после листания", wide.countPrompts() === 1, `строк с ❯: ${wide.countPrompts()}`);
+  ok(
+    "статусная строка не переносится",
+    wide.lines().filter((l) => l.includes("контекст:")).length === 1,
+    wide.lines().join(" | "),
+  );
+
+  send(CR);
+  await browsing;
+  process.stdout.write = prevWrite;
+}
+
+// Статус собирается до отрисовки, и это его работа — уложиться в ширину:
+// обрезка в редакторе спасает рамку, но съедает конец подсказки многоточием.
+{
+  const { composeStatus } = await import("../dist/ui/inputbox.js");
+  const { width } = await import("../dist/ui/ansi.js");
+  const { contentWidth } = await import("../dist/ui/layout.js");
+  const w = contentWidth();
+  const st = composeStatus({
+    mode: "yolo",
+    provider: "OpenRouter",
+    model: "nvidia/nemotron-3.5-lightning:free",
+    effort: "high",
+    cwdLabel: "~/projects/tokenrouter-cli",
+    contextUsed: 524,
+    contextWindow: 1_000_000,
+    contextEstimated: false,
+  });
+  ok("статус влезает в строку", width(st.left) + width(st.hint) + 2 <= w, `${width(st.left)} + ${width(st.hint)} + 2 > ${w}`);
+  ok("модель в статусе уцелела", st.left.includes("nemotron-3.5-lightning"), st.left);
+  ok("подсказка не обрезана многоточием", !st.hint.includes("…"), st.hint);
+
+  // Место для полной подсказки появляется только на широком терминале —
+  // на восьмидесяти колонках её конец всё равно нечем показать.
+  Object.defineProperty(process.stdout, "columns", { value: 160, configurable: true });
+  const short = composeStatus({
+    model: "gpt-5",
+    effort: "low",
+    cwdLabel: "~/p",
+    contextUsed: 0,
+    contextWindow: 200_000,
+    contextEstimated: false,
+  });
+  ok("на широком терминале подсказка полная", short.hint.includes("Ctrl+Enter"), short.hint);
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
 }
 
 process.stdout.write = realWrite;

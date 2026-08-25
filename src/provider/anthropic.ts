@@ -95,10 +95,16 @@ export function toAnthropicMessages(messages: Message[]): {
     }
 
     if (m.role === "tool") {
+      // A tool result may carry screenshots: Anthropic takes image blocks
+      // inside the tool_result content array, next to the text.
+      const images = (m.images ?? []).map((img) => ({
+        type: "image" as const,
+        source: { type: "base64", media_type: img.mime, data: img.data },
+      }));
       push("user", {
         type: "tool_result",
         tool_use_id: m.tool_call_id,
-        content: String(m.content ?? ""),
+        content: images.length ? [{ type: "text", text: String(m.content ?? "") }, ...images] : String(m.content ?? ""),
       });
       continue;
     }
@@ -117,7 +123,11 @@ export function toAnthropicMessages(messages: Message[]): {
       continue;
     }
 
-    push("user", { type: "text", text: String(m.content ?? "") });
+    const blocks: any[] = [{ type: "text", text: String(m.content ?? "") }];
+    for (const img of m.images ?? []) {
+      blocks.push({ type: "image", source: { type: "base64", media_type: img.mime, data: img.data } });
+    }
+    for (const b of blocks) push("user", b);
     anchor = { msg: out.length - 1, block: out[out.length - 1].content.length - 1 };
   }
 
@@ -292,7 +302,7 @@ export class AnthropicStreamParser {
     return {
       toolCalls,
       usage: this.usage,
-      finishReason: toolCalls.length ? "tool_calls" : this.finish || "stop",
+      finishReason: this.finish === "length" ? "length" : toolCalls.length ? "tool_calls" : this.finish || "stop",
     };
   }
 }
