@@ -133,7 +133,7 @@ function languageDirective(lang: Lang): string {
   if (lang === "ru") {
     return `Answer in Russian. Отвечай по-русски, включая заголовки, списки и объяснения. ${rules}`;
   }
-  return `Answer in English. If the request or the conversation is written in another language, answer in that language instead — match the language of the question. ${rules}`;
+  return `Answer in English, unless the request or the conversation is written in another language — match it instead. ${rules}`;
 }
 
 /**

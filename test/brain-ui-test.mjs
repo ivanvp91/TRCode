@@ -61,6 +61,9 @@ Object.assign(app, {
   catalog: [{ id: "mock-fast" }, { id: "mock-smart" }],
   session,
   usage: new UsageTracker(),
+  // runBrain reads cfg.brainMainModel (v0.1.3); empty means "the session's
+  // model writes the final answer", which is what this panel exercises.
+  cfg: {},
   pending: [],
   editor: null,
   effortOverride: undefined,
