@@ -5,7 +5,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 
-export const VERSION = "0.1.2";
+export const VERSION = "0.1.3";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";
@@ -57,6 +57,11 @@ export interface Config {
    * hosts is the point — two models from one vendor share their blind spots.
    */
   brainModels: string[];
+  /**
+   * The panel member that writes the final answer. Empty means the session's
+   * model, which is how it worked before the choice existed.
+   */
+  brainMainModel: string;
   /**
    * Extra system-prompt notes per model. A key is a model id, a bare name, or
    * a family with a trailing "*"; an exact match replaces the built-in note
@@ -222,6 +227,12 @@ export interface Config {
    */
   skillAuto: boolean;
   /**
+   * Match a design request against the UI library and inject the saved mockup
+   * as the visual reference without asking. Off turns every match into an
+   * explicit /uilib pick.
+   */
+  uilibAuto: boolean;
+  /**
    * Whether skills take part in requests at all. Off by default: the <skills>
    * block and the `skill` tool cost ~1-2k tokens on every request, and most
    * projects never use them. Turn on with `/skills on` when they earn it.
@@ -249,7 +260,24 @@ export interface Config {
   codeMode: boolean | "auto";
   /** Ceiling for one run_code program, in ms of wall clock. */
   codeModeTimeoutMs: number;
+  /**
+   * What the one-line status under each turn shows. Everything is on by
+   * default; /settings unticks the fields that are not worth their width.
+   */
+  statusFields: Record<StatusField, boolean>;
+  /**
+   * Whether the client looks for a newer GitHub release at startup (at most
+   * once every six hours) and says so in the header. It never applies anything
+   * by itself — /update does that on request.
+   */
+  updateCheck: boolean;
 }
+
+/** The pieces a turn status can carry, each independently optional. */
+export type StatusField = "model" | "tokens" | "steps" | "time" | "speed";
+
+/** The status fields in display order, with what each shows. */
+export const STATUS_FIELDS: StatusField[] = ["model", "tokens", "steps", "time", "speed"];
 
 const DEFAULTS: Config = {
   baseUrl: DEFAULT_BASE_URL,
@@ -258,6 +286,7 @@ const DEFAULTS: Config = {
   promptModels: {},
   subagentModels: {},
   brainModels: [],
+  brainMainModel: "",
   modelPrompts: {},
   // Off the automatic path by default: rewriting what someone typed is a
   // liberty, and it costs a call. /prompt asks for it explicitly.
@@ -342,6 +371,7 @@ const DEFAULTS: Config = {
   orcaAgent: "opencode",
   lang: "en",
   skillAuto: true,
+  uilibAuto: true,
   // Off, as the comment on the field says: the block and the tool cost tokens
   // on every request, and a project that never uses a skill pays them anyway.
   skillsEnabled: false,
@@ -353,6 +383,8 @@ const DEFAULTS: Config = {
   codeMode: false,
   codeModeTimeoutMs: 60_000,
   mcpServers: {},
+  statusFields: { model: true, tokens: true, steps: true, time: true, speed: true },
+  updateCheck: true,
 };
 
 export function configDir(): string {
@@ -396,6 +428,7 @@ export function loadConfig(): Config {
     providerState: { ...DEFAULTS.providerState, ...(file.providerState || {}) },
     projectState: { ...DEFAULTS.projectState, ...(file.projectState || {}) },
     mcpServers: { ...DEFAULTS.mcpServers, ...(file.mcpServers || {}) },
+    statusFields: { ...DEFAULTS.statusFields, ...(file.statusFields || {}) },
   };
   const envKey = process.env.TOKENROUTER_API_KEY || process.env.TR_API_KEY;
   if (envKey) merged.apiKey = envKey;
@@ -440,6 +473,7 @@ export function saveConfig(patch: Partial<Config>, opts: { replace?: (keyof Conf
     providerState: merge("providerState", current.providerState, patch.providerState),
     projectState: merge("projectState", current.projectState, patch.projectState),
     mcpServers: merge("mcpServers", current.mcpServers, patch.mcpServers),
+    statusFields: merge("statusFields", current.statusFields, patch.statusFields),
   };
   ensureDir(configDir());
   fs.writeFileSync(configPath(), JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });

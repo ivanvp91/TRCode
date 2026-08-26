@@ -522,7 +522,9 @@ const PROVIDERS: ProviderDef[] = [
 ];
 
 export function providers(): ProviderDef[] {
-  return PROVIDERS;
+  // Alphabetical: the panel and /auth status read as a table, and a registry
+  // ordered by history is a list nobody can scan.
+  return [...PROVIDERS].sort((a, b) => a.label.localeCompare(b.label));
 }
 
 export function providerById(id: string): ProviderDef | undefined {
@@ -728,9 +730,9 @@ function needsDeviceId(mode: ProviderMode): boolean {
   return Boolean(mode.headers?.["X-Msh-Platform"]);
 }
 
-/** Providers with a usable credential, default first. */
+/** Providers with a usable credential, default first, the rest alphabetical. */
 export function configuredProviders(): ProviderDef[] {
-  return PROVIDERS.filter((p) => modeFor(p.id) !== null || (p.importFrom && importVendorCredentials(p.importFrom)));
+  return providers().filter((p) => modeFor(p.id) !== null || (p.importFrom && importVendorCredentials(p.importFrom)));
 }
 
 /** True once at least one provider can serve a request. */

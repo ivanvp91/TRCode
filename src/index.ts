@@ -31,6 +31,7 @@ import {
   splitModelId,
 } from "./provider/registry.js";
 import { clearCredentials, importVendorCredentials, readCredentials } from "./provider/credentials.js";
+import { latestRelease, isNewer, applyUpdate, refreshCache } from "./update.js";
 
 interface Args {
   prompt?: string;
@@ -109,7 +110,7 @@ function parseArgs(argv: string[]): Args {
     }
   }
 
-  const SUBCOMMANDS = ["auth", "models", "sessions", "run", "help", "version", "config"];
+  const SUBCOMMANDS = ["auth", "models", "sessions", "run", "help", "version", "config", "update"];
   if (positional.length && SUBCOMMANDS.includes(positional[0]) && !args.command) {
     args.command = positional[0];
     args.rest = positional.slice(1);
@@ -148,6 +149,7 @@ function printHelp(): void {
   line("    trc auth logout [--provider P]   disconnect");
   line("    trc models                   list models");
   line("    trc sessions                 sessions for this project");
+  line("    trc update                   update to the latest GitHub release");
   line("    trc config                   config path and contents");
   line();
   line(c.gray(`  Config: ${configPath()}`));
@@ -327,7 +329,9 @@ async function cmdModels(): Promise<number> {
   const catalog = await fetchModels({ force: true });
   // Names without the routing prefix; which host serves one is its own column.
   const bare = (id: string) => splitModelId(id).model;
-  const hosts = new Set(catalog.map((m) => splitModelId(m.id).providerId));
+  const hosts = [...new Set(catalog.map((m) => splitModelId(m.id).providerId))].sort((a, b) =>
+    providerLabel(a).localeCompare(providerLabel(b)),
+  );
   const width = Math.min(38, Math.max(12, ...catalog.map((m) => bare(m.id).length + 1)));
   // Grouped the way the catalog tags them — [Text], [Images], [Video],
   // [Audio] — and by vendor inside each, so a flat 125-line dump becomes a
@@ -341,7 +345,7 @@ async function cmdModels(): Promise<number> {
       for (const m of group.models) {
         const cur = m.id === cfg.model ? c.brightCyan("❯ ") : "  ";
         const ctxWin = m.contextWindow ? `ctx ${fmtTokens(m.contextWindow)}` : "";
-        const host = hosts.size > 1 ? providerLabel(splitModelId(m.id).providerId) : "";
+        const host = hosts.length > 1 ? providerLabel(splitModelId(m.id).providerId) : "";
         const price = m.pricing ? `$${m.pricing.input}/$${m.pricing.output} per 1M` : "";
         line(`  ${cur}${bare(m.id).padEnd(width)} ${c.gray(ctxWin.padEnd(11))} ${c.dim(host.padEnd(14))} ${c.dim(price)}`);
       }
@@ -377,6 +381,44 @@ function cmdSessions(cwd: string): number {
 function maskKey(key: string): string {
   if (key.length <= 10) return key.slice(0, 3) + "…";
   return `${key.slice(0, 6)}…${key.slice(-4)}`;
+}
+
+/** `trc update [--check]`: self-update from GitHub Releases. */
+async function cmdUpdate(rest: string[]): Promise<number> {
+  const checkOnly = rest.includes("--check");
+  line();
+  info(`Checking ${"github.com/ivanvp91/TRCode"} releases…`);
+  let rel;
+  try {
+    rel = await latestRelease();
+  } catch (err) {
+    error(`Could not reach GitHub: ${(err as Error).message}`);
+    return 1;
+  }
+  if (!rel.version) {
+    error("The release has no version tag.");
+    return 1;
+  }
+  if (!isNewer(VERSION, rel.version)) {
+    success(`Already on the latest version (${VERSION}).`);
+    return 0;
+  }
+  line(`  New version available: ${c.bold(rel.version)} ${c.gray(`(current: ${VERSION})`)}`);
+  if (checkOnly) {
+    if (rel.url) line(c.gray(`  ${rel.url}`));
+    return 0;
+  }
+
+  try {
+    const { to } = await applyUpdate(rel);
+    success(`Updated to ${rel.version} in ${to}`);
+    warn("Restart trc to run the new build.");
+    return 0;
+  } catch (err) {
+    error(`Update failed: ${(err as Error).message}`);
+    line(c.gray("  The previous install is untouched."));
+    return 1;
+  }
 }
 
 /** Headless: run one prompt, print the final answer, exit. */
@@ -484,6 +526,7 @@ async function main(): Promise<void> {
   if (args.command === "auth") return finish(await cmdAuth(args.rest));
   if (args.command === "models") return finish(await cmdModels());
   if (args.command === "sessions") return finish(cmdSessions(args.cwd));
+  if (args.command === "update") return finish(await cmdUpdate(args.rest));
   if (args.command === "config") {
     const cfg = loadConfig();
     line(c.gray(configPath()));
@@ -524,6 +567,14 @@ async function main(): Promise<void> {
   if (args.preset) app.presetOverride = args.preset;
   await app.init();
   if (args.effort) app.effortOverride = args.effort;
+
+  // A new release is worth one gray line at startup and nothing more: the
+  // check itself runs in the background at most once every six hours and
+  // never applies anything. The header carries the persistent state — the
+  // starred version and, after an update, the restart reminder.
+  if (!process.env.TRCODE_UPDATE_API && !process.env.TRCODE_NO_UPDATE_CHECK && loadConfig().updateCheck !== false) {
+    void refreshCache().catch(() => {});
+  }
 
   if (args.model) {
     try {

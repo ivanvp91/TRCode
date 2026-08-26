@@ -289,6 +289,11 @@ export interface BannerInfo {
   cwdLabel: string;
   sessionId: string;
   version: string;
+  /**
+   * Gray note after the version — "a newer release exists" or "an installed
+   * update waits for a restart". Absent when there is nothing to say.
+   */
+  versionNote?: string;
   /** Rendered under the box; nudges toward a better setup when one exists. */
   tip?: { title: string; detail: string };
 }
@@ -304,9 +309,10 @@ const LOGO = [
 
 /**
  * The header box. It cannot be edited once printed, so whoever changes what it
- * states repaints the screen and prints it again — see App.repaintHeader.
+ * states prints it again — see App.repaintHeader. `compact` is the reprint:
+ * the fields alone, without the logo and welcome that belong to the startup.
  */
-export function banner(info: BannerInfo): void {
+export function banner(info: BannerInfo & { compact?: boolean }): void {
   const inner = contentWidth() - 2;
   const modelValue =
     c.brightCyan(info.model) + (info.effort === "off" ? "" : c.gray(t("  thinking: ", "  мышление: ")) + c.brightMagenta(info.effort));
@@ -317,8 +323,26 @@ export function banner(info: BannerInfo): void {
     padded(c.brightBlue("│") + content + " ".repeat(gap) + c.brightBlue("│"));
   };
 
-  const field = (label: string, value: string) =>
-    row("   " + c.gray(label.padEnd(12)) + c.bold(value));
+  const fields: [string, string][] = [
+    [t("Directory:", "Каталог:"), info.cwdLabel],
+    [t("Session:", "Сессия:"), info.sessionId],
+    [t("Provider:", "Поставщик:"), c.brightBlue(info.provider)],
+    [t("Model:", "Модель:"), modelValue],
+    [t("Version:", "Версия:"), info.version + (info.versionNote ? c.gray(`  ·  ${info.versionNote}`) : "")],
+  ];
+
+  if (info.compact) {
+    // A mid-session reprint must not look like a restart: no logo, no welcome —
+    // the fields alone, top and bottom borders, done.
+    line();
+    padded(c.brightBlue("╭" + "─".repeat(inner) + "╮"));
+    for (const [label, value] of fields) {
+      row("   " + c.gray(label.padEnd(12)) + c.bold(value));
+    }
+    padded(c.brightBlue("╰" + "─".repeat(inner) + "╯"));
+    line();
+    return;
+  }
 
   line();
   padded(c.brightBlue("╭" + "─".repeat(inner) + "╮"));
@@ -326,13 +350,6 @@ export function banner(info: BannerInfo): void {
   const aside = [
     c.bold(c.brightBlue(t("Welcome to TRCode!", "TRCode — добро пожаловать!"))),
     "",
-  ];
-  const fields: [string, string][] = [
-    [t("Directory:", "Каталог:"), info.cwdLabel],
-    [t("Session:", "Сессия:"), info.sessionId],
-    [t("Provider:", "Поставщик:"), c.brightBlue(info.provider)],
-    [t("Model:", "Модель:"), modelValue],
-    [t("Version:", "Версия:"), info.version],
   ];
   for (const [label, value] of fields) aside.push(c.gray(label.padEnd(12)) + c.bold(value));
   aside.push("", c.gray(t("Send ", "Наберите ")) + c.bold("/help") + c.gray(t(" for help, ", " для справки, ")) + c.bold("/") + c.gray(t(" for the command list", " для списка команд")));

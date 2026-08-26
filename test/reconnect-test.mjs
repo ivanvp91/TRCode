@@ -135,6 +135,31 @@ const check = (name, cond, detail = "") => {
   );
 }
 
+// ── a drop after part of the answer was already streamed ────────────────────
+{
+  const reconnects = [];
+  const usage = new UsageTracker();
+  const res = await runAgent({
+    model: "mock-drop-mid",
+    systemPrompt: "ты агент",
+    messages: [{ role: "user", content: "привет" }],
+    tools: [],
+    toolContext: { cwd: process.cwd(), depth: 0, signal: new AbortController().signal },
+    catalog: [{ id: "mock-drop-mid" }],
+    usage,
+    maxSteps: 4,
+    signal: new AbortController().signal,
+    effort: "off",
+    toolConcurrency: 1,
+    events: { onReconnect: (reason, attempt, of, hadText) => reconnects.push({ reason, attempt, of, hadText }) },
+  });
+
+  check("a drop mid-answer is resent too", res.finalText.includes("ОТВЕТ ПОСЛЕ ОБРЫВА"), JSON.stringify(res.finalText));
+  check("the cut-off half does not reach the history", !res.finalText.includes("НАЧАЛО ОТВ"), JSON.stringify(res.finalText));
+  check("the resend says the screen kept a partial block", reconnects[0]?.hadText === true, JSON.stringify(reconnects[0]));
+  check("the same step went out again", res.steps === 1, String(res.steps));
+}
+
 mock.kill();
 await new Promise((r) => setTimeout(r, 200));
 fs.rmSync(HOME, { recursive: true, force: true });

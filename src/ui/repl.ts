@@ -41,6 +41,7 @@ import { OrcaReporter } from "./orca.js";
 import { pushConsumer } from "./stdin.js";
 import { PermissionBroker } from "./permissions.js";
 import { loadConfig, projectState, VERSION, type Config, type Effort } from "../config.js";
+import { refreshCache, appliedUpdate, versionBadge } from "../update.js";
 import { fetchModels, cachedModels, catalogIsFresh, effortFor, usableModels, resolveModelId, findModel, sameModelElsewhere } from "../provider/models.js";
 import { defaultProviderId, hasProvider, modeFor, providerLabel, providerState, splitModelId, wireModelId } from "../provider/registry.js";
 
@@ -256,6 +257,16 @@ export class App {
         this.notice("warn", tr(`MCP ${client.id} failed: ${client.detail}`, `MCP ${client.id} не подключился: ${client.detail}`));
       }
     });
+    // The release check rides along in the background: at most one GET every
+    // six hours, and when it finds something the header is reprinted with a
+    // starred version — the same way a model switch reaches it.
+    if (this.cfg.updateCheck !== false) {
+      void refreshCache()
+        .then(() => {
+          if (versionBadge().text.includes("*")) this.repaintHeader();
+        })
+        .catch(() => {});
+    }
   }
 
   /**
@@ -494,7 +505,12 @@ export class App {
       const res = await runBrain({
         task: question,
         models: panel,
-        finalModel: this.session.model,
+        // The configured main model when it sits on the panel — the session's
+        // model otherwise, which is how it worked before the choice existed.
+        finalModel:
+          this.cfg.brainMainModel && panel.includes(this.cfg.brainMainModel)
+            ? this.cfg.brainMainModel
+            : this.session.model,
         cwd: this.cwd,
         // What the user is looking at while asking. A question put mid-session
         // is usually about the session — "обсудите идею" is a pronoun — and the
@@ -599,32 +615,37 @@ export class App {
   }
 
   /** Prints the header box from live state. The tip is a startup-only nudge. */
-  showBanner(opts: { tip?: boolean } = {}): void {
+  showBanner(opts: { tip?: boolean; compact?: boolean } = {}): void {
+    const badge = versionBadge();
     banner({
       provider: providerLabel(splitModelId(this.session.model).providerId),
       model: this.session.model,
       effort: this.effort(),
       cwdLabel: this.cwd,
       sessionId: this.session.id,
-      version: VERSION,
+      version: c.yellow(badge.text),
+      versionNote: badge.note,
       tip: opts.tip ? this.startupTip() : undefined,
+      compact: opts.compact,
     });
   }
 
   /**
-   * Clears the screen and prints the header again.
+   * Reprints the header under the transcript — fields only, no logo or
+   * welcome, so a reprint can never look like the session restarting.
    *
    * A box already on screen cannot be edited — it is output, not a live region
    * — so the only way for the header to state the current provider, model and
-   * budget is to repaint. Called by whatever changes one of those three. The
-   * transcript stays in the terminal's scrollback.
+   * budget is to reprint it. A clear only happens when asked for (/clear):
+   * wiping on every switch read as losing the session, when nothing but the
+   * header had changed.
    */
-  repaintHeader(): void {
-    if (process.stdout.isTTY) {
+  repaintHeader(opts: { clear?: boolean } = {}): void {
+    if (opts.clear && process.stdout.isTTY) {
       process.stdout.write(ESC + "[2J" + ESC + "[H");
       process.stdout.write(ESC + "]0;TRCode" + ESC + "\\");
     }
-    this.showBanner();
+    this.showBanner({ compact: true });
   }
 
   private status(): StatusInfo {
@@ -1058,6 +1079,7 @@ export class App {
       this.skipNextDesignMatch = false;
       return;
     }
+    if (!this.cfg.uilibAuto) return;
     // Asking for a design is the gate, not merely mentioning words a saved
     // entry happens to be keyed on. Every message shares vocabulary with some
     // mockup — "dark", "saas", "terminal" — and matching on that alone put the
@@ -1397,9 +1419,12 @@ export class App {
           },
           onAssistantMessage: () => stopStream(),
           // A dropped connection is not a refusal: the step goes out again,
-          // and the user is told why the wait just got longer.
-          onReconnect: (reason, attempt, of) => {
+          // and the user is told why the wait just got longer. When part of
+          // the answer was already on the screen, that block stays as it was
+          // cut off — the resent step opens a fresh one below it.
+          onReconnect: (reason, attempt, of, hadText) => {
             stopStream();
+            if (!hadText) answer = "";
             spinner.stop();
             warn(
               tr(
@@ -1592,21 +1617,27 @@ export class App {
       (t.requests > 1 ? c.gray(` in ${t.requests} requests`) : "") +
       (t.cached ? c.gray(` · ${fmtTokens(t.cached)} cached (${pctOf(t.cached, t.input)}%)`) : "");
 
+    // Which parts of the line the user wants to see — /settings unticks them.
+    const on = this.cfg.statusFields ?? {};
     const bits = [
-      c.brightYellow(this.session.model) +
-        (effort === "off" || ignored ? "" : c.gray(":") + c.brightMagenta(effort)),
-      `${sent} ${c.gray("↓")} ${fmtTokens(t.output)}` +
-        // Thinking is billed as output; without this the number looks absurd.
-        (t.reasoning ? c.gray(` · ${fmtTokens(t.reasoning)} of it reasoning`) : ""),
-      c.gray(nOf(steps, ["step", "steps"], ["шаг", "шага", "шагов"])),
-      c.gray(fmtDuration(elapsedMs)),
-      elapsedMs > 1000 && t.output
+      on.model !== false
+        ? c.brightYellow(this.session.model) +
+          (effort === "off" || ignored ? "" : c.gray(":") + c.brightMagenta(effort))
+        : "",
+      on.tokens !== false
+        ? `${sent} ${c.gray("↓")} ${fmtTokens(t.output)}` +
+          // Thinking is billed as output; without this the number looks absurd.
+          (t.reasoning ? c.gray(` · ${fmtTokens(t.reasoning)} of it reasoning`) : "")
+        : "",
+      on.steps !== false ? c.gray(nOf(steps, ["step", "steps"], ["шаг", "шага", "шагов"])) : "",
+      on.time !== false ? c.gray(fmtDuration(elapsedMs)) : "",
+      on.speed !== false && elapsedMs > 1000 && t.output
         ? c.gray(`${fmtTokens(Math.round((t.output / elapsedMs) * 1000))} tok/s avg`)
         : "",
     ].filter(Boolean);
 
     line();
-    padded(bits.join(c.gray(" · ")));
+    if (bits.length) padded(bits.join(c.gray(" · ")));
     this.cacheNudge();
     this.contextNudge();
 

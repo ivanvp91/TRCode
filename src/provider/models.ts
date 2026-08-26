@@ -636,7 +636,7 @@ const DATED_SNAPSHOT = /-(20\d\d-\d\d-\d\d|\d{8}|\d{6}|\d{4})$/;
 /**
  * Vendor sections, newest model first inside each. The API's `created` field
  * is the only objective "newer/stronger" signal we have, so ordering rests on
- * it; vendors are ordered by their freshest model.
+ * it; pinned vendors lead, the rest follow alphabetically.
  */
 export function groupByVendor(models: ModelInfo[]): { vendor: string; models: ModelInfo[] }[] {
   const groups = new Map<string, ModelInfo[]>();
@@ -657,14 +657,13 @@ export function groupByVendor(models: ModelInfo[]): { vendor: string; models: Mo
   return out.sort((a, b) => {
     const ra = VENDOR_RANK.indexOf(a.vendor);
     const rb = VENDOR_RANK.indexOf(b.vendor);
-    // Pinned vendors first, in the order listed; the rest by freshest model.
+    // Pinned vendors first, in the order listed; the rest alphabetical.
     if (ra !== -1 || rb !== -1) {
       if (ra === -1) return 1;
       if (rb === -1) return -1;
       return ra - rb;
     }
-    const newest = (g: { models: ModelInfo[] }) => Math.max(...g.models.map((m) => m.created ?? 0));
-    return newest(b) - newest(a) || a.vendor.localeCompare(b.vendor);
+    return a.vendor.localeCompare(b.vendor);
   });
 }
 

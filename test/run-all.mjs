@@ -2,14 +2,59 @@
  * Runs every suite. The ones that talk to a model use the local mock server,
  * so `npm test` needs no API key and no network.
  */
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
+import net from "node:net";
 import path from "node:path";
 import fs from "node:fs";
 import os from "node:os";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.MOCK_PORT || 8877);
+
+/**
+ * A port nobody holds right now. Fixed numbers collide the moment two
+ * checkouts — or two sessions in one checkout — run the tests at once, and
+ * the loser's suites each wait out their whole timeout against a mock that
+ * is not theirs.
+ */
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once("error", reject);
+    srv.listen(0, "127.0.0.1", () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+/**
+ * SIGKILL the process and everything under it: a suite killed on its timeout
+ * must take the mock server it spawned along, or the orphan keeps the port.
+ */
+function killTree(child) {
+  if (!child || child.exitCode !== null) return;
+  if (process.platform === "win32") {
+    try {
+      execFileSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], { stdio: "ignore" });
+    } catch {
+      /* already gone */
+    }
+    return;
+  }
+  try {
+    // Suites are spawned as group leaders; the negative pid takes the group.
+    process.kill(-child.pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+const PORT = process.env.MOCK_PORT ? Number(process.env.MOCK_PORT) : await freePort();
 
 const SUITES = [
   "protocol-test.mjs",
@@ -63,7 +108,11 @@ const SUITES = [
   "transcript-test.mjs",
   "keyscan-test.mjs",
   "shutdown-test.mjs",
+  "update-test.mjs",
 ];
+
+/** The suite now in flight, so an interrupt can take it down tree and all. */
+let running = null;
 
 function run(file, env) {
   return new Promise((resolve) => {
@@ -71,12 +120,19 @@ function run(file, env) {
       cwd: path.join(here, ".."),
       stdio: ["ignore", "pipe", "pipe"],
       env,
+      // Its own process group, so the timeout kill reaches the whole tree.
+      detached: process.platform !== "win32",
     });
+    running = child;
     let out = "";
     child.stdout.on("data", (d) => (out += d));
     child.stderr.on("data", (d) => (out += d));
-    child.on("exit", (code) => resolve({ code, out }));
-    setTimeout(() => child.kill("SIGKILL"), 120_000);
+    const reaper = setTimeout(() => killTree(child), 120_000);
+    child.on("exit", (code) => {
+      clearTimeout(reaper);
+      running = null;
+      resolve({ code, out });
+    });
   });
 }
 
@@ -92,7 +148,37 @@ const mock = spawn(process.execPath, [path.join(here, "mock-server.mjs")], {
   stdio: "ignore",
   env: { ...process.env, MOCK_PORT: String(PORT), MOCK_LOG },
 });
-await new Promise((r) => setTimeout(r, 1200));
+
+// An interrupted run must not leave the mock — or the suite in flight, with
+// the mock of its own — holding ports for every run that comes after.
+process.on("exit", () => {
+  killTree(running);
+  killTree(mock);
+  try { fs.rmSync(MOCK_LOG, { force: true }); } catch {}
+});
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
+  process.on(sig, () => process.exit(130));
+}
+
+// Wait until the mock actually answers rather than napping a fixed spell: a
+// busy machine outlives any constant, and a failed bind should say so now.
+const ready = await (async () => {
+  for (let i = 0; i < 50; i++) {
+    if (mock.exitCode !== null) return false;
+    try {
+      const res = await fetch(`http://127.0.0.1:${PORT}/v1/models`, { signal: AbortSignal.timeout(500) });
+      if (res.ok) return true;
+    } catch {
+      /* not up yet */
+    }
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  return false;
+})();
+if (!ready) {
+  console.error(`the mock server did not come up on port ${PORT}`);
+  process.exit(1);
+}
 
 const env = {
   ...process.env,
@@ -105,14 +191,17 @@ const env = {
 
 let failed = 0;
 for (const suite of SUITES) {
-  const { code, out } = await run(suite, env);
+  // Suites that raise a mock of their own read MOCK_PORT before falling back
+  // to a hardcoded default; a fresh free port per suite keeps two parallel
+  // runs — and a stray MOCK_PORT in the caller's environment — off each
+  // other's servers.
+  const { code, out } = await run(suite, { ...env, MOCK_PORT: String(await freePort()) });
   const summary = out.split("\n").filter((l) => /passed|пройдено/.test(l)).pop() ?? "";
   if (code !== 0) failed++;
   console.log(`${code === 0 ? "PASS" : "FAIL"}  ${suite.padEnd(22)} ${summary.trim()}`);
   if (code !== 0) console.log(out.split("\n").filter((l) => /FAIL|ПРОВАЛ/.test(l)).join("\n"));
 }
 
-mock.kill("SIGKILL");
-try { fs.rmSync(MOCK_LOG, { force: true }); } catch {}
+// The exit handler above takes the mock and the log down.
 console.log(failed ? `\n${failed} suite(s) failed` : `\nall ${SUITES.length} suites passed`);
 process.exit(failed ? 1 : 0);

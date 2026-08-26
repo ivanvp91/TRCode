@@ -40,6 +40,9 @@ const MODELS = [
   // Hangs up in the middle of the answer the first time, then behaves: the
   // dropped connection a client has to resend rather than report.
   { id: "mock-drop", owned_by: "mock", context_window: 64000 },
+  // Same, but the hang-up comes after part of the visible text: the resend
+  // has to start a fresh block instead of gluing onto the cut-off one.
+  { id: "mock-drop-mid", owned_by: "mock", context_window: 64000 },
   // Same, but its router says so in words inside the still-open stream
   // ("Upstream idle timeout exceeded") instead of closing the socket.
   { id: "mock-upstream-timeout", owned_by: "mock", context_window: 64000 },
@@ -186,6 +189,30 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
       sse(res, chunk({ role: "assistant", content: "" }));
       sse(res, chunk({ content: "ПОСЛЕ ОБРЫВА" }));
+      sse(res, chunk({}, "stop"));
+      sse(res, { ...chunk({}), usage: { prompt_tokens: 50, completion_tokens: 5, total_tokens: 55 } });
+      res.write("data: [DONE]" + "\n\n");
+      res.end();
+      return;
+    }
+
+    // The hang-up after visible text: the first attempt streams a few chunks
+    // of the answer, then the socket dies. The resent step has to arrive as a
+    // complete answer of its own, with nothing glued onto the cut-off part.
+    if (payload.model === "mock-drop-mid") {
+      if (!dropped.has("mock-drop-mid")) {
+        dropped.add("mock-drop-mid");
+        log("DROP model=mock-drop-mid first\n");
+        res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+        sse(res, chunk({ role: "assistant", content: "" }));
+        sse(res, chunk({ content: "НАЧАЛО ОТВ" }));
+        setTimeout(() => res.socket?.destroy(), 50);
+        return;
+      }
+      log("DROP model=mock-drop-mid retry\n");
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      sse(res, chunk({ role: "assistant", content: "" }));
+      sse(res, chunk({ content: "ОТВЕТ ПОСЛЕ ОБРЫВА" }));
       sse(res, chunk({}, "stop"));
       sse(res, { ...chunk({}), usage: { prompt_tokens: 50, completion_tokens: 5, total_tokens: 55 } });
       res.write("data: [DONE]" + "\n\n");
@@ -399,6 +426,25 @@ function anthropic(payload, res) {
 }
 
 const port = Number(process.env.MOCK_PORT || 8787);
+server.on("error", (err) => {
+  // A taken port must be a loud failure, not a process that lingers doing
+  // nothing while every suite times out against whoever actually holds it.
+  process.stderr.write(`mock: cannot listen on ${port}: ${err?.code ?? err}\n`);
+  process.exit(1);
+});
 server.listen(port, "127.0.0.1", () => {
   process.stdout.write(`mock listening on ${port}\n`);
 });
+
+// Nobody waits on this process: the suite that spawned it may be SIGKILLed on
+// a timeout, or the whole run interrupted, and its cleanup never reached. An
+// orphaned mock keeps the port and stalls every later run — so when the
+// parent is gone, so is the reason to stay up.
+const ppid = process.ppid;
+setInterval(() => {
+  try {
+    process.kill(ppid, 0);
+  } catch {
+    process.exit(0);
+  }
+}, 2000).unref();

@@ -31,8 +31,8 @@ export interface AgentEvents {
   onAssistantMessage?(m: Message): void;
   /** Old tool output was shortened to keep the request within budget. */
   onTrim?(savedTokens: number, count: number): void;
-  /** The connection died before the model said anything; the step is being resent. */
-  onReconnect?(reason: string, attempt: number, of: number): void;
+  /** The connection died; the step is being resent. `hadText`: part of the answer had already been streamed. */
+  onReconnect?(reason: string, attempt: number, of: number, hadText?: boolean): void;
 }
 
 export interface RunOptions {
@@ -283,16 +283,17 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         if (text) messages.push({ role: "assistant", content: text });
         return { finalText: text || finalText, steps: step, stoppedBecause: "aborted" };
       }
-      // A connection that died on its own is not an answer: the host never
-      // refused anything, so the same request is still valid. Resent while the
-      // model has said nothing yet — once text is on the screen, a silent
-      // resend would print the answer twice.
-      if (isConnectionDrop(err) && !text.trim() && netRetries < NET_RETRIES) {
+      // A part already on the screen stays there as a cut-off block — the
+      // resent step answers in a fresh one below it, and only that complete
+      // answer reaches the history, so nothing half-said is ever sent back.
+      if (isConnectionDrop(err) && netRetries < NET_RETRIES) {
         netRetries++;
-        events?.onReconnect?.(describeConnectionDrop(err), netRetries, NET_RETRIES);
+        events?.onReconnect?.(describeConnectionDrop(err), netRetries, NET_RETRIES, Boolean(text.trim()));
         await new Promise((r) => setTimeout(r, netRetries * 1500));
         if (opts.signal.aborted) return { finalText, steps: step, stoppedBecause: "aborted" };
         step--; // the same step, sent again
+        text = "";
+        toolCalls = [];
         continue;
       }
       if (isConnectionDrop(err)) {

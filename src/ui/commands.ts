@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { c } from "./ansi.js";
 import { contentWidth, fmtAgo } from "./layout.js";
 import { error, expandedBlock, hint, info, line, padded, plural, renderMarkdownBlock, rule, Spinner, success, truncate, warn, wrapText } from "./render.js";
-import { openModal, pick, pickMulti, type ModalAction, type ModalResult, type PickerItem } from "./picker.js";
+import { openModal, pick, pickMulti, type ModalAction, type ModalResult, type PickerItem, type PickerTab } from "./picker.js";
 import { choose, type Choice } from "./choice.js";
 import { openModelModal, openModelsModal, pickModelsAcrossProviders } from "./modelpicker.js";
 import { askSecret } from "./secret.js";
@@ -21,15 +21,20 @@ import {
   VERSION,
   EFFORT_LEVELS,
   LANGUAGES,
+  STATUS_FIELDS,
   type Effort,
   type Lang,
+  type StatusField,
 } from "../config.js";
+import { latestRelease, isNewer, applyUpdate } from "../update.js";
 import {
   fetchModels,
   resolveModelId,
   findModel,
+  groupByVendor,
   incompatibleReason,
   servesModality,
+  usableModels,
   contextWindowFor,
   effortFor,
 } from "../provider/models.js";
@@ -68,9 +73,10 @@ import { createSkill } from "../skills/loader.js";
 import { memoryPath, memoryCount } from "../tools/memory.js";
 import { resetPromptSnapshots } from "../agent/prompt.js";
 import { connectMcpServers, mcpClients, stopMcpServers } from "../mcp/client.js";
-import { t, count } from "../i18n.js";
+import { t, count, t as tr } from "../i18n.js";
 import { listEntries, getEntry, deleteEntry, type UiEntry } from "../ui-library/store.js";
 import { matchLibrary } from "../ui-library/match.js";
+import type { ModelInfo } from "../types.js";
 import type { App } from "./repl.js";
 
 type Group = "main" | "session" | "settings" | "other";
@@ -299,6 +305,156 @@ async function logoutFromProvider(app: App, def: ProviderDef): Promise<void> {
   }
 }
 
+// ── /settings ─────────────────────────────────────────────────────────────
+
+/**
+ * The settings panel. Grouped in sections — the status line first (what it
+ * shows), then updates (whether the client looks for a release at all) — so
+ * the list grows by section instead of turning into one flat wall of rows.
+ */
+async function settingsModal(app: App): Promise<void> {
+  const cfg = loadConfig();
+  const fields: { key: StatusField; label: string; example: string }[] = [
+    { key: "model", label: t("model and reasoning budget", "модель и бюджет мышления"), example: "kimi:k3:high" },
+    { key: "tokens", label: t("tokens — in, cached, out, reasoning", "токены — вход, кэш, выход, мышление"), example: "↑ 1.1M · 920k cached ↓ 9.9k" },
+    { key: "steps", label: t("how many steps the turn took", "сколько шагов занял ход"), example: "11 steps" },
+    { key: "time", label: t("how long the turn ran", "сколько шёл ход"), example: "6m 05s" },
+    { key: "speed", label: t("output speed", "скорость вывода"), example: "27 tok/s avg" },
+  ];
+  const updatesOn = cfg.updateCheck !== false;
+  const skillsOn = cfg.skillsEnabled === true;
+  const skillAutoOn = skillsOn && cfg.skillAuto !== false;
+  const uilibAutoOn = cfg.uilibAuto !== false;
+  const items: PickerItem[] = [
+    {
+      header: t("Auto-loading", "Автоподстановка"),
+      value: "__hdr-auto",
+      label: "",
+    },
+    {
+      value: "skillAuto",
+      label: t(
+        "find and apply matching skills on their trigger words",
+        "искать подходящие навыки по словам-триггерам и применять их",
+      ),
+      hint: c.dim(t("the ⚡ injections · /skills manages the catalog", "вставки ⚡ · каталогом управляет /skills")),
+      badge: skillAutoOn ? c.brightGreen(t("on", "вкл")) : c.gray(t("off", "выкл")),
+    },
+    {
+      value: "uilibAuto",
+      label: t(
+        "match design requests against the UI library",
+        "подбирать макет из UI-библиотеки под запросы про дизайн",
+      ),
+      hint: c.dim(t("injected as <design-reference> · /uilib", "подставляется как <design-reference> · /uilib")),
+      badge: uilibAutoOn ? c.brightGreen(t("on", "вкл")) : c.gray(t("off", "выкл")),
+    },
+    { header: t("Status line", "Строка состояния"), value: "__hdr-status", label: "" },
+    ...fields.map((f) => ({
+      value: `status:${f.key}`,
+      label: f.label,
+      hint: c.dim(f.example),
+      badge: cfg.statusFields[f.key] !== false ? c.brightGreen(t("on", "вкл")) : c.gray(t("off", "выкл")),
+    })),
+    {
+      header: t("Updates", "Обновления"),
+      value: "__hdr-updates",
+      label: "",
+    },
+    {
+      value: "updateCheck",
+      label: t(
+        "check GitHub for a newer release at startup",
+        "проверять GitHub на новую версию при старте",
+      ),
+      hint: c.dim(t("never installs anything by itself · /update does", "само ничего не ставит · установка через /update")),
+      badge: updatesOn ? c.brightGreen(t("on", "вкл")) : c.gray(t("off", "выкл")),
+    },
+  ];
+  const picked = await pickMulti({
+    title: t("Settings", "Настройки"),
+    subtitle: t("Space toggles a row; Enter saves.", "Пробел переключает строку; Enter сохраняет."),
+    items,
+    groupGap: true,
+    selected: [
+      ...(skillAutoOn ? ["skillAuto"] : []),
+      ...(uilibAutoOn ? ["uilibAuto"] : []),
+      ...fields.filter((f) => cfg.statusFields[f.key] !== false).map((f) => `status:${f.key}`),
+      ...(updatesOn ? ["updateCheck"] : []),
+    ],
+    allowEmpty: true,
+  });
+  if (picked === null) return;
+
+  const next: Record<StatusField, boolean> = { ...cfg.statusFields };
+  for (const k of STATUS_FIELDS) next[k] = picked.includes(`status:${k}`);
+  app.cfg = saveConfig({
+    statusFields: next,
+    updateCheck: picked.includes("updateCheck"),
+    // Auto-selection lives only while the skills take part in requests at all:
+    // an ⚡ injection without them would be a body nobody asked to see.
+    skillAuto: skillsOn && picked.includes("skillAuto"),
+    uilibAuto: picked.includes("uilibAuto"),
+  });
+  const shown = STATUS_FIELDS.filter((k) => next[k]).length;
+  const upd = picked.includes("updateCheck");
+  success(
+    t(
+      `Saved: skills ${picked.includes("skillAuto") ? "on" : "off"}, UI library ${picked.includes("uilibAuto") ? "on" : "off"}, ${shown} of ${STATUS_FIELDS.length} status fields, update check ${upd ? "on" : "off"}.`,
+      `Сохранено: навыки ${picked.includes("skillAuto") ? "вкл" : "выкл"}, UI-библиотека ${picked.includes("uilibAuto") ? "вкл" : "выкл"}, полей статуса ${shown} из ${STATUS_FIELDS.length}, проверка обновлений ${upd ? "вкл" : "выкл"}.`,
+    ),
+  );
+}
+
+// ── /update ───────────────────────────────────────────────────────────────
+
+/**
+ * Update from inside a session. The check runs here rather than through the
+ * startup cache, so the answer is always current.
+ */
+async function runUpdate(app: App): Promise<void> {
+  await app.exclusiveInput(async () => {
+    line();
+    info(tr("Checking github.com/ivanvp91/TRCode releases…", "Проверяю релизы на github.com/ivanvp91/TRCode…"));
+    let rel;
+    try {
+      rel = await latestRelease();
+    } catch (err) {
+      error(tr(`Could not reach GitHub: ${(err as Error).message}`, `GitHub недоступен: ${(err as Error).message}`));
+      return;
+    }
+    if (!rel.version || !isNewer(VERSION, rel.version)) {
+      success(tr(`Already on the latest version (${VERSION}).`, `Уже последняя версия (${VERSION}).`));
+      return;
+    }
+    line(
+      tr(
+        `  New version available: ${c.bold(rel.version)} ${c.gray(`(current: ${VERSION})`)}`,
+        `  Доступна новая версия: ${c.bold(rel.version)} ${c.gray(`(текущая: ${VERSION})`)}`,
+      ),
+    );
+    try {
+      await applyUpdate(rel);
+      success(
+        tr(
+          `Updated to ${rel.version}. Restart the terminal to run the new build.`,
+          `Обновлено до ${rel.version}. Перезапустите терминал, чтобы запустить новую сборку.`,
+        ),
+      );
+      app.repaintHeader();
+    } catch (err) {
+      error(
+        tr(
+          `Update failed: ${(err as Error).message} — the previous install is untouched.`,
+          `Не удалось обновиться: ${(err as Error).message} — прежняя сборка не тронута.`,
+        ),
+      );
+    }
+  });
+}
+
+// ── model and provider ─────────────────────────────────────────────────────
+
 /**
  * The model panel. A button changes what the list is scoped to and the panel
  * comes straight back, so widening to every provider or re-reading the
@@ -306,6 +462,18 @@ async function logoutFromProvider(app: App, def: ProviderDef): Promise<void> {
  */
 async function modelModal(app: App, opts: { all?: boolean } = {}): Promise<void> {
   let all = opts.all === true;
+  // The panel opens on the cached catalog and the live one is fetched behind
+  // it: a provider that has just published a model shows it without a press
+  // of Refresh, and a slow host delays nothing. When the answer lands while
+  // the panel is still up, the rows follow it in place.
+  let repaint: (() => void) | null = null;
+  void fetchModels({ force: true })
+    .then((catalog) => {
+      app.catalog = catalog;
+      app.rebuildTools();
+      repaint?.();
+    })
+    .catch(() => {});
   for (;;) {
     const cfg = loadConfig();
     const provider = currentProviderId(app);
@@ -317,7 +485,16 @@ async function modelModal(app: App, opts: { all?: boolean } = {}): Promise<void>
 
     const res = await app.exclusiveInput(() =>
       openModelModal({
-        catalog: scoped,
+        // A getter rather than a snapshot, so the background re-read above
+        // reaches rows the panel has already drawn.
+        get catalog() {
+          const here = providerModels(app, provider);
+          return all || !here.length ? app.catalog : here;
+        },
+        onOpen(update) {
+          repaint = update;
+          return () => void (repaint = null);
+        },
         current: app.session.model,
         defaultModel: cfg.model,
         title: t("Model", "Модель"),
@@ -434,6 +611,17 @@ function brainNeedsPanel(): void {
   hint(t("Choose them with /brain models", "Выбрать: /brain models"));
 }
 
+/**
+ * The panel as it stands, minus anything this client can no longer reach.
+ * The main model is a panel member first: if it was dropped from the panel or
+ * cannot be reached, the session's model writes instead.
+ */
+function brainMain(app: App, panel: string[]): string {
+  const cfg = loadConfig();
+  if (cfg.brainMainModel && panel.includes(cfg.brainMainModel)) return cfg.brainMainModel;
+  return app.session.model;
+}
+
 /** Who sits on the panel — one multi-select spanning every connected host. */
 async function brainPanelModal(app: App): Promise<void> {
   const cfg = loadConfig();
@@ -461,28 +649,51 @@ async function brainPanelModal(app: App): Promise<void> {
 /** The panel as it stands, and the question to put to it. */
 async function brainModal(app: App): Promise<void> {
   for (;;) {
+    const cfg = loadConfig();
     const configured = loadConfig().brainModels;
     const reachable = brainPanel(app);
-    const items: PickerItem[] = configured.map((id) => ({
-      value: id,
-      label: wireModelId(id).padEnd(28),
-      hint: reachable.includes(id)
-        ? c.dim(providerLabel(splitModelId(id).providerId))
-        : c.red(t("not reachable from here", "отсюда недоступна")),
-    }));
+    const mainModel = cfg.brainMainModel || app.session.model;
+    const items: PickerItem[] = configured.map((id) => {
+      const providerId = splitModelId(id).providerId;
+      const okHere = reachable.includes(id);
+      const marks =
+        (id === mainModel ? c.brightGreen("★ ") : "  ") +
+        (okHere ? "" : c.red("✗ "));
+      return {
+        value: id,
+        label: (marks + wireModelId(id)).padEnd(30),
+        hint: okHere
+          ? c.dim(providerLabel(providerId)) +
+            (id === cfg.brainMainModel ? c.brightGreen(t("  · main", "  · главная")) : "")
+          : c.red(t("not reachable from here", "отсюда недоступна")),
+        badge: id === mainModel && cfg.brainMainModel ? "" : id === mainModel ? c.gray(t("session", "сессия")) : "",
+      };
+    });
+
+    const tabs: PickerTab[] = [
+      { key: "panel", label: t("Active models", "Активные модели"), count: configured.length },
+    ];
+    // The catalogue tab: the same place a model is added is where one is
+    // excluded, so the panel never has to be rebuilt to drop a member.
+    const text = usableModels(app.catalog).filter((m) => servesModality(m, "text"));
+    if (text.length) {
+      tabs.push({ key: "all", label: t("All models", "Все модели"), count: text.length });
+    }
 
     const res = await app.exclusiveInput(() =>
       openModal({
         title: t("Brain", "Совет моделей"),
         subtitle: t(
-          "They answer separately, read each other, and one writes the result. Enter puts a question to them.",
-          "Они отвечают порознь, читают друг друга, одна сводит итог. Enter — задать им вопрос.",
+          "★ marks the main model — it writes the final answer. Enter on a row in All models adds or removes it.",
+          "★ — главная модель, она пишет итог. Enter по строке в «Все модели» добавляет или убирает её.",
         ),
-        items,
+        tabs,
+        initialTab: "panel",
         search: false,
         empty: t("No panel yet — choose the models first.", "Совета пока нет — сначала выберите модели."),
         actions: [
           { id: "ask", label: t("Ask…", "Спросить…"), hotkey: "a", disabled: reachable.length < 2 },
+          { id: "main", label: t("Make main", "Сделать главной"), hotkey: "m" },
           { id: "models", label: t("Choose models…", "Выбрать модели…"), hotkey: "c" },
           {
             id: "clear",
@@ -492,6 +703,10 @@ async function brainModal(app: App): Promise<void> {
             disabled: !configured.length,
           },
         ],
+        items: (tabKey) =>
+          tabKey === "all"
+            ? modelsAsRows(app.catalog)
+            : items,
       }),
     );
     if (!res) return;
@@ -501,16 +716,42 @@ async function brainModal(app: App): Promise<void> {
         await brainPanelModal(app);
         continue;
       }
+      if (res.id === "main") {
+        // The button carries the row that was under the cursor; with nothing
+        // under it (an empty panel, a header), the current choice stands.
+        await setBrainMain(app, res.value ?? cfg.brainMainModel);
+        continue;
+      }
       if (res.id === "clear") {
-        saveConfig({ brainModels: [] }, { replace: ["brainModels"] });
+        saveConfig({ brainModels: [], brainMainModel: "" }, { replace: ["brainModels"] });
         app.cfg = loadConfig();
         success(t("Panel cleared.", "Совет очищен."));
         continue;
       }
+      continue;
     }
 
-    // "Ask", and Enter on a row, are the same thing: the panel answers as a
-    // panel, so which row the cursor was on never mattered.
+    // A row answered from the catalogue tab toggles membership; from the panel
+    // tab, Enter asks. Which tab answered comes back with the result.
+    if (res.tab === "all") {
+      const next = configured.includes(res.value)
+        ? configured.filter((m) => m !== res.value)
+        : [...configured, res.value];
+      saveConfig(
+        { brainModels: next, brainMainModel: cfg.brainMainModel === res.value ? "" : cfg.brainMainModel },
+        { replace: ["brainModels"] },
+      );
+      app.cfg = loadConfig();
+      success(
+        next.includes(res.value)
+          ? t(`Added: ${wireModelId(res.value)}`, `Добавлена: ${wireModelId(res.value)}`)
+          : t(`Removed: ${wireModelId(res.value)}`, `Убрана: ${wireModelId(res.value)}`),
+      );
+      continue;
+    }
+
+    // "Ask", and Enter on a panel row, are the same thing: the panel answers as
+    // a panel, so which row the cursor was on never mattered.
     const panel = brainPanel(app);
     if (panel.length < 2) {
       brainNeedsPanel();
@@ -521,6 +762,47 @@ async function brainModal(app: App): Promise<void> {
     await app.runBrain(question, panel);
     return;
   }
+}
+
+/** Saves the main model when it sits on the panel; says so either way. */
+async function setBrainMain(app: App, model: string | null): Promise<void> {
+  if (!model) {
+    hint(t("Put the cursor on a model first.", "Сначала поставьте курсор на модель."));
+    return;
+  }
+  const panel = loadConfig().brainModels;
+  if (!panel.includes(model)) {
+    warn(
+      t(
+        `${wireModelId(model)} is not on the panel — add it before making it main.`,
+        `${wireModelId(model)} нет в совете — сначала добавьте её.`,
+      ),
+    );
+    return;
+  }
+  saveConfig({ brainMainModel: model });
+  app.cfg = loadConfig();
+  success(t(`Main model: ${wireModelId(model)}`, `Главная модель: ${wireModelId(model)}`));
+}
+
+/** The whole catalogue as picker rows — vendor sections, newest first. */
+function modelsAsRows(catalog: ModelInfo[]): PickerItem[] {
+  const models = usableModels(catalog).filter((m) => servesModality(m, "text"));
+  const bare = (id: string) => wireModelId(id);
+  const width = Math.min(34, Math.max(...models.map((m) => bare(m.id).length)) + 1);
+  const rows: PickerItem[] = [];
+  for (const group of groupByVendor(models)) {
+    rows.push({ value: `__${group.vendor}`, label: "", header: group.vendor });
+    for (const m of group.models) {
+      rows.push({
+        value: m.id,
+        label: bare(m.id).padEnd(width),
+        hint: c.dim(providerLabel(splitModelId(m.id).providerId)),
+        badge: incompatibleReason(m) ? "" : m.pricing ? `$${m.pricing.input}/$${m.pricing.output}` : "",
+      });
+    }
+  }
+  return rows;
 }
 
 // ── /subagents ────────────────────────────────────────────────────────────
@@ -1037,6 +1319,10 @@ function usageRows(folded: Map<string, ModelUsage>, only: string | null): Picker
  * the two questions this report ever answers — since when, and whose key — are
  * both a keypress away instead of a re-run of the command.
  */
+/**
+ * The usage panel. Buttons switch provider scope; the reset asks twice,
+ * because what it throws away is every session's record, not a view's filter.
+ */
 async function statModal(app: App): Promise<void> {
   const all = loadUsageRows(app);
   if (!all.length) {
@@ -1064,6 +1350,7 @@ async function statModal(app: App): Promise<void> {
     const actions: ModalAction[] = [
       ...(only ? [{ id: "__all", label: t("All providers", "Все поставщики") }] : []),
       ...everyProvider.filter((pid) => pid !== only).map((pid) => ({ id: pid, label: providerLabel(pid) })),
+      { id: "__reset", label: t("Reset", "Сбросить"), tone: "danger" as const },
     ];
 
     const res: ModalResult | null = await app.exclusiveInput(() =>
@@ -1083,15 +1370,68 @@ async function statModal(app: App): Promise<void> {
         readOnly: true,
         search: false,
         empty: t("No usage in this period.", "За этот период расхода нет."),
-        actions: actions.length > 1 ? actions : [],
+        actions: actions,
       }),
     );
     if (!res || res.kind !== "action") return;
+
+    if (res.id === "__reset") {
+      const rows = foldFor(period);
+      const totals = usageTotals(scope(rows));
+      if (!totals)
+        { period = (res.tab || period) as StatPeriod; continue; }
+      const sure = await app.exclusiveInput(() =>
+        choose<"yes" | "no">(
+          [
+            { value: "no", label: t("Keep it", "Оставить"), key: "n" },
+            { value: "yes", label: t("Erase all usage records", "Удалить все записи расхода"), key: "y", tone: "danger" },
+          ],
+          {
+            initial: "no",
+            fallback: "no",
+            hint: totals.replace(/<[^>]+>/g, "").trim() + "?",
+          },
+        ),
+      );
+      if (sure === "yes") await resetUsage(app, all);
+      return;
+    }
+
     // The panel reopens on the period it was left on, not on the one it opened
     // with: switching provider must not throw the period away.
     period = (res.tab || period) as StatPeriod;
     only = res.id === "__all" ? null : res.id;
   }
+}
+
+/**
+ * Wipes the usage record everywhere it lives: in the session files on disk and
+ * in the live tracker — whose next save would otherwise write its counts back.
+ */
+async function resetUsage(app: App, rows: (ModelUsage & { sessionFile?: string })[]): Promise<void> {
+  const sp = new Spinner(t("erasing usage records", "стираю записи расхода"));
+  sp.start();
+  try {
+    const live = `${app.session.id}.json`;
+    const files = [...new Set(rows.map((u) => u.sessionFile ?? "").filter(Boolean))];
+    for (const n of files) {
+      const f = path.join(sessionsDir(app.cwd), n);
+      let data: { usage?: unknown; messages?: unknown[] };
+      try {
+        data = JSON.parse(fs.readFileSync(f, "utf8"));
+      } catch {
+        continue; // gone by itself — nothing stored there to reset
+      }
+      if (n === live) continue; // handled below through the running tracker
+      data.usage = [];
+      fs.writeFileSync(f, JSON.stringify(data));
+    }
+    app.usage.reset();
+    app.session.save();
+  } finally {
+    sp.stop();
+  }
+  success(t("Usage records erased.", "Записи расхода стёрты."));
 }
 
 
@@ -1393,6 +1733,43 @@ async function browseSessions(app: App, mode: "resume" | "manage"): Promise<void
     app.replayHistory();
     return;
   }
+}
+
+/**
+ * `/erase`: every saved session of this project goes away in one stroke,
+ * except the one being lived in — /sessions already refuses to delete the
+ * session you are inside, and so does this.
+ */
+async function eraseSessions(app: App): Promise<void> {
+  const metas = Session.list(app.cwd, Number.MAX_SAFE_INTEGER).filter((m) => m.id !== app.session.id);
+  if (!metas.length)
+    return info(t("Only the current session is stored — nothing to erase.", "Сохранена только текущая сессия — стирать нечего."));
+
+  const msgs = metas.reduce((n, m) => n + m.messageCount, 0);
+  const sure = await choose<"yes" | "no">(
+    [
+      { value: "no", label: "Keep them", key: "n" },
+      {
+        value: "yes",
+        label: `Erase ${metas.length} ${plural(metas.length, "session", "sessions")} · ${msgs} ${plural(msgs, "message", "messages")}`,
+        key: "y",
+        tone: "danger",
+      },
+    ],
+    { initial: "no", fallback: "no" },
+  );
+  if (sure !== "yes") return;
+
+  let done = 0;
+  for (const m of metas) {
+    // The same cleanup as a single delete above: snapshots and input history
+    // are unreachable bytes once the file they belong to is gone.
+    dropStore(app.cwd, m.id);
+    dropSessionHistory(app.cwd, m.id);
+    if (Session.remove(app.cwd, m.id)) done++;
+  }
+  if (done < metas.length) warn(t(`${metas.length - done} could not be deleted.`, `Не удалось удалить: ${metas.length - done}.`));
+  success(t(`Erased ${done} ${plural(done, "session", "sessions")}.`, `Удалено ${count(done, ["session", "sessions"], ["сессия", "сессии", "сессий"])}.`));
 }
 
 /**
@@ -2483,6 +2860,14 @@ const COMMANDS: Command[] = [
     },
   },
   {
+    name: "/erase",
+    group: "session",
+    help: () => t("delete all saved sessions of this project except the current one", "удалить все сохранённые сессии проекта, кроме текущей"),
+    async run(app) {
+      await app.exclusiveInput(() => eraseSessions(app));
+    },
+  },
+  {
     name: "/fork",
     group: "session",
     args: () => t("[turn]", "[ход]"),
@@ -3012,6 +3397,22 @@ const COMMANDS: Command[] = [
     },
   },
   {
+    name: "/settings",
+    group: "settings",
+    help: () => t("status line fields, update checks", "поля строки состояния, проверка обновлений"),
+    async run(app) {
+      await app.exclusiveInput(() => settingsModal(app));
+    },
+  },
+  {
+    name: "/update",
+    group: "settings",
+    help: () => t("update to the latest GitHub release", "обновиться до последнего релиза с GitHub"),
+    async run(app) {
+      await runUpdate(app);
+    },
+  },
+  {
     name: "/config",
     group: "settings",
     help: () => t("current configuration", "текущая конфигурация"),
@@ -3307,7 +3708,7 @@ const COMMANDS: Command[] = [
     group: "other",
     help: () => t("clear the screen", "очистить экран"),
     async run(app) {
-      app.repaintHeader();
+      app.repaintHeader({ clear: true });
     },
   },
   {

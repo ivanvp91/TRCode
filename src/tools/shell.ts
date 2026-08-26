@@ -17,6 +17,14 @@ const HARD_LIMIT_MS = 20 * 60_000;
  * speaks when there is none.
  */
 const HEARTBEAT_MS = 10_000;
+/**
+ * After we have killed a tree, how long we wait for the `close` event before
+ * resolving with what was captured anyway. `taskkill` is fire-and-forget, and
+ * a grandchild that survives it — a gradle daemon's java.exe — keeps the
+ * stdout pipe open, which is what the promise waits on; without this the turn
+ * sat there for good, deaf even to Esc.
+ */
+const KILL_GRACE_MS = 10_000;
 /** Kept from the start and from the end of a stream, in characters. */
 const HEAD_LIMIT = 20_000;
 const TAIL_LIMIT = 20_000;
@@ -151,7 +159,8 @@ export const shellTool: ToolDef = {
         description:
           "How long the command may produce NO output before it is killed, in ms (default 120000). " +
           "A command that keeps printing keeps running, so a build does not need a bigger number — " +
-          "a silent one does. Hard ceiling: 20 minutes.",
+          "a silent one does. A first Gradle/Maven/CMake build compiles quietly for many minutes: " +
+          "pass 600000 or more for one. Hard ceiling: 20 minutes.",
       },
       cwd: { type: "string", description: "Subdirectory to run in, relative to the project" },
     },
@@ -212,6 +221,22 @@ export const shellTool: ToolDef = {
         tail(c);
       });
 
+      // A kill is a promise, not an event: taskkill is fire-and-forget, and a
+      // grandchild that survives it — a gradle daemon's java.exe — keeps the
+      // stdout pipe open, which close waits on. Once the tree has been killed,
+      // the run is over by definition; settle with what was captured.
+      let forceResolve: ReturnType<typeof setTimeout> | undefined;
+      const scheduleForceResolve = () => {
+        if (forceResolve) return;
+        forceResolve = setTimeout(() => {
+          child.emit("close", null);
+        }, KILL_GRACE_MS);
+      };
+      const stopForceResolve = () => {
+        clearTimeout(forceResolve);
+        forceResolve = undefined;
+      };
+
       // The limit is on silence, not on duration. A build that prints for six
       // minutes is working; a command that has said nothing for two is the one
       // worth killing, and the old rule killed them both at the same mark —
@@ -225,6 +250,7 @@ export const shellTool: ToolDef = {
           killed = true;
           reason = `[no output for ${Math.round(timeout / 1000)}s — killed]`;
           killTree(child);
+          scheduleForceResolve();
         }, timeout);
       };
       stopAfterSilence();
@@ -234,6 +260,7 @@ export const shellTool: ToolDef = {
         killed = true;
         reason = `[still running after ${Math.round(HARD_LIMIT_MS / 1000)}s — killed]`;
         killTree(child);
+        scheduleForceResolve();
       }, HARD_LIMIT_MS);
 
       /**
@@ -268,10 +295,12 @@ export const shellTool: ToolDef = {
       const onAbort = () => {
         killed = true;
         killTree(child);
+        scheduleForceResolve();
       };
       ctx.signal.addEventListener("abort", onAbort, { once: true });
 
       child.on("error", (err) => {
+        stopForceResolve();
         clearTimeout(quiet);
         clearTimeout(ceiling);
         clearInterval(heartbeat);
@@ -280,6 +309,7 @@ export const shellTool: ToolDef = {
       });
 
       child.on("close", (code) => {
+        stopForceResolve();
         clearTimeout(quiet);
         clearTimeout(ceiling);
         clearInterval(heartbeat);

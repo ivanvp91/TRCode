@@ -62,6 +62,15 @@ check("the env key is what callers see", loadConfig().apiKey === "sk-from-env", 
 check("but it is not written to the file", onDisk().apiKey !== "sk-from-env", String(onDisk().apiKey));
 delete process.env.TOKENROUTER_API_KEY;
 
+// The status line: all fields on by default, toggles merge, replace replaces.
+check(
+  "status fields are all on by default",
+  Object.values(loadConfig().statusFields).every(Boolean),
+  JSON.stringify(loadConfig().statusFields),
+);
+saveConfig({ statusFields: { speed: false } });
+check("a toggle merges over the defaults", loadConfig().statusFields.speed === false && loadConfig().statusFields.model === true, JSON.stringify(loadConfig().statusFields));
+
 fs.rmSync(HOME, { recursive: true, force: true });
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

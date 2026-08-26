@@ -7,6 +7,7 @@ import {
   type ModalAction,
   type ModalResult,
   type PickerItem,
+  type PickerOptions,
   type PickerTab,
 } from "./picker.js";
 import { fmtTokens } from "../usage.js";
@@ -28,6 +29,8 @@ export interface ModelPickerOptions {
   allowEmpty?: boolean;
   /** Show every modality, including models this client cannot drive. */
   includeIncompatible?: boolean;
+  /** Passed through to the panel: lets the caller repaint it while open. */
+  onOpen?: PickerOptions["onOpen"];
 }
 
 function rowsFor(opts: ModelPickerOptions, modality: string): PickerItem[] {
@@ -99,6 +102,7 @@ export function openModelModal(opts: ModelPickerOptions): Promise<ModalResult | 
     initial: opts.current,
     actions: opts.actions,
     items: (tabKey) => rowsFor(opts, tabKey || "text"),
+    onOpen: opts.onOpen,
   });
 }
 
@@ -155,7 +159,9 @@ export async function pickModelsAcrossProviders(
   opts: ModelPickerOptions & { selected?: string[] },
 ): Promise<string[] | null> {
   const text = usableModels(opts.catalog).filter((m) => servesModality(m, "text"));
-  const providers = [...new Set(text.map((m) => splitModelId(m.id).providerId))];
+  const providers = [...new Set(text.map((m) => splitModelId(m.id).providerId))].sort((a, b) =>
+    providerLabel(a).localeCompare(providerLabel(b)),
+  );
   const tabs: PickerTab[] = providers.map((id) => ({
     key: id,
     label: providerLabel(id),

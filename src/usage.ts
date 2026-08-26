@@ -219,6 +219,19 @@ export class UsageTracker {
     return this.all();
   }
 
+  /** Forgets every recorded row; the session keeps running from zero. */
+  reset(): void {
+    this.byModel.clear();
+    this.turn = zeroTurn();
+    this.lastTurn = {
+      input: 0,
+      output: 0,
+      reasoning: 0,
+      costUsd: 0,
+      priceUnknown: false,
+    };
+  }
+
   static fromJSON(data: ModelUsage[] | undefined): UsageTracker {
     const t = new UsageTracker();
     for (const u of data ?? []) t.byModel.set(u.model, { ...u });

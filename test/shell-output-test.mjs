@@ -80,6 +80,28 @@ check("short output is verbatim", /just this/.test(small.output) && !/omitted/.t
   check("without waiting out the whole command", (Date.now() - at0) / 1000 < 5, ((Date.now() - at0) / 1000).toFixed(1) + "s");
 }
 
+// The kill has to end the run even when the tree ignores it. A grandchild that
+// survives taskkill keeps the stdout pipe open, close never fires, and the
+// turn sat there for good — deaf to Esc, printing heartbeats past its own
+// deadline. Simulated here by a child that swallows SIGKILL-equivalent kills
+// and exits only after the grace period, long after the idle limit.
+{
+  const stubborn = path.join(HOME, "stubborn.js");
+  fs.writeFileSync(
+    stubborn,
+    [
+      "console.log('started');",
+      "process.on('SIGTERM', () => {});", // ignore the polite kill
+      "setTimeout(() => process.exit(0), 30000);", // would hold the pipe for 30s
+    ].join(String.fromCharCode(10)),
+  );
+  const at0 = Date.now();
+  const res = await shellTool.run({ command: `node "${stubborn}"`, timeout_ms: 1500 }, ctx);
+  const secs = (Date.now() - at0) / 1000;
+  check("a kill that is ignored still ends the run", res.isError === true, res.output.slice(-160));
+  check("within the grace window, not after the command", secs < 15, secs.toFixed(1) + "s");
+}
+
 // What the user sees of a failure. A build opens with pages of warnings and
 // says what actually went wrong in its last lines, so the first eight showed
 // the noise and hid the reason.

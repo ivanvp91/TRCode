@@ -92,6 +92,14 @@ export interface PickerOptions {
    * real answer — no panel, no extra subagent models — and not an accident.
    */
   allowEmpty?: boolean;
+  /** A blank line before every section heading except the first. */
+  groupGap?: boolean;
+  /**
+   * Called once the panel is up, with a function that re-reads `items` and
+   * redraws in place — for a list that improves while open, like a catalog
+   * re-fetched in the background. May return a cleanup, run when it closes.
+   */
+  onOpen?: (update: () => void) => (() => void) | void;
 }
 
 /** What the panel was closed with. */
@@ -265,7 +273,11 @@ export function openModal(
       // What is left for the list once the chrome above and below is counted.
       const buttonRows = modalButtons(w, actions, focus === "buttons" ? buttonIdx : null);
       const chromeBelow = 1 /* pad */ + (buttonRows.length ? buttonRows.length + 1 : 0) + 1 /* footer */ + 1 /* bottom */;
-      const room = Math.max(4, (process.stdout.rows || 24) - buf.length - chromeBelow - 3);
+      // Gaps before section headings are part of the page height too.
+      const gaps = opts.groupGap
+        ? rows.slice(0, -1).filter((r, i) => r.header && !rows[i + 1].header).length
+        : 0;
+      const room = Math.max(4, (process.stdout.rows || 24) - buf.length - chromeBelow - 3) - gaps;
       const pageSize = Math.min(opts.pageSize ?? 14, room);
 
       // Keep the cursor roughly centred without slicing off headers.
@@ -279,6 +291,9 @@ export function openModal(
       for (const [i, item] of page.entries()) {
         const abs = start + i;
         if (item.header) {
+          if (opts.groupGap && abs > 0 && rows[abs - 1] && !rows[abs - 1].header) {
+            buf.push(modalRow(w));
+          }
           buf.push(modalSep(w, item.header));
           continue;
         }
@@ -324,6 +339,8 @@ export function openModal(
     };
 
     let release: () => void = () => {};
+    let stopLive: (() => void) | void;
+    let closed = false;
     cursor.hide();
     syncIndex(visible());
     if (opts.initial) {
@@ -334,6 +351,8 @@ export function openModal(
     draw();
 
     const finish = (value: ModalResult | null) => {
+      closed = true;
+      if (typeof stopLive === "function") stopLive();
       release();
       clear();
       cursor.show();
@@ -458,6 +477,17 @@ export function openModal(
     };
 
     release = pushConsumer(onData);
+    stopLive = opts.onOpen?.(() => {
+      if (closed) return;
+      // Keep the cursor on the row it was on, wherever that row moved to.
+      const keep = currentValue();
+      all = resolveItems(tabs[tabIndex]?.key ?? "");
+      if (keep) {
+        const at = visible().findIndex((r) => !r.header && r.value === keep);
+        if (at !== -1) index = at;
+      }
+      draw();
+    });
   });
 }
 

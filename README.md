@@ -347,11 +347,13 @@ insert, Esc to dismiss. `/help` prints the full reference.
 system prompt, tool schemas, history after trim, injections — the projection behind
 [Token spend](#token-spend))
 
-**Settings** — `/lang [en\|ru]`, `/default [name]`, `/aliases`, `/permissions`, `/login [provider] [url]`, `/config`, `/cwd`
+**Settings** — `/lang [en\|ru]`, `/default [name]`, `/aliases`, `/permissions`, `/login [provider] [url]`, `/settings`, `/update [--check]`, `/config`, `/cwd`
 (the catalog lives in `/model` — the panel lists the current provider by type and vendor,
 `/model all` every provider, and its Refresh button re-reads it past the cache; `/login`
 connects the one in use unless another is named, and takes a host for the providers whose
-endpoint is per-account)
+endpoint is per-account; `/settings` groups the toggleable preferences — what the status
+line shows, whether skills and UI mockups match themselves automatically, whether updates
+are looked for; `/update` installs the newest GitHub release — details below)
 
 **Agents** — `/subagents [model [id]\|auto]`, `/prompt <task> \| model [id] \| off\|command\|auto`,
 `/prompt_model [id]`, `/mcp [reload]`
@@ -404,6 +406,22 @@ description.
 **Other** — `/tools`, `/skills`, `/preset [standard\|minimal]`, `/todo`, `/keys`, `/init`, `/clear`, `/version`, `/help`, `/exit`
 (`/preset minimal` keeps only `shell` and `edit` with a short prompt — see
 [Presets](#presets))
+
+### Updating
+
+The client checks GitHub Releases at startup — at most once every six hours, never
+applying anything — and the header says when a newer version exists. Installing is
+explicit:
+
+```bash
+trc update           # download, unpack, swap — the new build runs on restart
+trc update --check   # only report what is out there
+```
+
+Same inside a session: `/update`. The tarball comes from
+`github.com/ivanvp91/TRCode/releases`, is unpacked with the system `tar`, and the swap
+keeps the old `dist` around until the new one is in place. `"updateCheck": false` (or
+`TRCODE_NO_UPDATE_CHECK`) turns the passive startup check off; `/update` keeps working.
 
 ### Keys
 
@@ -1336,6 +1354,7 @@ Prices are not published either, so no money is shown anywhere — only tokens.
   "promptMode": "command",
   "subagentModels": {},
   "brainModels": [],
+  "brainMainModel": "",
   "toolConcurrency": 4,
   "modelPrompts": {},
   "hideIncompatibleModels": true,
@@ -1361,9 +1380,13 @@ Prices are not published either, so no money is shown anywhere — only tokens.
   "orcaAgent": "opencode",
   "providers": {},
   "lang": "en",
+  "skillAuto": true,
+  "uilibAuto": true,
   "defaultProvider": "tokenrouter",
   "providerState": { "kimi": { "model": "kimi:k3", "effort": "high" } },
   "projectState": { "trcode-cli-9f2c1a4b7e08": { "model": "x-ai/grok-4.6", "effort": "medium" } },
+  "statusFields": { "model": true, "tokens": true, "steps": true, "time": true, "speed": true },
+  "updateCheck": true,
   "temperature": 0.2
 }
 ```
@@ -1404,7 +1427,9 @@ it runs, not after three models have each spent a minute answering that they wer
 nothing.
 
 What the user sees is the discussion as it happens — each model's first answer and its
-revision — and then one answer at the end, written by the session's own model. The final
+revision — and then one answer at the end, written by the session's own model, or by the
+panel member marked as the main one (`/brain models`, "Make main"; kept in the config as
+`brainMainModel`). The final
 answer says where the panel genuinely disagreed and what the split depends on; it does not
 manufacture a consensus, and it does not report on the process. The question and that
 answer join the session as an ordinary exchange, so the next turn continues from it.
@@ -1521,11 +1546,13 @@ PASS  cache-test.mjs         25/25     PASS  turnbar-test.mjs    45/45
 PASS  prompt-test.mjs        35/35     PASS  transcript-test.mjs 14/14
 PASS  projection-test.mjs    11/11     PASS  preset-test.mjs     9/9
 PASS  codemode-test.mjs      9/9       PASS  fork-test.mjs       10/10
+PASS  stat-test.mjs          17/17     PASS  update-test.mjs     23/23
 ```
 
 51 suites in all. The suites cover the wire protocols, provider routing and the OAuth device flow (against a
 throwaway server on localhost), history trimming, the request projection log, the code-mode
-sandbox (path guard, snapshots, timeout, abort), session forking and the tool presets,
+sandbox (path guard, snapshots, timeout, abort), session forking, the tool presets and the
+self-update path against a mock of the GitHub API,
 plus the terminal behaviour that is otherwise painful to verify: paste in four delivery
 shapes, split escape sequences,
 Shift+Tab in its three encodings, focus events, frame repainting, multi-line input,
@@ -1648,6 +1675,12 @@ src/
 
 MIT
 yscan.ts         /keys inspector
+```
+
+## License
+
+MIT
+r
 ```
 
 ## License
