@@ -5,7 +5,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 
-export const VERSION = "0.1.3";
+export const VERSION = "0.1.4";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";
@@ -47,6 +47,13 @@ export interface Config {
    */
   promptModels: Record<string, string>;
   /**
+   * Which models subagents may run on, per provider: "session" — the model the
+   * session runs on and nothing else; "list" — the models chosen in
+   * subagentModels. Absent is read from the list itself, so a config written
+   * before the choice existed keeps behaving the way it did.
+   */
+  subagentMode: Record<string, "session" | "list">;
+  /**
    * Models a subagent may be launched on, per provider. Empty means the model
    * chooses from everything the provider serves, which is the default; a list
    * narrows it to what you are willing to pay for in parallel.
@@ -62,6 +69,30 @@ export interface Config {
    * model, which is how it worked before the choice existed.
    */
   brainMainModel: string;
+  /**
+   * The roster /swarm runs: the same task in parallel, one worker per model.
+   * Empty means the automatic pick — the session's model plus a different
+   * vendor for each remaining slot.
+   */
+  swarmModels: string[];
+  /**
+   * The roster member that merges the answers. Empty — or a model no longer on
+   * the roster — means the session's model writes the synthesis, which is how
+   * it worked before the choice existed.
+   */
+  swarmMainModel: string;
+  /**
+   * Starred models: they get the leading tab in every model chooser, whatever
+   * provider each belongs to.
+   */
+  favoriteModels: string[];
+  /**
+   * Scope of that tab: true — the default — every connected provider's stars,
+   * so picking one switches the session's host; false — only what the provider
+   * in use serves. A panel whose answer has to be callable by the provider in
+   * use, the subagent pool, stays narrow either way.
+   */
+  favoritesAllProviders: boolean;
   /**
    * Extra system-prompt notes per model. A key is a model id, a bare name, or
    * a family with a trailing "*"; an exact match replaces the built-in note
@@ -285,8 +316,13 @@ const DEFAULTS: Config = {
   smallModel: "moonshotai/kimi-k3-free",
   promptModels: {},
   subagentModels: {},
+  subagentMode: {},
   brainModels: [],
   brainMainModel: "",
+  swarmModels: [],
+  swarmMainModel: "",
+  favoriteModels: [],
+  favoritesAllProviders: true,
   modelPrompts: {},
   // Off the automatic path by default: rewriting what someone typed is a
   // liberty, and it costs a call. /prompt asks for it explicitly.
@@ -424,11 +460,17 @@ export function loadConfig(): Config {
     effortForm: { ...DEFAULTS.effortForm, ...(file.effortForm || {}) },
     promptModels: { ...DEFAULTS.promptModels, ...(file.promptModels || {}) },
     subagentModels: { ...DEFAULTS.subagentModels, ...(file.subagentModels || {}) },
+    subagentMode: { ...DEFAULTS.subagentMode, ...(file.subagentMode || {}) },
     modelPrompts: { ...DEFAULTS.modelPrompts, ...(file.modelPrompts || {}) },
     providerState: { ...DEFAULTS.providerState, ...(file.providerState || {}) },
     projectState: { ...DEFAULTS.projectState, ...(file.projectState || {}) },
     mcpServers: { ...DEFAULTS.mcpServers, ...(file.mcpServers || {}) },
     statusFields: { ...DEFAULTS.statusFields, ...(file.statusFields || {}) },
+    // A favoriteModels corrupted by an older save (an object-shaped spread)
+    // must not crash every model panel — salvage what looks like an array.
+    brainModels: Array.isArray(file.brainModels) ? file.brainModels : DEFAULTS.brainModels,
+    swarmModels: Array.isArray(file.swarmModels) ? file.swarmModels : DEFAULTS.swarmModels,
+    favoriteModels: Array.isArray(file.favoriteModels) ? file.favoriteModels : DEFAULTS.favoriteModels,
   };
   const envKey = process.env.TOKENROUTER_API_KEY || process.env.TR_API_KEY;
   if (envKey) merged.apiKey = envKey;
@@ -458,6 +500,13 @@ export function saveConfig(patch: Partial<Config>, opts: { replace?: (keyof Conf
   const replace = new Set(opts.replace ?? []);
   const merge = <T extends object>(key: keyof Config, base: T | undefined, incoming: T | undefined): T =>
     replace.has(key) && incoming !== undefined ? incoming : ({ ...(base ?? {}), ...(incoming ?? {}) } as T);
+  // Array-valued keys must replace wholesale — object-spreading an array
+  // turns it into {0:…,1:…}, and the next load reads garbage. A non-array
+  // already on disk (an older save's mistake) is dropped here too.
+  const mergeList = <T>(key: keyof Config, base: T[] | undefined, incoming: T[] | undefined): T[] => {
+    const prior = Array.isArray(base) ? base : [];
+    return replace.has(key) && incoming !== undefined ? incoming : prior;
+  };
   const next = {
     ...current,
     ...patch,
@@ -469,11 +518,15 @@ export function saveConfig(patch: Partial<Config>, opts: { replace?: (keyof Conf
     effortForm: merge("effortForm", current.effortForm, patch.effortForm),
     promptModels: merge("promptModels", current.promptModels, patch.promptModels),
     subagentModels: merge("subagentModels", current.subagentModels, patch.subagentModels),
+    subagentMode: merge("subagentMode", current.subagentMode, patch.subagentMode),
     modelPrompts: merge("modelPrompts", current.modelPrompts, patch.modelPrompts),
     providerState: merge("providerState", current.providerState, patch.providerState),
     projectState: merge("projectState", current.projectState, patch.projectState),
     mcpServers: merge("mcpServers", current.mcpServers, patch.mcpServers),
     statusFields: merge("statusFields", current.statusFields, patch.statusFields),
+    brainModels: mergeList("brainModels", current.brainModels, patch.brainModels),
+    swarmModels: mergeList("swarmModels", current.swarmModels, patch.swarmModels),
+    favoriteModels: mergeList("favoriteModels", current.favoriteModels, patch.favoriteModels),
   };
   ensureDir(configDir());
   fs.writeFileSync(configPath(), JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });

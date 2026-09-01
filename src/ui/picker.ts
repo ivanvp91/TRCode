@@ -92,8 +92,12 @@ export interface PickerOptions {
    * real answer — no panel, no extra subagent models — and not an accident.
    */
   allowEmpty?: boolean;
-  /** A blank line before every section heading except the first. */
-  groupGap?: boolean;
+  /**
+   * A blank line before every section heading except the first. A tab key may
+   * be listed here to turn it on for that tab alone — the favorite tab's
+   * provider sections read as groups, one modality's list does not.
+   */
+  groupGap?: boolean | string[];
   /**
    * Called once the panel is up, with a function that re-reads `items` and
    * redraws in place — for a list that improves while open, like a catalog
@@ -147,6 +151,8 @@ export function openModal(
     let all: PickerItem[] = resolveItems(tabs[tabIndex]?.key ?? "");
     let index = 0;
     let rendered = 0;
+    /** First row of the current page; moves only when the cursor hits an edge. */
+    let viewStart = 0;
     /** The list owns the keyboard until Tab hands it to the buttons. */
     let focus: "list" | "buttons" = "list";
     let buttonIdx = actions.findIndex((a) => !a.disabled);
@@ -219,6 +225,7 @@ export function openModal(
       all = resolveItems(tabs[tabIndex].key);
       filter = "";
       index = 0;
+      viewStart = 0;
       syncIndex(visible());
     };
 
@@ -273,25 +280,59 @@ export function openModal(
       // What is left for the list once the chrome above and below is counted.
       const buttonRows = modalButtons(w, actions, focus === "buttons" ? buttonIdx : null);
       const chromeBelow = 1 /* pad */ + (buttonRows.length ? buttonRows.length + 1 : 0) + 1 /* footer */ + 1 /* bottom */;
-      // Gaps before section headings are part of the page height too.
-      const gaps = opts.groupGap
-        ? rows.slice(0, -1).filter((r, i) => r.header && !rows[i + 1].header).length
-        : 0;
-      const room = Math.max(4, (process.stdout.rows || 24) - buf.length - chromeBelow - 3) - gaps;
+      // Gaps before section headings inside the page are part of its height:
+      // the slice can hold fewer items than `pageSize` when it carries gaps.
+      const gapOn = Array.isArray(opts.groupGap)
+        ? opts.groupGap.includes(tabs[tabIndex]?.key ?? "")
+        : opts.groupGap === true;
+      const room = Math.max(4, (process.stdout.rows || 24) - buf.length - chromeBelow - 3);
       const pageSize = Math.min(opts.pageSize ?? 14, room);
 
-      // Keep the cursor roughly centred without slicing off headers.
-      const start = Math.max(0, Math.min(index - Math.floor(pageSize / 2), Math.max(0, rows.length - pageSize)));
-      const page = rows.slice(start, start + pageSize);
+      // Anchor the window at the top and slide it only when the cursor walks
+      // past an edge. Re-centering on every step redraws the whole panel from
+      // a different offset, which reads as the screen scrolling; walking rows
+      // inside the page must leave everything else untouched.
+      //
+      // The page budget is in *drawn* lines: a gap before a header costs one,
+      // a header itself one more, so how many rows fit depends on where the
+      // window starts. buildPage turns a start index into exactly the rows the
+      // frame will draw, never exceeding pageSize drawn lines.
+      const buildPage = (start: number): PickerItem[] => {
+        const pageRows: PickerItem[] = [];
+        let used = 0;
+        for (let i = start; i < rows.length; i++) {
+          const cost = i > start && gapOn && rows[i].header && !rows[i - 1].header ? 2 : 1;
+          if (used + cost > pageSize) break;
+          pageRows.push(rows[i]);
+          used += cost;
+        }
+        return pageRows;
+      };
+      /** Row index of the last selectable row a window at start shows. */
+      const drawnEnd = (start: number): number => {
+        const pageRows = buildPage(start);
+        for (let i = pageRows.length - 1; i >= 0; i--) if (!pageRows[i].header) return start + i;
+        return start;
+      };
+      if (index < viewStart) viewStart = index;
+      while (index > drawnEnd(viewStart) && viewStart < rows.length - 1) viewStart++;
+
+      // Headers lead their section: a window starting on a model whose group
+      // heading sits above it would draw that model headless. Slide the top
+      // back past headers — and re-check the cursor afterwards, since the
+      // widened page may now end before it (the list tail case).
+      while (viewStart > 0 && rows[viewStart]?.header) viewStart--;
+      while (index > drawnEnd(viewStart) && viewStart < rows.length - 1) viewStart++;
+      const page = buildPage(viewStart);
 
       if (!page.length) {
         buf.push(modalRow(w, c.dim(filter ? t("nothing matches", "ничего не найдено") : (opts.empty ?? t("nothing here yet", "здесь пока пусто")))));
       }
 
       for (const [i, item] of page.entries()) {
-        const abs = start + i;
+        const abs = viewStart + i;
         if (item.header) {
-          if (opts.groupGap && abs > 0 && rows[abs - 1] && !rows[abs - 1].header) {
+          if (gapOn && abs > 0 && rows[abs - 1] && !rows[abs - 1].header) {
             buf.push(modalRow(w));
           }
           buf.push(modalSep(w, item.header));
@@ -443,8 +484,14 @@ export function openModal(
       }
 
       // A panel that only reports has nothing to answer with: Enter closes it,
-      // the way Esc does.
-      if (s === "\r" || s === "\n") return opts.readOnly ? finish(null) : answerItem();
+      // the way Esc does. A multi panel with nothing marked answers only when
+      // the caller allowed an empty set — an Enter on a bare row must not
+      // silently wipe a set the user sees unchecked because a filter hides
+      // the marked rows.
+      if (s === "\r" || s === "\n") {
+        if (opts.readOnly) return finish(null);
+        return answerItem();
+      }
       if (s === " " && multi) {
         const item = visible()[index];
         if (item && !item.header) {
@@ -455,6 +502,19 @@ export function openModal(
       }
       if (s === UP) return move(-1), draw();
       if (s === DOWN) return move(1), draw();
+      // A page at a time, for lists too long to walk: the terminal spells
+      // PageUp/PageDown as ESC [5~ / ESC [6~.
+      if (s === "\x1b[5~" || s === "\x1b[6~") {
+        const dir = s === "\x1b[6~" ? 1 : -1;
+        const rows = visible();
+        const sel = selectableIdx(rows);
+        if (!sel.length) return;
+        const step = 7;
+        const at = sel.indexOf(index);
+        const next = sel[Math.max(0, Math.min(sel.length - 1, (at < 0 ? 0 : at) + dir * step))];
+        if (next !== undefined) index = next;
+        return draw();
+      }
       if (s === LEFT) return switchTab(-1), draw();
       if (s === RIGHT) return switchTab(1), draw();
       if (s === DEL || s === BACKSPACE) {
@@ -485,7 +545,10 @@ export function openModal(
       if (keep) {
         const at = visible().findIndex((r) => !r.header && r.value === keep);
         if (at !== -1) index = at;
+      } else {
+        index = 0;
       }
+      viewStart = Math.max(0, Math.min(index - 2, Math.max(0, all.length - 1)));
       draw();
     });
   });

@@ -10,20 +10,51 @@ import { buildSystemPrompt } from "./prompt.js";
 import { runAgent, stepCeiling } from "./loop.js";
 import { UsageTracker, fmtTokens } from "../usage.js";
 import { loadConfig } from "../config.js";
-import { effortFor } from "../provider/models.js";
+import { effortFor, servesModality, usableModels } from "../provider/models.js";
 import type { ModelInfo, ToolDef } from "../types.js";
 import type { App } from "../ui/repl.js";
 
+/**
+ * The roster chosen by hand: what /swarm models saved, minus anything this
+ * client can no longer reach. Empty — nothing chosen, or nothing left of it —
+ * hands the pick back to defaultRoster.
+ */
+export function configuredRoster(catalog: ModelInfo[]): string[] {
+  return loadConfig().swarmModels.filter((id) => catalog.some((m) => m.id === id));
+}
+
+/**
+ * What a /swarm would run right now: the chosen roster when there is one, else
+ * the automatic pick. One place, so the panel shows exactly what will run.
+ */
+export function swarmRoster(catalog: ModelInfo[], current: string, size = 3): string[] {
+  const chosen = configuredRoster(catalog);
+  return chosen.length ? chosen : defaultRoster(catalog, current, size);
+}
+
+/**
+ * Who merges the answers: the roster member pinned for it, else the session's
+ * model. A pin dropped from the roster is ignored rather than obeyed — the
+ * synthesis reads every answer, so it has to be a model that ran.
+ */
+export function swarmMain(sessionModel: string, roster: string[]): string {
+  const pinned = loadConfig().swarmMainModel;
+  return pinned && roster.includes(pinned) ? pinned : sessionModel;
+}
+
 /** Picks a diverse roster: the current model plus different-owner alternatives. */
 export function defaultRoster(catalog: ModelInfo[], current: string, size = 3): string[] {
-  const ids = catalog.map((m) => m.id);
+  // Only what can actually answer: an embedding or image-only model taken for
+  // its vendor would fail on the first turn and quietly shrink the swarm.
+  const pool = usableModels(catalog).filter((m) => m.chatCapable !== false && servesModality(m, "text"));
+  const ids = pool.map((m) => m.id);
   if (!ids.length) return [current];
   const roster = [current];
-  const ownerOf = (id: string) => catalog.find((m) => m.id === id)?.owner ?? id.split("-")[0];
+  const ownerOf = (id: string) => pool.find((m) => m.id === id)?.owner ?? id.split("-")[0];
   const usedOwners = new Set([ownerOf(current)]);
 
   // Prefer a different vendor each time — diversity is the point of a swarm.
-  for (const m of catalog) {
+  for (const m of pool) {
     if (roster.length >= size) break;
     if (roster.includes(m.id)) continue;
     const owner = ownerOf(m.id);
@@ -58,9 +89,12 @@ Merge them into one answer:
 
 Write the final answer as if you were answering the user yourself: no "model A said…" in every paragraph. Put the disagreement analysis at the end as a short separate block, and only if the disagreements matter.`;
 
-export async function runSwarm(app: App, task: string): Promise<void> {
+export async function runSwarm(app: App, task: string, given?: string[]): Promise<void> {
   const cfg = loadConfig();
-  const roster = defaultRoster(app.catalog, app.session.model, 3);
+  // The panel hands its own roster in so what it showed is what runs; a bare
+  // /swarm <task> resolves the same list here.
+  const roster = given?.length ? given : swarmRoster(app.catalog, app.session.model, 3);
+  const synthModel = swarmMain(app.session.model, roster);
 
   if (roster.length < 2) {
     warn("Fewer than two models in the catalog — the swarm degenerates into a plain request.");
@@ -69,7 +103,7 @@ export async function runSwarm(app: App, task: string): Promise<void> {
   line();
   rule(c.brightMagenta(` swarm · ${roster.length} ${roster.length === 1 ? "model" : "models"} `));
   padded(`${c.bold("task")} ${truncate(task, 90)}`);
-  for (const m of roster) padded(`${c.brightBlue("├")} ${m}`);
+  for (const m of roster) padded(`${c.brightBlue("├")} ${m}${m === synthModel ? c.gray(" · synthesis") : ""}`);
   line();
 
   const readOnlyTools: ToolDef[] = app.toolList().filter((t) => t.risk === "read");
@@ -125,7 +159,7 @@ export async function runSwarm(app: App, task: string): Promise<void> {
   if (good.length === 1) {
     info(`Only one model finished (${good[0].model}) — no synthesis needed.`);
     printAnswer(good[0].model, good[0].text);
-    commit(app, task, good[0].text, roster);
+    commit(app, task, good[0].text, roster, good[0].model);
     return;
   }
 
@@ -144,7 +178,7 @@ export async function runSwarm(app: App, task: string): Promise<void> {
 
   try {
     const res = await runAgent({
-      model: app.session.model,
+      model: synthModel,
       systemPrompt: SYNTH_PROMPT,
       messages: [{ role: "user", content: `Task:\n${task}\n\nModel answers:\n\n${bundle}` }],
       tools: [],
@@ -153,13 +187,13 @@ export async function runSwarm(app: App, task: string): Promise<void> {
       usage: synthUsage,
       maxSteps: 1,
       signal: ctx.signal,
-      effort: effortFor(app.session.model, app.effortOverride),
+      effort: effortFor(synthModel, app.effortOverride),
       events: {
         onText: (delta) => {
           if (!stream.md) {
             sp.stop();
             line();
-            assistantPrefix(`${app.session.model} ${c.gray("· synthesis")}`);
+            assistantPrefix(`${synthModel} ${c.gray("· synthesis")}`);
             stream.md = new MarkdownStream();
           }
           stream.md.push(delta);
@@ -182,7 +216,7 @@ export async function runSwarm(app: App, task: string): Promise<void> {
   }
 
   app.usage.absorb(synthUsage);
-  commit(app, task, synth, roster);
+  commit(app, task, synth, roster, synthModel);
 
   line();
   padded(
@@ -205,8 +239,8 @@ function printAnswer(model: string, text: string): void {
 }
 
 /** Folds the swarm result into the session so the dialogue stays coherent. */
-function commit(app: App, task: string, answer: string, roster: string[]): void {
+function commit(app: App, task: string, answer: string, roster: string[], model?: string): void {
   app.session.add({ role: "user", content: `[swarm: ${roster.join(", ")}] ${task}` });
-  app.session.add({ role: "assistant", content: answer, meta: { model: app.session.model } });
+  app.session.add({ role: "assistant", content: answer, meta: { model: model ?? app.session.model } });
   app.session.save();
 }

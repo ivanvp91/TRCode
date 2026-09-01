@@ -14,11 +14,13 @@ import { MarkdownStream, Spinner, assistantPrefix, error, hint, info, line, padd
 import { buildSystemPrompt } from "./prompt.js";
 import { runAgent, stepCeiling } from "./loop.js";
 import { complete } from "../provider/client.js";
-import { effortFor } from "../provider/models.js";
+import { effortFor, servesModality, usableModels } from "../provider/models.js";
+import { splitModelId, wireModelId } from "../provider/registry.js";
+import { subagentMode } from "./subagent.js";
 import { UsageTracker, fmtTokens } from "../usage.js";
 import { loadConfig } from "../config.js";
 import { fmtDuration } from "../ui/layout.js";
-import type { ToolDef } from "../types.js";
+import type { ModelInfo, ToolDef } from "../types.js";
 import type { App } from "../ui/repl.js";
 
 interface Step {
@@ -63,6 +65,60 @@ Rules:
 - Steps with "writes": true run one at a time and last. Do not create two writing steps that touch the same thing.
 - "prompt" is written for an agent that has NOT seen the original request and will not see other steps except those in deps. Spell it out fully.
 - Do not invent files or commands you may not know: if a step needs reconnaissance, make that a separate step.`;
+
+/**
+ * The models a step may run on. Same rule as the task tool: a step agent is
+ * paid for by the key the session is using, so it is this provider's models,
+ * and the shortlist alone when /subagents has one switched on. Without that
+ * list there is nothing to choose between — the session's model runs every
+ * step, exactly as it did before.
+ */
+export function stepModels(app: App): ModelInfo[] {
+  const home = splitModelId(app.session.model).providerId;
+  const runnable = usableModels(app.catalog).filter(
+    (m) => m.chatCapable !== false && servesModality(m, "text") && splitModelId(m.id).providerId === home,
+  );
+  const list = subagentMode(home) === "list" ? loadConfig().subagentModels?.[home] ?? [] : [];
+  const shortlist = runnable.filter((m) => list.includes(m.id));
+  if (!shortlist.length) return runnable.filter((m) => m.id === app.session.model);
+  // The session's model leads and is always on the offer: it is the default
+  // every step without a "model" falls back to.
+  const withDefault = shortlist.some((m) => m.id === app.session.model)
+    ? shortlist
+    : [...runnable.filter((m) => m.id === app.session.model), ...shortlist];
+  // The list rides in the planner's prompt, so it stays as short as the offer.
+  return withDefault.slice(0, 12);
+}
+
+/**
+ * A step's model, resolved against what the planner was offered. A name it
+ * invented — or the bare spelling of one it was given — lands on the default
+ * rather than on a 404.
+ */
+export function resolveStepModel(offered: ModelInfo[], want: string | undefined, dflt: string): string {
+  if (!want) return dflt;
+  const hit = offered.find((m) => m.id === want || wireModelId(m.id) === want);
+  return hit ? hit.id : dflt;
+}
+
+/** What the planner is told about those models — ids, size, price. */
+function modelBlock(models: ModelInfo[], dflt: string): string {
+  const lines = models
+    .map((m) => {
+      const ctx = m.contextWindow ? ` · ctx ${fmtTokens(m.contextWindow)}` : "";
+      const price = m.pricing ? ` · $${m.pricing.input}/$${m.pricing.output} per Mtok` : "";
+      return `- ${m.id}${m.id === dflt ? " (the default)" : ""}${ctx}${price}`;
+    })
+    .join("\n");
+  return `
+
+A step may also carry "model": "<id>", choosing which model carries it out. Available:
+${lines}
+
+- Omit "model" and the step runs on ${dflt}.
+- Match the model to the step: the largest one for reasoning, writing and anything with a judgement call in it; a cheaper one for mechanical work — listing files, grepping, collecting facts, reformatting.
+- Ids exactly as written above. Anything else is ignored and that step runs on ${dflt}.`;
+}
 
 const SYNTH_PROMPT = `You are given the results of several agents that carried out subtasks of one task. Assemble the final answer to the user from them.
 
@@ -128,14 +184,17 @@ function waves(steps: Step[]): Step[][] {
   return out;
 }
 
-function renderPlan(steps: Step[], statuses: Map<string, string>): void {
+function renderPlan(steps: Step[], statuses: Map<string, string>, dflt?: string): void {
   for (const s of steps) {
     const st = statuses.get(s.id) ?? "pending";
     const mark =
       st === "done" ? c.green("✔") : st === "running" ? c.brightYellow("▸") : st === "failed" ? c.red("✖") : c.gray("○");
     const deps = s.deps.length ? c.gray(` ← ${s.deps.join(", ")}`) : "";
     const kind = s.writes ? c.yellow(" [writes]") : "";
-    padded(`  ${mark} ${c.gray(s.id)} ${s.title}${kind}${deps}`);
+    // Only when it is not the model everything else runs on — a column of the
+    // same name on every row says nothing.
+    const on = s.model && s.model !== dflt ? c.gray(` · ${wireModelId(s.model)}`) : "";
+    padded(`  ${mark} ${c.gray(s.id)} ${s.title}${kind}${on}${deps}`);
   }
 }
 
@@ -150,6 +209,11 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
   line();
 
   // ── plan ────────────────────────────────────────────────────────────────
+  // Only worth offering when there is a choice: one model is what happens
+  // anyway, and a list of one in the prompt is tokens spent on nothing.
+  const offered = stepModels(app);
+  const canChoose = offered.length > 1;
+  const planner = canChoose ? PLANNER_PROMPT + modelBlock(offered, app.session.model) : PLANNER_PROMPT;
   const sp = new Spinner("planning the breakdown");
   sp.start();
   let steps: Step[];
@@ -158,7 +222,7 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
     const res = await complete({
       model: app.session.model,
       messages: [
-        { role: "system", content: PLANNER_PROMPT },
+        { role: "system", content: planner },
         { role: "user", content: `Working directory: ${app.cwd}\n\nTask:\n${task}` },
       ],
       temperature: 0.2,
@@ -168,6 +232,9 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
     planUsage.record(app.session.model, res.usage, app.catalog);
     app.usage.absorb(planUsage);
     steps = normalizePlan(extractJson(res.content));
+    // Resolved once, here: the plan on screen has to name the model that will
+    // actually run, not the one the planner wished for.
+    for (const s of steps) s.model = resolveStepModel(canChoose ? offered : [], s.model, app.session.model);
     sp.stop();
   } catch (err) {
     sp.stop();
@@ -179,7 +246,7 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
 
   const statuses = new Map<string, string>();
   padded(c.bold("plan"));
-  renderPlan(steps, statuses);
+  renderPlan(steps, statuses, app.session.model);
   line();
 
   // ── execute ─────────────────────────────────────────────────────────────
@@ -191,20 +258,32 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
     if (ctx.signal.aborted) break;
 
     const runs = wave.map(async (step) => {
-      const model = step.model && app.catalog.some((m) => m.id === step.model) ? step.model : app.session.model;
+      const model = step.model ?? app.session.model;
       const usage = new UsageTracker();
       const tag = c.brightBlue(`  ├ ${step.id}`);
       statuses.set(step.id, "running");
       padded(`${tag} ${c.bold(step.title)} ${c.gray(`· ${model}${step.writes ? "" : " · read-only"}`)}`);
 
-      const context = step.deps
-        .map((d) => results.get(d))
-        .filter((r): r is StepResult => Boolean(r?.ok))
-        .map((r) => `<step-result id="${r.step.id}" title="${r.step.title}">\n${r.text}\n</step-result>`)
+      // A dependency that failed is named, not dropped: silently handing on
+      // an empty context lets the step build on work that never happened.
+      const prior = step.deps.map((d) => results.get(d)).filter((r): r is StepResult => Boolean(r));
+      const context = prior
+        .map((r) =>
+          r.ok
+            ? `<step-result id="${r.step.id}" title="${r.step.title}">\n${r.text}\n</step-result>`
+            : `<step-failed id="${r.step.id}" title="${r.step.title}">${
+                r.text.trim() || "This step produced no result."
+              }</step-failed>`,
+        )
         .join("\n\n");
+      const failedDep = prior.some((r) => !r.ok);
 
       const prompt = context
-        ? `${step.prompt}\n\nWhat other agents already established — build on this, do not re-verify it:\n\n${context}`
+        ? `${step.prompt}\n\nWhat other agents already established — build on this, do not re-verify it.${
+            failedDep
+              ? " A step shown as step-failed produced nothing: whatever it was meant to establish is still open, so do not assume its work was done."
+              : ""
+          }\n\n${context}`
         : step.prompt;
 
       const t0 = Date.now();
@@ -244,7 +323,9 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
         const msg = (err as Error)?.name === "AbortError" ? "interrupted" : (err as Error).message;
         statuses.set(step.id, "failed");
         padded(`${tag} ${c.red("failed")} ${c.dim(msg)}`);
-        results.set(step.id, { step, text: "", ok: false, ms: Date.now() - t0 });
+        // The reason is kept: a step that depends on this one is told what
+        // went wrong, and only `ok` results ever reach the synthesis.
+        results.set(step.id, { step, text: `This step failed: ${msg}`, ok: false, ms: Date.now() - t0 });
       }
     });
 
@@ -254,7 +335,7 @@ export async function runOrchestration(app: App, task: string): Promise<void> {
   const good = [...results.values()].filter((r) => r.ok);
   line();
   padded(c.bold("step results"));
-  renderPlan(steps, statuses);
+  renderPlan(steps, statuses, app.session.model);
   line();
 
   if (!good.length) {

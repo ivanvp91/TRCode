@@ -262,6 +262,49 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // A host with no endpoint that takes pixels — the shape OpenRouter answers
+    // with for a text-only model. It refuses the request outright, so the
+    // client learns the model and resends without the images.
+    if (payload.model === "mock-novision") {
+      const carriesImage = messages.some(
+        (m) => Array.isArray(m.content) && m.content.some((p) => p?.type === "image_url"),
+      );
+      if (carriesImage) {
+        log("REQ model=mock-novision status=404 images\n");
+        res.writeHead(404, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: { message: "No endpoints found that support image input" } }));
+        return;
+      }
+      log("REQ model=mock-novision images=stripped\n");
+    }
+
+    // A model that never gets anywhere: it asks for the same file, with the
+    // same arguments, for as long as anyone keeps answering. What the agent
+    // loop's repeat guard is there to cut short.
+    if (payload.model === "mock-loop") {
+      log(`LOOP model=mock-loop step\n`);
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      sse(res, chunk({ role: "assistant", content: "" }));
+      sse(
+        res,
+        chunk({
+          tool_calls: [
+            {
+              index: 0,
+              id: "call_loop",
+              type: "function",
+              function: { name: "read", arguments: JSON.stringify({ path: "package.json" }) },
+            },
+          ],
+        }),
+      );
+      sse(res, chunk({}, "tool_calls"));
+      sse(res, { ...chunk({}), usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } });
+      res.write("data: [DONE]\n\n");
+      res.end();
+      return;
+    }
+
     const sawToolResult = messages.some((m) => m.role === "tool");
     const stream = payload.stream !== false;
 

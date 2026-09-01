@@ -331,6 +331,55 @@ ok("отсутствующий файл не роняет импорт", creds.i
   creds.clearCredentials("claude");
 }
 
+// ── Meta: ключ Model API, Muse на /responses ──────────────────────────────
+{
+  const def = registry.providerById("meta");
+  ok("Meta есть в реестре", Boolean(def));
+  ok("модельное имя ведёт к тому же поставщику", registry.providerById("muse")?.id === "meta");
+  ok("и второе тоже", registry.providerById("metaai")?.id === "meta");
+  ok("префикс-псевдоним схлопывается", registry.splitModelId("muse:muse-spark-1.2").providerId === "meta");
+  // Подписка у Meta есть, но она привязана к их собственному CLI: «Your
+  // subscription only works through the Muse Code CLI», а любой ключ на том же
+  // аккаунте оплачивается по факту. Тот же случай, что Claude Pro/Max, —
+  // поэтому режим ровно один.
+  ok("подписочного режима нет", def.modes.oauth === undefined);
+  ok("и OAuth-потока тоже", def.oauth === undefined);
+
+  creds.writeCredentials("meta", { mode: "apikey", accessToken: "LLM|123|key" });
+  const auth = await registry.resolveAuth("meta");
+  ok("ключ идёт на api.meta.ai/v1", auth.baseUrl === "https://api.meta.ai/v1", auth.baseUrl);
+  ok("Bearer из ключа", auth.headers.Authorization === "Bearer LLM|123|key", auth.headers.Authorization);
+  ok("x-api-key не отправляется", auth.headers["x-api-key"] === undefined);
+
+  const dialect = (m) => registry.protocolForModel(`meta:${m}`);
+  ok("Muse Spark → /responses", dialect("muse-spark-1.2") === "responses", dialect("muse-spark-1.2"));
+  ok("и контрибьюторская сборка туда же", dialect("muse-spark-1.2-contributor") === "responses");
+  // Картиночный эндпоинт этот клиент не водит: сказать об этом в списке лучше,
+  // чем упасть на первом запросе.
+  ok("muse-image помечен как неведомый", dialect("muse-image-1.0") === "unsupported", dialect("muse-image-1.0"));
+
+  const seeded = registry.seedModels("meta", "apikey");
+  ok(
+    "опубликованный набор моделей",
+    seeded.map((m) => m.id).join() === "meta:muse-spark-1.2,meta:muse-spark-1.2-contributor,meta:muse-spark-1.1",
+    seeded.map((m) => m.id).join(),
+  );
+  ok("окно — 1M на всю линейку", seeded.every((m) => m.contextWindow === 1_048_576));
+  ok("модели помечены как рабочие", seeded.every((m) => m.chatCapable));
+  // Каталог Meta цен не отдаёт, а контрибьюторский SKU дешевле в десять раз —
+  // разница должна быть видна в /cost до выбора модели.
+  ok("цена стандартной сборки проставлена", seeded[0].pricing?.input === 1.25 && seeded[0].pricing?.output === 4.25, JSON.stringify(seeded[0].pricing));
+  ok("кэш-цена тоже", seeded[0].pricing?.cachedInput === 0.15);
+  ok("контрибьюторская дешевле", seeded[1].pricing?.input === 0.1 && seeded[1].pricing?.output === 0.2, JSON.stringify(seeded[1].pricing));
+
+  // Чья это модель — читается из имени, у какого бы хоста её ни взяли.
+  ok("Muse у Meta — Meta", catalogModels.vendorOf({ id: "meta:muse-spark-1.2" }) === "Meta");
+  ok("Muse у шлюза — тоже Meta", catalogModels.vendorOf({ id: "opencode:muse-spark-1.2" }) === "Meta");
+  ok("окно известно и без каталога", catalogModels.knownContextFor("meta:muse-spark-1.1") === 1_048_576);
+
+  creds.clearCredentials("meta");
+}
+
 // ── OpenCode Zen: один хост, три диалекта ─────────────────────────────────
 {
   const def = registry.providerById("opencode");

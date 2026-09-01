@@ -2,7 +2,7 @@
  * The agent loop: stream a completion, execute any tool calls, feed the
  * results back, repeat until the model stops calling tools.
  */
-import { streamChat, ApiError, describeConnectionDrop, isConnectionDrop } from "../provider/client.js";
+import { streamChat, ApiError, describeConnectionDrop, isConnectionDrop, modelStripsImages } from "../provider/client.js";
 import { loadConfig, type Effort } from "../config.js";
 import { trimForRequest } from "../session/trim.js";
 import {
@@ -77,7 +77,7 @@ export interface RunResult {
   /** Messages produced during this run, already appended to options.messages. */
   finalText: string;
   steps: number;
-  stoppedBecause: "stop" | "max_steps" | "aborted" | "length";
+  stoppedBecause: "stop" | "max_steps" | "aborted" | "length" | "looping";
 }
 
 /**
@@ -202,6 +202,57 @@ async function runToolCalls(
   return results;
 }
 
+/**
+ * A model whose host refuses image input still gets the read_image result —
+ * with the pixels dropped one layer down, where nothing above can see it. The
+ * model then reads "the image itself follows above", sees nothing, and calls
+ * again: one real session spent 158 consecutive steps re-reading the same PNG
+ * and put 29 MB of base64 into its history. So it is said here, in the result,
+ * which is where the model actually reads what a call produced.
+ */
+function noteStrippedImages(results: Message[]): void {
+  for (const m of results) {
+    if (!m.images?.length) continue;
+    m.images = undefined;
+    m.content =
+      `${String(m.content ?? "")}\n… [the pixels were NOT sent: this model's host refuses image input. ` +
+      `Calling this tool again will not change that — work from the metadata above, or tell the user to ` +
+      `switch to a vision model.]`;
+  }
+}
+
+/** What identifies a step's tool calls, for spotting one repeated verbatim. */
+function callSignature(calls: ToolCall[]): string {
+  return calls.map((c) => `${c.function.name}(${c.function.arguments ?? ""})`).join("\u0001");
+}
+
+/**
+ * How many times the same call may repeat back to back before the loop stops
+ * running it. Three is still plausible work — polling a build, waiting for a
+ * port to open — so the fourth is where it is refused: by then nothing has
+ * changed between the copies and nothing will.
+ */
+const LOOP_REFUSE_AT = 3;
+/** And where the turn is given up on: the model was told, and kept going. */
+const LOOP_ABORT_AT = 6;
+
+/**
+ * What a repeated call gets instead of being run again. Said in the tool's own
+ * voice, because that is where the model looks for the outcome of a call.
+ */
+function loopBreakResults(calls: ToolCall[], times: number): Message[] {
+  return calls.map((call) => ({
+    role: "tool" as const,
+    tool_call_id: call.id,
+    name: call.function.name,
+    content:
+      `Not run. This is call #${times} of an identical "${call.function.name}" with the same arguments, ` +
+      `back to back with nothing in between — the earlier results are above, and repeating it cannot ` +
+      `produce anything new. Stop calling it: use what you already have, do something different, or ` +
+      `answer the user and say what is blocking you.`,
+  }));
+}
+
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
   const { messages, tools, events } = opts;
   let finalText = "";
@@ -210,6 +261,10 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // host that keeps hanging up should surface, not be retried forever.
   let netRetries = 0;
   const NET_RETRIES = 3;
+  // The last step tool calls, and how many steps in a row have made exactly
+  // the same ones. See loopBreakResults.
+  let lastCallSignature = "";
+  let repeats = 0;
 
   // 0 means no ceiling: the turn runs until the model stops calling tools,
   // the user interrupts it, or the host refuses.
@@ -306,6 +361,10 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
     opts.usage.record(opts.model, usage, opts.catalog, Date.now());
     events?.onUsage?.(opts.model, usage);
+    // The request that just went out is where a host refuses image content, so
+    // this is the first moment the strip is known. Run over the whole history:
+    // it takes the dead base64 out of every later step as well as this one.
+    if (modelStripsImages(opts.model)) noteStrippedImages(messages);
     if (opts.projection) {
       const { cwd, sessionId } = opts.projection;
       appendProjection(cwd, sessionId, {
@@ -336,6 +395,18 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
 
     if (!toolCalls.length) {
       return { finalText, steps: step + 1, stoppedBecause: finishReason === "length" ? "length" : "stop" };
+    }
+
+    // The same calls, made again, with nothing in between: that is a loop, not
+    // progress. Counted across steps of this turn and reset the moment the
+    // model does anything else.
+    const signature = callSignature(toolCalls);
+    repeats = signature === lastCallSignature ? repeats + 1 : 0;
+    lastCallSignature = signature;
+    if (repeats >= LOOP_REFUSE_AT) {
+      messages.push(...loopBreakResults(toolCalls, repeats + 1));
+      if (repeats >= LOOP_ABORT_AT) return { finalText, steps: step + 1, stoppedBecause: "looping" };
+      continue;
     }
 
     // Aborting must not wait for the tools to notice. Most honour the signal,

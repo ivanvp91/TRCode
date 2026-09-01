@@ -50,7 +50,10 @@ const server = http.createServer((req, res) => {
     fs.mkdirSync(path.join(stage, "package", "dist"), { recursive: true });
     fs.writeFileSync(path.join(stage, "package", "package.json"), '{"name":"trcode","version":"9.9.9"}');
     fs.writeFileSync(path.join(stage, "package", "dist", "index.js"), "// new build\n");
-    execSync(`tar -czf "${path.join(HOME, "pkg.tgz")}" -C "${stage}" package`);
+    // The archive name goes in relative, with HOME as the cwd: GNU tar reads a
+    // "C:..." -f argument as host:path and goes looking for a machine called C.
+    // Only -f is parsed that way, so the -C directory can stay absolute.
+    execSync(`tar -czf pkg.tgz -C "${stage}" package`, { cwd: HOME });
     res.writeHead(200);
     res.end(fs.readFileSync(path.join(HOME, "pkg.tgz")));
     return;

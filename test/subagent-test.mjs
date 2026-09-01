@@ -138,6 +138,39 @@ check("nor embeddings", !models.includes("text-embedding-v4"), String(models));
   }).parameters.properties.model.enum) === JSON.stringify(["mock-fast"]), JSON.stringify(loadConfig().subagentModels));
 }
 
+// The two modes: a saved list is used or it is not, and switching between them
+// never costs the list itself — that was a wipe, and re-picking five models to
+// get back was the whole reason the choice had to become explicit.
+{
+  const { saveConfig, loadConfig } = await import("../dist/config.js");
+  const { subagentMode } = await import("../dist/agent/subagent.js");
+  const enumOf = () => makeTaskTool({
+    cwd: process.cwd(), catalog, skills: [], tools: () => [],
+    defaultModel: "mock-fast", effortFor: () => "off", maxSteps: 3, usage: new UsageTracker(),
+  }).parameters.properties.model.enum;
+
+  saveConfig({ subagentModels: { tokenrouter: ["mock-fast", "mock-smart"] } }, { replace: ["subagentModels"] });
+  check("a saved list reads as the list mode", subagentMode("tokenrouter") === "list");
+  check("and it is what gets offered", JSON.stringify(enumOf()) === JSON.stringify(["mock-fast", "mock-smart"]), String(enumOf()));
+
+  saveConfig({ subagentMode: { tokenrouter: "session" } });
+  check("switched to the session's model, only that is offered", JSON.stringify(enumOf()) === JSON.stringify(["mock-fast"]), String(enumOf()));
+  check(
+    "and the list is still in the config, untouched",
+    JSON.stringify(loadConfig().subagentModels.tokenrouter) === JSON.stringify(["mock-fast", "mock-smart"]),
+    JSON.stringify(loadConfig().subagentModels.tokenrouter),
+  );
+
+  saveConfig({ subagentMode: { tokenrouter: "list" } });
+  check("switched back, the same list is offered again", JSON.stringify(enumOf()) === JSON.stringify(["mock-fast", "mock-smart"]), String(enumOf()));
+
+  // A provider with no mode saved behaves the way it did before the choice.
+  saveConfig({ subagentMode: {} }, { replace: ["subagentMode"] });
+  check("no mode saved, a list still means the list", subagentMode("tokenrouter") === "list");
+  saveConfig({ subagentModels: {} }, { replace: ["subagentModels"] });
+  check("no mode and no list means the session's model", subagentMode("tokenrouter") === "session");
+}
+
 // A refusal has to tell the model what to do differently, or it relaunches the
 // same fan-out at the same metered host and gets refused four more times.
 {
@@ -181,6 +214,10 @@ check("nor embeddings", !models.includes("text-embedding-v4"), String(models));
 
 mock.kill();
 await new Promise((r) => setTimeout(r, 200));
-fs.rmSync(HOME, { recursive: true, force: true });
+try {
+  fs.rmSync(HOME, { recursive: true, force: true });
+} catch {
+  /* Windows may hold the directory briefly; the temp dir is disposable */
+}
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

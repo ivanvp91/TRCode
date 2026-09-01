@@ -128,6 +128,17 @@ function isCacheComplaint(err: ApiError): boolean {
  */
 const imageRejected = new Set<string>();
 
+/**
+ * True once the host has refused image content for this model. The stripping
+ * happens a layer down and is invisible from above — which is exactly how a
+ * turn ends up re-reading the same screenshot forever: the tool says the
+ * pixels follow, the model never sees them, so it asks again. The agent loop
+ * reads this and says so in the result instead.
+ */
+export function modelStripsImages(model: string): boolean {
+  return imageRejected.has(model);
+}
+
 function hasImages(messages: Message[]): boolean {
   return messages.some((m) => m.images?.length && !m.meta?.hidden);
 }
@@ -246,14 +257,12 @@ export function repairToolPairs(messages: Message[]): Message[] {
   return out;
 }
 
-function wireMessages(model: string, messages: Message[]): unknown[] {
-  // A model that already refused image blocks gets text only — see postChat.
-  const stripImages = imageRejected.has(model);
+function wireMessages(messages: Message[]): unknown[] {
   return messages
     .filter((m) => !m.meta?.hidden)
     .map((m) => {
       const out: Record<string, unknown> = { role: m.role, content: m.content ?? "" };
-      if (!stripImages && m.images?.length && (m.role === "tool" || m.role === "user")) {
+      if (m.images?.length && (m.role === "tool" || m.role === "user")) {
         out.content = [
           ...(m.content ? [{ type: "text", text: m.content }] : []),
           ...m.images.map((img) => ({ type: "image_url", image_url: { url: `data:${img.mime};base64,${img.data}` } })),
@@ -301,7 +310,7 @@ function buildBody(req: ChatRequest, stream: boolean): Record<string, unknown> {
   const cfg = loadConfig();
   const body: Record<string, unknown> = {
     model: wireModelId(req.model),
-    messages: wireMessages(req.model, req.messages),
+    messages: wireMessages(req.messages),
     stream,
   };
   applyEffort(body, req.model, req.effort);
@@ -574,8 +583,17 @@ function pathFor(p: Protocol): string {
 /** Builds the request body in whichever dialect the model speaks. */
 function buildBodyFor(rawReq: ChatRequest, stream: boolean): Record<string, unknown> {
   // One place for every protocol: whatever is wrong with the pairing, it is
-  // wrong for all three.
-  const req: ChatRequest = { ...rawReq, messages: repairToolPairs(rawReq.messages) };
+  // wrong for all three. The same goes for a model that has already refused
+  // image blocks — the three dialects each build their own content array, so
+  // the pixels have to come off here or two of them would resend them and
+  // earn the same 400 again (see postChat).
+  const paired = repairToolPairs(rawReq.messages);
+  const req: ChatRequest = {
+    ...rawReq,
+    messages: imageRejected.has(rawReq.model)
+      ? paired.map((m) => (m.images?.length ? { ...m, images: undefined } : m))
+      : paired,
+  };
   const cfg = loadConfig();
   const protocol = protocolForModel(req.model);
   if (protocol === "responses") {

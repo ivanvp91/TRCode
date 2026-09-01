@@ -119,7 +119,7 @@ function repeatStub(m: Message): Message {
  */
 function imageStub(m: Message): Message {
   const n = m.images?.length ?? 0;
-  return { ...m, images: undefined, content: `${String(m.content ?? "")}\n… [${n} image(s) attached earlier were dropped to save context; call read_image again if you still need them.]` };
+  return { ...m, images: undefined, content: `${String(m.content ?? "")}\n… [${n} image(s) attached earlier were dropped to save context. Use what you already noted about them; read the file again only if you must see it once more.]` };
 }
 
 function hasImages(m: Message): boolean {
@@ -176,7 +176,11 @@ export function trimForRequest(messages: Message[], opts: TrimOptions): TrimResu
     for (let i = 0; i < cutoff; i++) {
       const m = out[i];
       if (m.role !== "tool") continue;
-      if (String(m.content ?? "").length <= maxResult) continue;
+      const body = String(m.content ?? "");
+      if (body.length <= maxResult) continue;
+      // A stub can still be longer than a very small cap; re-cutting it every
+      // turn gains nothing and fires onTrim on a history that never changes.
+      if (/more characters omitted/.test(body)) continue;
       shorten(i, Math.min(2000, Math.floor(maxResult / 4)));
     }
   }

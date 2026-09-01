@@ -71,11 +71,14 @@ const SUITES = [
   "ratelimit-test.mjs",
   "interrupt-test.mjs",
   "reconnect-test.mjs",
+  "loopguard-test.mjs",
   "toolpairs-test.mjs",
   "memory-test.mjs",
   "subagent-test.mjs",
   "brain-test.mjs",
   "brain-ui-test.mjs",
+  "swarm-test.mjs",
+  "orchestrate-test.mjs",
   "promptmode-test.mjs",
   "shell-output-test.mjs",
   "checkpoint-test.mjs",
@@ -109,6 +112,7 @@ const SUITES = [
   "keyscan-test.mjs",
   "shutdown-test.mjs",
   "update-test.mjs",
+  "favorite-test.mjs",
 ];
 
 /** The suite now in flight, so an interrupt can take it down tree and all. */
@@ -132,6 +136,13 @@ function run(file, env) {
       clearTimeout(reaper);
       running = null;
       resolve({ code, out });
+    });
+    // A spawn that never starts emits 'error' and no 'exit': unhandled, it
+    // throws out of the run; unresolved, the whole run hangs on this suite.
+    child.on("error", (err) => {
+      clearTimeout(reaper);
+      running = null;
+      resolve({ code: 1, out: out + "could not start the suite: " + err.message + "\n" });
     });
   });
 }

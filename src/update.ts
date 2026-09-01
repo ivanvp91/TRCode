@@ -140,11 +140,23 @@ async function download(url: string, dest: string): Promise<void> {
   await fs.promises.writeFile(dest, Buffer.from(await res.arrayBuffer()));
 }
 
+/**
+ * Which tar to run. Windows 10+ ships bsdtar as System32\tar.exe, and that is
+ * the one to name outright: a Git-for-Windows install puts GNU tar earlier on
+ * PATH, and GNU tar reads an archive path of "C:\..." as host:path — it goes
+ * looking for a machine called C and the unpack fails on the user's own disk.
+ */
+function tarBin(): string {
+  if (process.platform !== "win32") return "tar";
+  const sys = path.join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+  return fs.existsSync(sys) ? sys : "tar";
+}
+
 function untar(file: string, dir: string): Promise<void> {
   return new Promise((resolve, reject) => {
     // bsdtar ships with Windows 10+ and every Linux/macOS; args-array spawn,
     // so nothing from the network ever touches a shell.
-    const child = spawn("tar", ["-xzf", file, "-C", dir], { windowsHide: true, stdio: "ignore" });
+    const child = spawn(tarBin(), ["-xzf", file, "-C", dir], { windowsHide: true, stdio: "ignore" });
     child.on("error", reject);
     child.on("exit", (code) =>
       code === 0 ? resolve() : reject(new Error(`tar exited with code ${code}`)),

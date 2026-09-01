@@ -7,7 +7,7 @@ import { contentWidth, fmtAgo } from "./layout.js";
 import { error, expandedBlock, hint, info, line, padded, plural, renderMarkdownBlock, rule, Spinner, success, truncate, warn, wrapText } from "./render.js";
 import { openModal, pick, pickMulti, type ModalAction, type ModalResult, type PickerItem, type PickerTab } from "./picker.js";
 import { choose, type Choice } from "./choice.js";
-import { openModelModal, openModelsModal, pickModelsAcrossProviders } from "./modelpicker.js";
+import { FAVORITE_TAB, editFavorites, favoriteIds, openModelModal, openModelsModal, pickModelsAcrossProviders, toggleFavorite } from "./modelpicker.js";
 import { askSecret } from "./secret.js";
 import { askLine } from "./prompt.js";
 import { scanKeys } from "./keyscan.js";
@@ -67,7 +67,8 @@ import { dropSessionHistory } from "../session/history.js";
 import { fmtTokens, fmtCost, historyTokens, estimateTokens, dayKey } from "../usage.js";
 import type { ModelUsage } from "../usage.js";
 import { buildSystemPrompt } from "../agent/prompt.js";
-import { runSwarm } from "../agent/swarm.js";
+import { configuredRoster, runSwarm, swarmMain, swarmRoster } from "../agent/swarm.js";
+import { subagentMode } from "../agent/subagent.js";
 import { runOrchestration } from "../agent/orchestrator.js";
 import { createSkill } from "../skills/loader.js";
 import { memoryPath, memoryCount } from "../tools/memory.js";
@@ -325,6 +326,7 @@ async function settingsModal(app: App): Promise<void> {
   const skillsOn = cfg.skillsEnabled === true;
   const skillAutoOn = skillsOn && cfg.skillAuto !== false;
   const uilibAutoOn = cfg.uilibAuto !== false;
+  const favAllOn = cfg.favoritesAllProviders !== false;
   const items: PickerItem[] = [
     {
       header: t("Auto-loading", "Автоподстановка"),
@@ -348,6 +350,21 @@ async function settingsModal(app: App): Promise<void> {
       ),
       hint: c.dim(t("injected as <design-reference> · /uilib", "подставляется как <design-reference> · /uilib")),
       badge: uilibAutoOn ? c.brightGreen(t("on", "вкл")) : c.gray(t("off", "выкл")),
+    },
+    { header: t("Favorites", "Избранное"), value: "__hdr-fav", label: "" },
+    {
+      value: "favoritesAllProviders",
+      label: t(
+        "list favorites from every connected provider",
+        "показывать избранное со всех подключённых поставщиков",
+      ),
+      hint: c.dim(
+        t(
+          "off — only what the provider in use serves · /fav edits the list",
+          "выкл — только модели текущего поставщика · список правит /fav",
+        ),
+      ),
+      badge: favAllOn ? c.brightGreen(t("on", "вкл")) : c.gray(t("off", "выкл")),
     },
     { header: t("Status line", "Строка состояния"), value: "__hdr-status", label: "" },
     ...fields.map((f) => ({
@@ -379,6 +396,7 @@ async function settingsModal(app: App): Promise<void> {
     selected: [
       ...(skillAutoOn ? ["skillAuto"] : []),
       ...(uilibAutoOn ? ["uilibAuto"] : []),
+      ...(favAllOn ? ["favoritesAllProviders"] : []),
       ...fields.filter((f) => cfg.statusFields[f.key] !== false).map((f) => `status:${f.key}`),
       ...(updatesOn ? ["updateCheck"] : []),
     ],
@@ -395,13 +413,14 @@ async function settingsModal(app: App): Promise<void> {
     // an ⚡ injection without them would be a body nobody asked to see.
     skillAuto: skillsOn && picked.includes("skillAuto"),
     uilibAuto: picked.includes("uilibAuto"),
+    favoritesAllProviders: picked.includes("favoritesAllProviders"),
   });
   const shown = STATUS_FIELDS.filter((k) => next[k]).length;
   const upd = picked.includes("updateCheck");
   success(
     t(
-      `Saved: skills ${picked.includes("skillAuto") ? "on" : "off"}, UI library ${picked.includes("uilibAuto") ? "on" : "off"}, ${shown} of ${STATUS_FIELDS.length} status fields, update check ${upd ? "on" : "off"}.`,
-      `Сохранено: навыки ${picked.includes("skillAuto") ? "вкл" : "выкл"}, UI-библиотека ${picked.includes("uilibAuto") ? "вкл" : "выкл"}, полей статуса ${shown} из ${STATUS_FIELDS.length}, проверка обновлений ${upd ? "вкл" : "выкл"}.`,
+      `Saved: skills ${picked.includes("skillAuto") ? "on" : "off"}, UI library ${picked.includes("uilibAuto") ? "on" : "off"}, favorites ${picked.includes("favoritesAllProviders") ? "all providers" : "current provider"}, ${shown} of ${STATUS_FIELDS.length} status fields, update check ${upd ? "on" : "off"}.`,
+      `Сохранено: навыки ${picked.includes("skillAuto") ? "вкл" : "выкл"}, UI-библиотека ${picked.includes("uilibAuto") ? "вкл" : "выкл"}, избранное ${picked.includes("favoritesAllProviders") ? "со всех поставщиков" : "только текущий поставщик"}, полей статуса ${shown} из ${STATUS_FIELDS.length}, проверка обновлений ${upd ? "вкл" : "выкл"}.`,
     ),
   );
 }
@@ -460,8 +479,9 @@ async function runUpdate(app: App): Promise<void> {
  * comes straight back, so widening to every provider or re-reading the
  * catalogue never costs a re-typed command.
  */
-async function modelModal(app: App, opts: { all?: boolean } = {}): Promise<void> {
-  let all = opts.all === true;
+async function modelModal(app: App, opts: { only?: boolean } = {}): Promise<void> {
+  // Open on every connected host; `only` narrows to the provider in use.
+  let all = opts.only !== true;
   // The panel opens on the cached catalog and the live one is fetched behind
   // it: a provider that has just published a model shows it without a press
   // of Refresh, and a slow host delays nothing. When the answer lands while
@@ -478,18 +498,19 @@ async function modelModal(app: App, opts: { all?: boolean } = {}): Promise<void>
     const cfg = loadConfig();
     const provider = currentProviderId(app);
     const label = providerById(provider)?.label ?? provider;
-    const mine = providerModels(app, provider);
-    // Scoped to the provider in use: the other providers' models cannot be
-    // served by it, and listing them only invites a 404.
-    const scoped = all || !mine.length ? app.catalog : mine;
 
     const res = await app.exclusiveInput(() =>
       openModelModal({
         // A getter rather than a snapshot, so the background re-read above
-        // reaches rows the panel has already drawn.
+        // reaches rows the panel has already drawn. Every connected host at
+        // once: one lab's models spread over several providers, and a chooser
+        // that hides the others makes picking across hosts a detour through
+        // /provider. The scope button narrows it back.
         get catalog() {
-          const here = providerModels(app, provider);
-          return all || !here.length ? app.catalog : here;
+          return all ? providerModels(app, provider) : app.catalog;
+        },
+        get favoritesCatalog() {
+          return app.catalog;
         },
         onOpen(update) {
           repaint = update;
@@ -498,15 +519,20 @@ async function modelModal(app: App, opts: { all?: boolean } = {}): Promise<void>
         current: app.session.model,
         defaultModel: cfg.model,
         title: t("Model", "Модель"),
-        subtitle: t(
-          `${all ? "Every provider" : label} · ${scoped.length} models · ★ default · ● in use`,
-          `${all ? "Все поставщики" : label} · ${scoped.length} · ★ по умолчанию · ● текущая`,
-        ),
+        // Counted on read, like the rows: a background catalog re-read must
+        // not leave the panel quoting a number from before it landed.
+        get subtitle() {
+          const n = (all ? providerModels(app, provider) : app.catalog).length;
+          return t(
+            `${all ? label : "Every provider"} · ${n} models · ★ default · ● in use`,
+            `${all ? label : "Все поставщики"} · ${n} · ★ по умолчанию · ● текущая`,
+          );
+        },
         actions: [
           { id: "refresh", label: t("Refresh", "Обновить"), hotkey: "r" },
           all
-            ? { id: "scope", label: t(`Only ${label}`, `Только ${label}`), hotkey: "o" }
-            : { id: "scope", label: t("All providers", "Все поставщики"), hotkey: "a" },
+            ? { id: "scope", label: t("All providers", "Все поставщики"), hotkey: "a" }
+            : { id: "scope", label: t(`Only ${label}`, `Только ${label}`), hotkey: "o" },
           { id: "default", label: t("Make default", "По умолчанию"), hotkey: "d" },
           { id: "provider", label: t("Provider…", "Поставщик…"), hotkey: "p" },
         ],
@@ -594,6 +620,23 @@ async function providerModal(app: App): Promise<void> {
 }
 
 
+/**
+ * The favorite editor: checkbox lists on the provider tabs, preselected with
+ * the current stars. Space flips rows while scrolling, Enter saves the whole
+ * set in one write; Esc cancels without touching anything. Clearing all is a
+ * separate button inside the panel — not an accidental Enter.
+ */
+async function favModal(app: App): Promise<void> {
+  const picked = await app.exclusiveInput(() =>
+    editFavorites({ catalog: app.catalog, current: app.session.model, defaultModel: loadConfig().model }),
+  );
+  if (picked === null) return;
+  saveConfig({ favoriteModels: picked }, { replace: ["favoriteModels"] });
+  app.cfg = loadConfig();
+  if (!picked.length) return void success(t("Favorites cleared.", "Избранное очищено."));
+  success(t(`Favorites: ${picked.length}`, `В избранном: ${count(picked.length, ["model", "models"], ["модель", "модели", "моделей"])}`));
+}
+
 // ── /brain ────────────────────────────────────────────────────────────────
 
 /** The panel as it stands, minus anything this client can no longer reach. */
@@ -673,6 +716,12 @@ async function brainModal(app: App): Promise<void> {
     const tabs: PickerTab[] = [
       { key: "panel", label: t("Active models", "Активные модели"), count: configured.length },
     ];
+    // The favorite tab before the catalogue: the same list, cut down to the
+    // models a person has already singled out.
+    const favs = favoriteIds(app.catalog, app.session.model);
+    if (favs.length) {
+      tabs.push({ key: FAVORITE_TAB, label: t("Favorites", "Избранное"), count: favs.length });
+    }
     // The catalogue tab: the same place a model is added is where one is
     // excluded, so the panel never has to be rebuilt to drop a member.
     const text = usableModels(app.catalog).filter((m) => servesModality(m, "text"));
@@ -691,6 +740,7 @@ async function brainModal(app: App): Promise<void> {
         initialTab: "panel",
         search: false,
         empty: t("No panel yet — choose the models first.", "Совета пока нет — сначала выберите модели."),
+        groupGap: [FAVORITE_TAB, "all"],
         actions: [
           { id: "ask", label: t("Ask…", "Спросить…"), hotkey: "a", disabled: reachable.length < 2 },
           { id: "main", label: t("Make main", "Сделать главной"), hotkey: "m" },
@@ -704,14 +754,16 @@ async function brainModal(app: App): Promise<void> {
           },
         ],
         items: (tabKey) =>
-          tabKey === "all"
-            ? modelsAsRows(app.catalog)
-            : items,
+          tabKey === FAVORITE_TAB
+            ? modelsAsRows(favs.map((id) => app.catalog.find((m) => m.id === id)!).filter(Boolean))
+            : tabKey === "all"
+              ? modelsAsRows(app.catalog)
+              : items,
       }),
     );
     if (!res) return;
 
-    if (res.kind === "action") {
+    if (res.kind === "action" && res.id !== "ask") {
       if (res.id === "models") {
         await brainPanelModal(app);
         continue;
@@ -731,9 +783,9 @@ async function brainModal(app: App): Promise<void> {
       continue;
     }
 
-    // A row answered from the catalogue tab toggles membership; from the panel
-    // tab, Enter asks. Which tab answered comes back with the result.
-    if (res.tab === "all") {
+    // A row answered from the catalogue or favorite tab toggles membership; from
+    // the panel tab, Enter asks. Which tab answered comes back with the result.
+    if (res.kind === "item" && (res.tab === "all" || res.tab === FAVORITE_TAB)) {
       const next = configured.includes(res.value)
         ? configured.filter((m) => m !== res.value)
         : [...configured, res.value];
@@ -805,6 +857,203 @@ function modelsAsRows(catalog: ModelInfo[]): PickerItem[] {
   return rows;
 }
 
+// ── /swarm ────────────────────────────────────────────────────────────────
+
+/** The roster as it would run right now: the chosen one, else the automatic pick. */
+function swarmNow(app: App): string[] {
+  return swarmRoster(app.catalog, app.session.model, 3);
+}
+
+/** Who runs in the swarm — one multi-select spanning every connected host. */
+async function swarmPanelModal(app: App): Promise<void> {
+  const cfg = loadConfig();
+  const picked = await app.exclusiveInput(() =>
+    pickModelsAcrossProviders({
+      catalog: app.catalog,
+      current: app.session.model,
+      defaultModel: app.session.model,
+      selected: cfg.swarmModels,
+      allowEmpty: true,
+      title: t("Roster for /swarm", "Рой для /swarm"),
+      subtitle: t(
+        "Space marks a model, ←→ switches provider, Enter confirms. Nothing marked — the roster is picked for you.",
+        "Пробел отмечает модель, ←→ переключает поставщика, Enter подтверждает. Ничего не отмечено — рой подбирается сам.",
+      ),
+    }),
+  );
+  if (picked === null) return;
+  // A synthesiser dropped from the roster cannot merge answers it never saw.
+  saveConfig(
+    { swarmModels: picked, swarmMainModel: picked.includes(cfg.swarmMainModel) ? cfg.swarmMainModel : "" },
+    { replace: ["swarmModels"] },
+  );
+  app.cfg = loadConfig();
+  if (!picked.length) {
+    return void success(
+      t("Roster cleared — /swarm picks its own models again.", "Список очищен — /swarm снова подбирает модели сам."),
+    );
+  }
+  success(t(`Swarm: ${picked.map(wireModelId).join(", ")}`, `Рой: ${picked.map(wireModelId).join(", ")}`));
+}
+
+/** Saves the synthesiser when it sits on the roster; says so either way. */
+function setSwarmMain(app: App, model: string | null): void {
+  if (!model) return hint(t("Put the cursor on a model first.", "Сначала поставьте курсор на модель."));
+  if (!swarmNow(app).includes(model)) {
+    return warn(
+      t(
+        `${wireModelId(model)} is not on the roster — add it before making it the synthesiser.`,
+        `${wireModelId(model)} нет в рое — сначала добавьте её.`,
+      ),
+    );
+  }
+  saveConfig({ swarmMainModel: model });
+  app.cfg = loadConfig();
+  success(t(`Synthesis: ${wireModelId(model)}`, `Сведение: ${wireModelId(model)}`));
+}
+
+/** Asks for the task, then runs the roster the panel was showing. */
+async function askSwarm(app: App, roster: string[]): Promise<void> {
+  if (roster.length < 2) {
+    error(
+      t(
+        "A swarm needs at least two models this client can reach.",
+        "Рою нужны хотя бы две модели, доступные этому клиенту.",
+      ),
+    );
+    return void hint(t("Choose them with /swarm models", "Выбрать: /swarm models"));
+  }
+  const task = await app.exclusiveInput(() => askLine(t("The task:", "Задача:"), ""));
+  if (!task) return;
+  await runSwarm(app, task, roster);
+}
+
+/**
+ * The roster as it stands, and the task to throw at it. Same shape as /brain:
+ * the chosen models on the first tab, the stars and the catalogue behind it,
+ * and Enter on a row there adds or removes it without a second panel.
+ */
+async function swarmModal(app: App): Promise<void> {
+  for (;;) {
+    const cfg = loadConfig();
+    const configured = cfg.swarmModels;
+    const roster = swarmNow(app);
+    // Nothing chosen — or nothing left of it — means the rows on the first tab
+    // are the automatic pick rather than a saved list, and they say so.
+    const auto = !configuredRoster(app.catalog).length;
+    const synth = swarmMain(app.session.model, roster);
+    const shown = configured.length ? configured : roster;
+    // The name is padded before the mark is glued on, so the provider column
+    // stays put: a coloured ★ is a dozen invisible characters wide.
+    const width = Math.min(34, Math.max(...shown.map((id) => wireModelId(id).length), 0) + 2);
+    const items: PickerItem[] = shown.map((id) => {
+      const okHere = app.catalog.some((m) => m.id === id);
+      const mark = id === synth ? c.brightGreen("★ ") : "  ";
+      return {
+        value: id,
+        label: mark + wireModelId(id).padEnd(width),
+        hint: okHere
+          ? c.dim(providerLabel(splitModelId(id).providerId)) +
+            (id === synth ? c.brightGreen(t("  · synthesis", "  · сведение")) : "")
+          : c.red(t("✗ not reachable from here", "✗ отсюда недоступна")),
+        badge: auto ? c.gray(t("auto", "авто")) : "",
+      };
+    });
+
+    const tabs: PickerTab[] = [
+      { key: "roster", label: t("Roster", "Рой"), count: shown.length },
+    ];
+    const favs = favoriteIds(app.catalog, app.session.model);
+    if (favs.length) tabs.push({ key: FAVORITE_TAB, label: t("Favorites", "Избранное"), count: favs.length });
+    const text = usableModels(app.catalog).filter((m) => servesModality(m, "text"));
+    if (text.length) tabs.push({ key: "all", label: t("All models", "Все модели"), count: text.length });
+
+    const res = await app.exclusiveInput(() =>
+      openModal({
+        title: t("Swarm", "Рой"),
+        subtitle: auto
+          ? t(
+              "Picked automatically — the session's model plus a different vendor each. Enter on a row in All models pins a roster.",
+              "Подобран автоматически — модель сессии плюс по одной от других вендоров. Enter по строке во «Всех моделях» закрепит состав.",
+            )
+          : t(
+              "★ merges the answers. Enter on a row in All models adds or removes it.",
+              "★ сводит ответы. Enter по строке во «Всех моделях» добавляет или убирает её.",
+            ),
+        tabs,
+        initialTab: "roster",
+        search: false,
+        empty: t("No models to run — connect a provider first.", "Моделей нет — сначала подключите поставщика."),
+        groupGap: [FAVORITE_TAB, "all"],
+        actions: [
+          { id: "run", label: t("Run…", "Запустить…"), hotkey: "r", disabled: roster.length < 2 },
+          { id: "main", label: t("Make synthesiser", "Сделать сводящей"), hotkey: "m" },
+          { id: "models", label: t("Choose models…", "Выбрать модели…"), hotkey: "c" },
+          {
+            id: "clear",
+            label: t("Clear", "Очистить"),
+            hotkey: "x",
+            tone: "danger",
+            disabled: !configured.length,
+          },
+        ],
+        items: (tabKey) =>
+          tabKey === FAVORITE_TAB
+            ? modelsAsRows(favs.map((id) => app.catalog.find((m) => m.id === id)!).filter(Boolean))
+            : tabKey === "all"
+              ? modelsAsRows(app.catalog)
+              : items,
+      }),
+    );
+    if (!res) return;
+
+    if (res.kind === "action" && res.id !== "run") {
+      if (res.id === "models") {
+        await swarmPanelModal(app);
+        continue;
+      }
+      if (res.id === "main") {
+        // The button carries the row under the cursor; with nothing under it
+        // (a header, an empty list) the current choice stands.
+        setSwarmMain(app, res.value ?? cfg.swarmMainModel);
+        continue;
+      }
+      if (res.id === "clear") {
+        saveConfig({ swarmModels: [], swarmMainModel: "" }, { replace: ["swarmModels"] });
+        app.cfg = loadConfig();
+        success(t("Roster cleared — /swarm picks its own models again.", "Список очищен — /swarm снова подбирает модели сам."));
+        continue;
+      }
+      continue;
+    }
+
+    // A row answered from the catalogue or the favorites tab pins or unpins a
+    // member; from the roster tab, Enter runs. The tab comes back with it.
+    if (res.kind === "item" && (res.tab === "all" || res.tab === FAVORITE_TAB)) {
+      // The first pin freezes what was on screen: dropping the automatic pick
+      // for one hand-chosen model would leave a swarm of one.
+      const base = configured.length ? configured : roster;
+      const next = base.includes(res.value) ? base.filter((m) => m !== res.value) : [...base, res.value];
+      saveConfig(
+        { swarmModels: next, swarmMainModel: cfg.swarmMainModel === res.value ? "" : cfg.swarmMainModel },
+        { replace: ["swarmModels"] },
+      );
+      app.cfg = loadConfig();
+      success(
+        next.includes(res.value)
+          ? t(`Added: ${wireModelId(res.value)}`, `Добавлена: ${wireModelId(res.value)}`)
+          : t(`Removed: ${wireModelId(res.value)}`, `Убрана: ${wireModelId(res.value)}`),
+      );
+      continue;
+    }
+
+    // "Run", and Enter on a roster row, are the same thing: the swarm runs as a
+    // swarm, so which row the cursor was on never mattered.
+    await askSwarm(app, swarmNow(app));
+    return;
+  }
+}
+
 // ── /subagents ────────────────────────────────────────────────────────────
 
 /** Only what this key can actually launch a subagent on — the tool's own rule. */
@@ -842,7 +1091,11 @@ function addSubagentModel(app: App, named: string): void {
     );
   }
   const current = loadConfig().subagentModels?.[provider] ?? [];
-  saveConfig({ subagentModels: { [provider]: [...new Set([...current, added])] } });
+  // Adding a model to the list is asking for the list to be used.
+  saveConfig({
+    subagentModels: { [provider]: [...new Set([...current, added])] },
+    subagentMode: { [provider]: "list" },
+  });
   app.cfg = loadConfig();
   app.rebuildTools();
   success(
@@ -853,17 +1106,56 @@ function addSubagentModel(app: App, named: string): void {
   );
 }
 
-function resetSubagentModels(app: App): void {
+/**
+ * Switches between the two ways subagents get a model. The chosen list is left
+ * in the config either way — "the session's model" is a mode, not a wipe, so
+ * coming back to a list of five costs one keystroke instead of five choices.
+ */
+function setSubagentMode(app: App, mode: "session" | "list"): void {
   const provider = currentProviderId(app);
-  const next = { ...loadConfig().subagentModels };
-  delete next[provider];
-  saveConfig({ subagentModels: next }, { replace: ["subagentModels"] });
+  const list = loadConfig().subagentModels?.[provider] ?? [];
+  if (mode === "list" && !list.length) {
+    warn(
+      t(
+        `${providerLabel(provider)} has no list yet — mark the models first.`,
+        `У ${providerLabel(provider)} ещё нет списка — сначала отметьте модели.`,
+      ),
+    );
+    return void hint(t("Space marks a model, Enter saves.", "Пробел отмечает модель, Enter сохраняет."));
+  }
+  saveConfig({ subagentMode: { [provider]: mode } });
+  app.cfg = loadConfig();
+  app.rebuildTools();
+  if (mode === "session") {
+    return void success(
+      t(
+        `${providerLabel(provider)}: subagents run on the session's model${list.length ? ` — the list of ${list.length} is kept, unused` : ""}.`,
+        `${providerLabel(provider)}: субагенты работают на модели сессии${list.length ? ` — список из ${list.length} сохранён, но не используется` : ""}.`,
+      ),
+    );
+  }
+  success(
+    t(
+      `Subagents on ${providerLabel(provider)}: ${list.map(wireModelId).join(", ")}`,
+      `Субагенты у ${providerLabel(provider)}: ${list.map(wireModelId).join(", ")}`,
+    ),
+  );
+}
+
+/** Forgets the list for this provider, and with it the choice of using one. */
+function clearSubagentModels(app: App): void {
+  const provider = currentProviderId(app);
+  const models = { ...loadConfig().subagentModels };
+  const modes = { ...loadConfig().subagentMode };
+  delete models[provider];
+  delete modes[provider];
+  saveConfig({ subagentModels: models, subagentMode: modes }, { replace: ["subagentModels", "subagentMode"] });
   app.cfg = loadConfig();
   app.rebuildTools();
   success(
     t(
-      `${providerLabel(provider)}: subagents run on the session's model only.`,
-      `${providerLabel(provider)}: субагенты работают только на модели сессии.`,
+      `${providerLabel(provider)}: the list is gone — subagents run on the session's model.`,
+      `${providerLabel(provider)}: список удалён — субагенты работают на модели сессии.`,
     ),
   );
 }
@@ -874,9 +1166,17 @@ async function subagentsModal(app: App): Promise<void> {
     const pool = subagentPool(app, provider);
     if (!pool.length) return noSubagentModels(provider);
     const current = loadConfig().subagentModels?.[provider] ?? [];
+    // Two ways to get a model, and the panel says which one is in force: the
+    // marks stay on screen in either, so the list is never lost to a mode.
+    const mode = subagentMode(provider);
+    const onSession = t("the session's model", "модель сессии");
+    const onList = t(`the ${current.length} marked below`, `${current.length} отмеченных ниже`);
 
     const res = await app.exclusiveInput(() =>
       openModelsModal({
+        // No favoritesCatalog here: a subagent runs on the key the session is
+        // using, so the task tool only ever offers this provider's models — a
+        // star from another host would be marked and then silently dropped.
         catalog: pool,
         current: app.session.model,
         defaultModel: app.session.model,
@@ -884,19 +1184,39 @@ async function subagentsModal(app: App): Promise<void> {
         allowEmpty: true,
         title: t("Models for subagents", "Модели для субагентов"),
         subtitle: t(
-          `${providerLabel(provider)} · Space marks a model, Enter confirms. Nothing marked — the session's model only.`,
-          `${providerLabel(provider)} · Пробел отмечает модель, Enter подтверждает. Ничего не отмечено — только модель сессии.`,
+          `${providerLabel(provider)} · subagents run on ${mode === "list" ? onList : onSession}${
+            mode === "session" && current.length ? ` · a list of ${current.length} is kept, unused` : ""
+          } · Space marks a model, Enter saves and uses the list.`,
+          `${providerLabel(provider)} · субагенты работают на: ${mode === "list" ? onList : onSession}${
+            mode === "session" && current.length ? ` · список из ${current.length} сохранён, но не используется` : ""
+          } · Пробел отмечает модель, Enter сохраняет и включает список.`,
         ),
         actions: [
-          { id: "auto", label: t("Session model only", "Только модель сессии"), hotkey: "a" },
+          mode === "list"
+            ? { id: "session", label: t("Use the session's model", "Только модель сессии"), hotkey: "a" }
+            : {
+                id: "list",
+                label: t("Use the marked list", "Использовать список"),
+                hotkey: "a",
+                disabled: !current.length,
+              },
           { id: "refresh", label: t("Refresh", "Обновить"), hotkey: "r" },
+          {
+            id: "clear",
+            label: t("Forget the list", "Удалить список"),
+            hotkey: "x",
+            tone: "danger",
+            disabled: !current.length,
+          },
         ],
       }),
     );
     if (!res) return;
 
     if (res.kind === "action") {
-      if (res.id === "auto") return resetSubagentModels(app);
+      if (res.id === "session") return setSubagentMode(app, "session");
+      if (res.id === "list") return setSubagentMode(app, "list");
+      if (res.id === "clear") return clearSubagentModels(app);
       if (res.id === "refresh") {
         await refreshCatalog(app);
         continue;
@@ -904,7 +1224,11 @@ async function subagentsModal(app: App): Promise<void> {
       continue;
     }
 
-    saveConfig({ subagentModels: { [provider]: res.values } });
+    // Marking models is choosing to use them; marking none is the other mode.
+    saveConfig({
+      subagentModels: { [provider]: res.values },
+      subagentMode: { [provider]: res.values.length ? "list" : "session" },
+    });
     app.cfg = loadConfig();
     app.rebuildTools();
     if (!res.values.length) {
@@ -2152,9 +2476,9 @@ async function chooseWriter(app: App, named: string): Promise<void> {
   let all = false;
   for (;;) {
     const mine = providerModels(app, provider);
-    // Scoped to the provider in use by default: its key cannot call the other
-    // hosts' models, and listing them only invites a 404. The scope button is
-    // there for the times the catalogue for this host came up empty.
+    // The writer has to be one this provider's key can call, so the list is
+    // its models first — and widens to every host when the host's own
+    // catalogue came up empty, or by the scope button.
     const scoped = all || !mine.length ? app.catalog : mine;
     const pool = scoped.filter((m) => m.chatCapable !== false && servesModality(m, "text"));
     const label = providerById(provider)?.label ?? provider;
@@ -2169,6 +2493,9 @@ async function chooseWriter(app: App, named: string): Promise<void> {
     const res = await app.exclusiveInput(() =>
       openModelModal({
         catalog: pool,
+        // The writer is pinned per provider but called on its own key, so a
+        // star from another host is a working choice — the tab shows them all.
+        favoritesCatalog: app.catalog.filter((m) => m.chatCapable !== false && servesModality(m, "text")),
         current,
         defaultModel: app.session.model,
         title: t("Prompt model", "Модель промптов"),
@@ -2498,11 +2825,11 @@ const COMMANDS: Command[] = [
   {
     name: "/model",
     group: "main",
-    args: () => t("[name|alias|all|refresh]", "[имя|алиас|all|refresh]"),
+    args: () => t("[name|alias|only|refresh]", "[имя|алиас|only|refresh]"),
     help: () =>
       t(
-        "switch model — this provider's, `all` for every one, `refresh` to re-read the catalog",
-        "сменить модель — текущего поставщика, `all` для всех, `refresh` перечитать каталог",
+        "switch model — every connected provider at once, `only` narrows to this one, `refresh` re-reads the catalog",
+        "сменить модель — все подключённые поставщики сразу, `only` сузить до текущего, `refresh` перечитать каталог",
       ),
     async run(app, rest) {
       const arg = rest.trim();
@@ -2512,7 +2839,7 @@ const COMMANDS: Command[] = [
         await refreshCatalog(app);
         return void hint(t("Pick one with /model.", "Выбрать: /model."));
       }
-      if (arg && !/^all$/i.test(arg)) {
+      if (arg && !/^only$/i.test(arg)) {
         // A name is searched across every provider: naming one is an explicit
         // enough request to cross over.
         const id = resolveModelId(arg, app.catalog);
@@ -2522,7 +2849,28 @@ const COMMANDS: Command[] = [
         warnIfIncompatible(app, id);
         return;
       }
-      await modelModal(app, { all: /^all$/i.test(arg) });
+      await modelModal(app, { only: /^only$/i.test(arg) });
+    },
+  },
+  {
+    name: "/fav",
+    group: "main",
+    args: () => t("[name|alias]", "[имя|алиас]"),
+    help: () =>
+      t(
+        "edit favorite models — checkboxes on the provider tabs, the starred ones lead every model picker",
+        "редактировать избранное — чекбоксы на табах поставщиков, отмеченные ведут каждый список моделей",
+      ),
+    async run(app, rest) {
+      const arg = rest.trim();
+      if (arg) {
+        const id = resolveModelId(arg, app.catalog);
+        const on = toggleFavorite(id);
+        return void (on
+          ? success(t(`Favorite: ${c.brightMagenta(wireModelId(id))}`, `В избранном: ${c.brightMagenta(wireModelId(id))}`))
+          : hint(t(`Removed from favorites: ${wireModelId(id)}`, `Убрана из избранного: ${wireModelId(id)}`)));
+      }
+      await favModal(app);
     },
   },
   {
@@ -2778,12 +3126,13 @@ const COMMANDS: Command[] = [
   {
     name: "/swarm",
     group: "main",
-    args: () => t("<task>", "<задача>"),
+    args: () => t("<task> | models", "<задача> | models"),
     help: () => t("swarm: several models solve it in parallel, then a synthesis pass", "рой: несколько моделей решают параллельно, затем сведение"),
     async run(app, rest) {
-      const task = rest.trim();
-      if (!task) return warn(t("Name the task: /swarm <what to solve>", "Назовите задачу: /swarm <что решить>"));
-      await runSwarm(app, task);
+      const arg = rest.trim();
+      if (/^models?$/i.test(arg)) return void (await swarmPanelModal(app));
+      if (arg) return void (await runSwarm(app, arg));
+      await swarmModal(app);
     },
   },
   {
@@ -2912,11 +3261,11 @@ const COMMANDS: Command[] = [
   {
     name: "/subagents",
     group: "settings",
-    args: () => t("[model [id]] | auto", "[model [id]] | auto"),
+    args: () => t("[model [id]] | session | list", "[model [id]] | session | list"),
     help: () =>
       t(
-        "which models subagents may run on: `model [id]` adds one, `auto` resets to the session's model",
-        "какие модели доступны субагентам: `model [id]` добавляет одну, `auto` сбрасывает на модель сессии",
+        "which models subagents may run on: the session's model, or a list — `model [id]` adds one",
+        "на каких моделях работают субагенты: модель сессии или список — `model [id]` добавляет одну",
       ),
     async run(app, rest) {
       const arg = rest.trim();
@@ -2926,7 +3275,10 @@ const COMMANDS: Command[] = [
       if (/^models?\s+\S/i.test(arg)) {
         return void addSubagentModel(app, arg.replace(/^models?\s+/i, "").trim());
       }
-      if (/^(auto|reset|any|all)$/i.test(arg)) return void resetSubagentModels(app);
+      // "auto" is what this used to be called, when the only way back to the
+      // session's model was to throw the list away.
+      if (/^(session|auto|reset|any|all)$/i.test(arg)) return void setSubagentMode(app, "session");
+      if (/^lists?$/i.test(arg)) return void setSubagentMode(app, "list");
       await subagentsModal(app);
     },
   },

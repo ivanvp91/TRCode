@@ -225,6 +225,41 @@ const GO_PRICES: Record<string, ModelPricing> = {
   hy3: { input: 0.14, output: 0.58, cachedInput: 0.035 },
 };
 
+/**
+ * Meta's Model API serves the Muse line and one image model under a single
+ * base URL. Muse Spark is the agentic one and goes on /responses; muse-image
+ * is Meta's own image endpoint, which this client does not drive — saying so
+ * keeps it out of the picker with a reason rather than letting it be chosen
+ * and fail on the first request.
+ */
+const META_ENDPOINTS = [
+  { match: /^muse-image/, endpoint: "image-generation" },
+  { match: /^muse-spark/, endpoint: "openai-response" },
+];
+
+/**
+ * The published roster: the cold start, and the fallback when the listing
+ * fails. Every Muse Spark ships the same 1M window, and Meta charges no
+ * long-context premium on it.
+ */
+const MUSE_MODELS: SeedModel[] = [
+  { id: "muse-spark-1.2", label: "Muse Spark 1.2", contextWindow: 1_048_576 },
+  { id: "muse-spark-1.2-contributor", label: "Muse Spark 1.2 Contributor", contextWindow: 1_048_576 },
+  { id: "muse-spark-1.1", label: "Muse Spark 1.1", contextWindow: 1_048_576 },
+];
+
+/**
+ * What Meta publishes per 1M tokens (developer.meta.com/ai, 2026-09-01). Its
+ * listing carries no prices, and the contributor SKU is a tenth of the standard
+ * one because prompts and completions sent to it may be used to improve Meta
+ * products — a difference worth seeing in /cost before the model is chosen.
+ */
+const META_PRICES: Record<string, ModelPricing> = {
+  "muse-spark-1.2": { input: 1.25, output: 4.25, cachedInput: 0.15 },
+  "muse-spark-1.1": { input: 1.25, output: 4.25, cachedInput: 0.15 },
+  "muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cachedInput: 0.002 },
+};
+
 const PROVIDERS: ProviderDef[] = [
   {
     id: DEFAULT_PROVIDER,
@@ -292,6 +327,36 @@ const PROVIDERS: ProviderDef[] = [
         // The beta that unlocks hour-long cache entries. An agent turn outlives
         // the five-minute default many times over; see anthropic.ts.
         headers: { "anthropic-version": "2023-06-01", "anthropic-beta": "extended-cache-ttl-2025-04-11" },
+      },
+    },
+  },
+  {
+    id: "meta",
+    // The models are Muse, the account and the bill are Meta's; people arrive
+    // at the name from either side, and both are this one key.
+    aka: ["muse", "musespark", "muse-spark", "metaai", "modelapi"],
+    label: "Meta",
+    keyHint: "Meta Model API key (dev.meta.ai → API keys, LLM|…)",
+    modes: {
+      // Key only, and deliberately. Meta does sell subscriptions now
+      // (Everyday / High / Power Usage, counted in requests per 5 hours), but
+      // scopes them to its own client: "Your subscription only works through
+      // the Muse Code CLI while signed in with your Meta Model API account",
+      // and everything else on the account is billed pay-as-you-go. Which is
+      // the Claude Pro/Max case again — a plan its vendor does not sell to
+      // third-party clients is not one this client should reach for.
+      apikey: {
+        baseUrl: "https://api.meta.ai/v1",
+        // The host serves all three dialects. /responses is the one Meta
+        // documents for agent work — reasoning carries across turns there —
+        // and it is where Zen and Go already route the same models.
+        protocol: "responses",
+        endpoints: META_ENDPOINTS,
+        prices: META_PRICES,
+        // GET /v1/models is documented and key-gated, so the listing is both
+        // the catalog and the proof that a key is good.
+        listModels: true,
+        seed: MUSE_MODELS,
       },
     },
   },

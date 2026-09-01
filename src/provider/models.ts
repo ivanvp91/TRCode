@@ -93,6 +93,8 @@ const CONTEXT_RULES: ContextRule[] = [
   { match: /^gpt-4/, window: 128_000 },
   { match: /^gpt-oss/, window: 131_072 },
   { match: /^gemini-(2\.5|[3-9])/, window: 1_048_576 },
+  // Muse Spark is 1M across the line, contributor SKU included.
+  { match: /^muse-spark/, window: 1_048_576 },
   { match: /^gemma/, window: 131_072 },
   { match: /^grok-.*fast/, window: 2_000_000 },
   { match: /^grok/, from: 4.5, window: 500_000 },
@@ -205,7 +207,7 @@ const NAME_VENDOR: [RegExp, string][] = [
   [/^(seed|seedream|seedance|doubao)/, "ByteDance"],
   [/^kling/, "Kling"],
   [/^(mistral|devstral|codestral|voxtral|magistral|ministral)/, "Mistral"],
-  [/^llama/, "Meta"],
+  [/^(llama|muse)/, "Meta"],
   [/^step-/, "StepFun"],
   [/^mimo/, "Xiaomi"],
   [/^nemotron/, "NVIDIA"],
@@ -388,7 +390,7 @@ function modalitiesOf(endpoints: string[], tags: string, outputs: string[]): Non
     else if (e.startsWith("audio")) note("audio");
     else note("text");
   }
-  for (const t of tags.split(/[,s]+/)) note(t);
+  for (const t of tags.split(/[,\s]+/)) note(t);
   for (const o of outputs) note(o);
   return [...found];
 }

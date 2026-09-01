@@ -1646,6 +1646,14 @@ export class App {
     if (stopped === "max_steps") {
       warn(tr(`Hit the ${this.cfg.maxSteps}-step limit — say "continue" to resume, or set "maxSteps": 0 to remove it.`, `Достигнут предел в ${this.cfg.maxSteps} шагов — скажите «продолжай», или уберите ограничение: "maxSteps": 0.`));
     }
+    if (stopped === "looping") {
+      warn(
+        tr(
+          "Stopped: the model kept repeating the same tool call and was getting nowhere. If it was reading an image, the model may have no vision — try another one.",
+          "Остановлено: модель повторяла один и тот же вызов инструмента и не продвигалась. Если это было чтение картинки, у модели может не быть vision — попробуйте другую.",
+        ),
+      );
+    }
     if (stopped === "length") warn(tr("The answer was cut off by the model's token limit.", "Ответ обрезан лимитом токенов модели."));
   }
 

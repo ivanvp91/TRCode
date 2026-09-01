@@ -48,6 +48,19 @@ export interface SubagentDeps {
 
 let counter = 0;
 
+/**
+ * Which models subagents may run on for this provider. The saved list is kept
+ * either way: switching back to it costs a keystroke rather than re-picking
+ * every model. An unset mode is read from the list, so configs written before
+ * the choice existed behave exactly as they did.
+ */
+export function subagentMode(providerId: string): "session" | "list" {
+  const cfg = loadConfig();
+  const saved = cfg.subagentMode?.[providerId];
+  if (saved === "session" || saved === "list") return saved;
+  return (cfg.subagentModels?.[providerId] ?? []).length ? "list" : "session";
+}
+
 export function makeTaskTool(deps: SubagentDeps): ToolDef {
   const home = splitModelId(deps.defaultModel).providerId;
   // What cannot serve a chat turn has no business in the offer, and a subagent
@@ -58,22 +71,25 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
       (m.modality ?? "text") === "text" &&
       splitModelId(m.id).providerId === home,
   );
-  // A shortlist, when one was chosen: /subagents narrows the offer to the
-  // models you are willing to run several of at once. Anything on the list
-  // that this provider no longer serves is dropped rather than offered.
-  const pool = loadConfig().subagentModels?.[home] ?? [];
-  const shortlist = pool.length ? runnable.filter((m) => pool.includes(m.id)) : runnable;
+  // A shortlist, when one was chosen and switched on: /subagents narrows the
+  // offer to the models you are willing to run several of at once. Anything on
+  // the list that this provider no longer serves is dropped rather than
+  // offered, and in "session" mode the list is kept but not used.
+  const pool = subagentMode(home) === "list" ? loadConfig().subagentModels?.[home] ?? [] : [];
+  const shortlist = pool.length ? runnable.filter((m) => pool.includes(m.id)) : [];
   // The allowlist: a chosen shortlist, else only the session's own model. Left
   // open, the offer's "use a cheap one for mechanical work" sent real
   // reconnaissance to the cheapest id in a reseller's catalogue — hundreds of
   // requests and megabytes of input on a model nobody chose for this.
-  const allowed = pool.length && shortlist.length ? new Set(shortlist.map((m) => m.id)) : new Set([deps.defaultModel]);
+  const allowed = shortlist.length ? new Set(shortlist.map((m) => m.id)) : new Set([deps.defaultModel]);
   // The enum rides in the tool schema of every request, so it stays as small as
   // the allowlist; anything else this provider serves is still accepted by name
   // below, because the check reads the full runnable list.
   const MAX_OFFERED = 24;
-  const offered = (pool.length && shortlist.length ? shortlist : runnable.filter((m) => m.id === deps.defaultModel))
-    .slice(0, MAX_OFFERED);
+  const offered = (shortlist.length ? shortlist : runnable.filter((m) => m.id === deps.defaultModel)).slice(
+    0,
+    MAX_OFFERED,
+  );
   const modelIds = offered.map((m) => m.id);
   const runnableIds = new Set(runnable.map((m) => m.id));
 
@@ -227,6 +243,8 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
         const capped =
           result.stoppedBecause === "max_steps"
             ? `\n\n[the subagent hit its step limit — this result may be incomplete]`
+            : result.stoppedBecause === "looping"
+              ? `\n\n[the subagent was stopped: it kept repeating one tool call and made no progress — this result may be incomplete]`
             : "";
         return {
           output: result.finalText + capped,

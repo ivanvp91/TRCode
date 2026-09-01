@@ -249,6 +249,61 @@ const ACTIONS = [
   check("allowEmpty returns an empty set, not the cursor row", JSON.stringify(picked) === "[]", JSON.stringify(picked));
 }
 
+// ── the page window: walk rows inside it, slide only at an edge ────────────
+// Long list (two sections), more rows than a default 14-row page.
+const longItems = [];
+for (let v = 0; v < 3; v++) {
+  longItems.push({ value: `__V${v}`, label: "", header: `Vendor ${v}` });
+  for (let n = 0; n < 8; n++) longItems.push({ value: `v${v}:m${n}`, label: `m${v}-${n}` });
+}
+
+{
+  const DOWN2 = ESC + "[B";
+  // The picker repaints by clearing down and redrawing, so the visible frame
+  // is what follows the last clear. screen() has already stripped the escape
+  // letters, and every redraw begins with the bare ESC byte + "[19A"-style
+  // moves; split on "❯ m" is unreliable, so track the first drawn LIST line —
+  // a section heading or a model row — of the LAST frame via the footer-less
+  // tail: everything from the last "── Vendor"/model line that sits above
+  // the cursor row.
+  const frames = (s) => s.split(NL);
+  const body = (s) => {
+    const lines = frames(s);
+    const at = lines.map((l, i) => (l.includes("╭─") ? i : -1)).filter((i) => i >= 0).pop() ?? 0;
+    return lines.slice(at).filter((l) => /│\s+(❯|\s*m\d|──)/.test(l));
+  };
+  const firstRow = () => body(screen())[0] ?? "";
+
+  reset();
+  const m = openModal({ title: "Models", items: longItems, search: false });
+  const topAtStart = firstRow();
+  type(DOWN2); type(DOWN2);
+  check("walking down keeps the top row fixed", firstRow() === topAtStart,
+    `${JSON.stringify(topAtStart)} -> ${JSON.stringify(firstRow())}`);
+  // Walk to the bottom of the list and back: the page slides off its initial
+  // section heading long before row 27 is under the cursor.
+  for (let i = 0; i < 26; i++) type(DOWN2);
+  const topAtBottom = firstRow();
+  check("past the bottom edge the window slides", topAtBottom !== topAtStart,
+    `top still ${JSON.stringify(topAtBottom)}`);
+  // And walking back up must land exactly on the first row again.
+  const UP2 = ESC + "[A";
+  for (let i = 0; i < 26; i++) type(UP2);
+  check("walking back up restores the cursor row", screen().includes("❯ m0-0"));
+  type(ESC);
+  await m;
+
+  // Cursor stays put when a repaint happens with the same items.
+  reset();
+  const m2 = openModal({ title: "Models", items: longItems, search: false });
+  type(DOWN2); type(DOWN2);
+  const cursorBefore = body(screen()).findIndex((l) => l.includes("❯"));
+  type("\x0c"); // any unknown control — no movement
+  check("a repaint without changes keeps the cursor line", body(screen()).findIndex((l) => l.includes("❯")) === cursorBefore);
+  type(ESC);
+  await m2;
+}
+
 say("");
 say(passed + " passed, " + failed + " failed");
 process.exit(failed ? 1 : 0);

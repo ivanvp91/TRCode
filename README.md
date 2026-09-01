@@ -13,11 +13,11 @@
 agent in the spirit of Claude Code, with live model switching, subagents, skills and
 token accounting.
 
-One client, nine providers: the TokenRouter catalog, Kimi, Anthropic, OpenRouter,
-OpenCode Zen, OpenCode Go, Alibaba Cloud (Qwen), xAI (Grok) and Z.AI — subscriptions and
-API keys side by side, each model served on the wire protocol its vendor speaks (OpenAI
-chat, Responses and Anthropic Messages), with reasoning effort and prompt caching shaped
-per host.
+One client, ten providers: the TokenRouter catalog, Kimi, Anthropic, OpenRouter,
+OpenCode Zen, OpenCode Go, Meta (Muse), Alibaba Cloud (Qwen), xAI (Grok) and Z.AI —
+subscriptions and API keys side by side, each model served on the wire protocol its
+vendor speaks (OpenAI chat, Responses and Anthropic Messages), with reasoning effort and
+prompt caching shaped per host.
 
 Node 20+ on Windows, macOS and Linux; zero runtime dependencies (native `fetch`,
 raw-mode TTY, ANSI).
@@ -54,7 +54,7 @@ and quotes, so invisible terminal noise never ends up inside it.
 
 TokenRouter is the default, but the platform is cross-platform by design: a model can be
 reached at its own vendor instead — useful when you already pay for a subscription there
-and would rather spend the plan than the router's per-token price. Seven providers are
+and would rather spend the plan than the router's per-token price. Ten providers are
 built in, and each remembers its own model, reasoning budget and host.
 
 ```bash
@@ -66,6 +66,7 @@ trc auth login --provider opencode      # OpenCode Zen key; /login zen works too
 trc auth login --provider opencode-go   # the Go subscription; /login go works too
 trc auth login --provider alibabacloud  # QwenCloud key; asks which host it is for
 trc auth login --provider xai           # SuperGrok subscription or a console.x.ai key
+trc auth login --provider meta          # Meta Model API key (Muse); /login muse works too
 trc auth login --provider zai           # Z.AI / bigmodel key; asks which host it is for
 trc auth login --provider kimi --oauth  # subscription, via an OAuth device code
 trc auth login --provider kimi --key    # Moonshot platform key, pay per token
@@ -207,6 +208,33 @@ one (DeepSeek off-peak, Qwen's `-plus` short-context tier), and the six ids the 
 but the vendor's table does not price are left unpriced rather than guessed. Anything here
 is overridable per model in `config.json` → `pricing`.
 
+**Meta** is the Muse line straight from the vendor: `https://api.meta.ai/v1`, one key from
+dev.meta.ai, and `muse-spark-1.2` — a 1M-token agentic model — at **$1.25 / $4.25** per 1M
+tokens with cached input at $0.15 and no long-context premium. The host serves all three
+dialects under one base URL; requests go on `/responses`, which is what Meta documents for
+agent work and where reasoning carries across turns — the same place Zen and Go already
+route these models. It answers to `muse` as well, so `/login muse` and
+`-m muse:muse-spark-1.2` reach the same key and the same list.
+
+Its listing is key-gated and real, so it is both the catalog and the proof that a key
+works; the published set — `muse-spark-1.2`, `muse-spark-1.2-contributor`,
+`muse-spark-1.1` — is what the client falls back to when the listing fails. `muse-image` is
+served on Meta's own image endpoint, which this client does not speak, so it is marked in
+the catalog rather than offered and failed on.
+
+`muse-spark-1.2-contributor` is the same model at a tenth of the price — **$0.10 / $0.20**
+— because prompts and completions sent to it may be used to improve Meta products. Both
+prices are carried in the client, so `/cost` states the difference rather than leaving it
+to be discovered on the bill.
+
+There is no subscription path here, and that is a decision rather than a gap. Meta sells
+plans — Everyday, High and Power Usage, counted in requests per rolling five hours — but
+scopes them to its own client: *"Your subscription only works through the Muse Code CLI
+while signed in with your Meta Model API account"*, and any key issued on the same account
+is billed pay-as-you-go regardless. That is the Claude Pro/Max case again: a plan its
+vendor does not sell to third-party clients is not one this client reaches for. If Meta
+publishes a grant third parties may use, the mode is a dozen lines away.
+
 Alibaba Cloud is Model Studio (DashScope), reached through its OpenAI-compatible endpoint
 — Qwen straight from the vendor, at the vendor's prices. The same platform is documented
 as **QwenCloud** and as **Model Studio**, and the CLI answers to all of those names:
@@ -336,6 +364,7 @@ insert, Esc to dismiss. `/help` prints the full reference.
 | `/brain <question>` | a panel of models answers together — see [A panel of models](#a-panel-of-models) |
 | `/orchestrate <task>` | split a task into subtasks with dependencies and run them on subagents |
 | `/swarm <task>` | several models solve it in parallel, then a synthesis pass |
+| `/swarm` | the roster panel: who runs, who merges the answers; `/swarm models` picks them |
 | `/compact [focus]` | compact the history into a structured digest |
 | `/rewind [last]` | put files back to how they were before a turn |
 | `/yolo [on\|off]` | skip confirmations — tools run immediately (also Shift+Tab) |
@@ -355,10 +384,11 @@ endpoint is per-account; `/settings` groups the toggleable preferences — what 
 line shows, whether skills and UI mockups match themselves automatically, whether updates
 are looked for; `/update` installs the newest GitHub release — details below)
 
-**Agents** — `/subagents [model [id]\|auto]`, `/prompt <task> \| model [id] \| off\|command\|auto`,
+**Agents** — `/subagents [model [id]\|session\|list]`, `/prompt <task> \| model [id] \| off\|command\|auto`,
 `/prompt_model [id]`, `/mcp [reload]`
-(`/subagents` names the models subagents may run on: the interactive list, `model <id>`
-to add one by name, `auto` to reset to the session's model only — details in
+(`/subagents` picks between the two ways an agent gets a model — the session's own, or a
+list you chose — with `model <id>` to add one by name; the list survives the switch, so
+`session` is a mode rather than a wipe — details in
 [Subagents](#subagents); `/prompt` routes a short ask through a cheap model first —
 details in [Writing the prompt](#writing-the-prompt))
 
@@ -1058,10 +1088,15 @@ Four mechanisms, deliberately distinct:
   Independent steps run in parallel, dependent ones receive their predecessors' results,
   investigation steps are read-only, and writing steps run one at a time and last. The
   current model then merges everything into one answer. The plan and step statuses are
-  visible as it goes.
-- **`/swarm`** — one task goes to several models from different vendors at once (the roster
-  is picked automatically), they work read-only, and the current model then merges the
-  answers and names the disagreements explicitly.
+  visible as it goes. With a `/subagents` list switched on, the planner is shown it — size
+  and price included — and picks a model per step: the big one where there is a judgement
+  call, a cheap one for mechanical reconnaissance. A step naming anything else runs on the
+  session's model, and the plan on screen names the model each step will actually use.
+- **`/swarm`** — one task goes to several models from different vendors at once, they work
+  read-only, and one model then merges the answers and names the disagreements explicitly.
+  The roster is picked by hand on `/swarm models` — or, with nothing chosen, automatically:
+  the session's model plus one model per other vendor. Bare `/swarm` opens the panel, where
+  ★ marks the model that writes the synthesis (unpinned, the session's model writes it).
 - **`/brain <question>`** — not agents but models talking: several answer the same
   question alone, read each other's answers, revise, and one writes the final text. No
   tools, no file changes — see [A panel of models](#a-panel-of-models).
@@ -1447,14 +1482,25 @@ lead agent's history stays free of the intermediate steps. Several `task` calls 
 turn run in parallel.
 
 A subagent is paid for by the key this session is using, and it runs on **the session's own
-model by default**. `/subagents` names the other models it may be launched on — a shortlist
-you choose:
+model by default**. `/subagents` is where that is decided — two modes, and the panel says
+which one is in force:
+
+- **the session's model** — every subagent runs on whatever the session runs on;
+- **a list you chose** — subagents may be launched on any model marked in it.
+
+The list is kept either way. Switching to the session's model does not throw it away, so
+coming back to a shortlist of five costs one keystroke instead of five choices; `Forget the
+list` is the separate, deliberate button.
 
 ```
-/subagents              # the list, with checkboxes: Space marks, Enter confirms
+/subagents              # the panel: Space marks, Enter saves and switches to the list
 /subagents model qwen3.8-max   # add one by name — alias or prefix resolve, as in /model
-/subagents auto         # back to "the session's model only"
+/subagents session      # run on the session's model; the list stays, unused
+/subagents list         # use the list again
 ```
+
+The same shortlist is what `/orchestrate` offers its planner, so one choice governs every
+agent this session may launch.
 
 `/subagents model <id>` resolves the name the same way `/model` does and checks it against
 the current provider's catalog before adding; a model another provider owns is refused with
