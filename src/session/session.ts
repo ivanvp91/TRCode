@@ -4,6 +4,7 @@ import path from "node:path";
 import crypto from "node:crypto";
 import { sessionsDir } from "../config.js";
 import { removeProjection } from "./projection.js";
+import type { Goal } from "./goal.js";
 import { UsageTracker, historyTokens, type ModelUsage } from "../usage.js";
 import type { Message } from "../types.js";
 
@@ -19,6 +20,8 @@ export interface SessionMeta {
   tokens?: number;
   /** How many times this session has already been compacted. */
   compactions?: number;
+  /** The persistent goal (/goal), if one was ever set. */
+  goal?: Goal;
 }
 
 interface SessionFile {
@@ -43,6 +46,8 @@ export class Session {
   usage: UsageTracker;
   /** Set once /compact or auto-compact has run, for the status line. */
   compactions = 0;
+  /** The persistent goal (/goal); null when none was set. */
+  goal: Goal | null = null;
 
   constructor(opts: { id?: string; cwd: string; model: string; title?: string; createdAt?: number }) {
     this.id = opts.id ?? newId();
@@ -96,6 +101,7 @@ export class Session {
         messageCount: this.messages.length,
         tokens: historyTokens(this.messages),
         compactions: this.compactions,
+        goal: this.goal ?? undefined,
       },
       messages: this.messages,
       usage: this.usage.toJSON(),
@@ -121,6 +127,7 @@ export class Session {
       s.messages = data.messages ?? [];
       s.usage = UsageTracker.fromJSON(data.usage);
       s.compactions = data.meta.compactions ?? 0;
+      s.goal = data.meta.goal ?? null;
       return s;
     } catch {
       return null;

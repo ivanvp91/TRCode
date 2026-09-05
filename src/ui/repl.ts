@@ -75,6 +75,17 @@ import { connectMcpServers, mcpPendingCount, mcpSettled } from "../mcp/client.js
 import { discoverSkills, type Skill } from "../skills/loader.js";
 import { pickSkill, skillInjection, skillInterjector } from "../skills/match.js";
 import { Session } from "../session/session.js";
+import {
+  DEFAULT_MAX_TURNS,
+  completeGoal,
+  goalLine,
+  goalPrompt,
+  newGoal,
+  spendTurn,
+  statusMark,
+  turnGate,
+  type Goal,
+} from "../session/goal.js";
 import { loadInputHistory, saveInputHistory, dropSessionHistory } from "../session/history.js";
 import { compactSession, contextPressure, shouldAutoCompact } from "../session/compact.js";
 import { markTurn, pruneOrphanStores, recordWrite } from "../session/checkpoint.js";
@@ -132,6 +143,15 @@ export class App {
   presetOverride?: "standard" | "minimal";
   /** Full reasoning of the last turn, for /reasoning. */
   lastReasoning = "";
+  /**
+   * Whether the last turn ended in Esc. The goal loop reads it: an interrupt
+   * there pauses the goal instead of letting it fire the next round.
+   */
+  lastAborted = false;
+  /** The last turn threw — the goal loop pauses instead of retrying forever. */
+  lastTurnFailed = false;
+  /** The "goal budget exhausted" line was already said this session. */
+  private goalBudgetWarned = false;
   /** Skills whose body is already in the history — auto-loaded or asked for. */
   loadedSkills = new Set<string>();
 
@@ -278,6 +298,13 @@ export class App {
     const known = (id: string) => this.catalog.some((m) => m.id === id);
     if (known(this.session.model)) return;
 
+    // The model's provider is missing from the catalog altogether — a host
+    // whose listing failed or timed out drops out of the merged list. That
+    // catalog says nothing about this model, and swapping it for another
+    // host's model used to route the turn to a host with no channel for it.
+    const provider = splitModelId(this.session.model).providerId;
+    if (!this.catalog.some((m) => splitModelId(m.id).providerId === provider)) return;
+
     // An alias or a shorthand ("k3") reaches here unresolved on some paths.
     try {
       const resolved = resolveModelId(this.session.model, this.catalog);
@@ -290,7 +317,11 @@ export class App {
     }
 
     const stale = this.session.model;
-    const fallback = known(this.cfg.model) ? this.cfg.model : usableModels(this.catalog)[0]?.id;
+    // Another model of the same host: a renamed id keeps billing to the same
+    // subscription. Falling back to a different provider was how a session
+    // opened on the wrong host and every turn died with a 503.
+    const sameHost = usableModels(this.catalog).find((m) => splitModelId(m.id).providerId === provider);
+    const fallback = sameHost?.id ?? (known(this.cfg.model) ? this.cfg.model : undefined);
     if (!fallback) return;
     this.session.model = fallback;
     warn(tr(`Model "${stale}" is not in the ${this.cfg.baseUrl} catalog — switched to ${fallback}.`, `Модели "${stale}" нет в каталоге ${this.cfg.baseUrl} — переключился на ${fallback}.`));
@@ -706,6 +737,10 @@ export class App {
     if (initialPrompt?.trim()) await this.turn(initialPrompt.trim());
 
     while (!this.quitting) {
+      // An active goal keeps working between the user's turns — but anything
+      // typed while it ran gets through first: a /goal pause queued mid-run
+      // must land, not wait out the turn budget.
+      if (!this.pending.length && (await this.maybeGoalTurn())) continue;
       // Messages typed while the previous turn was running go first.
       let text: string;
       if (this.pending.length) {
@@ -731,12 +766,59 @@ export class App {
       // The frame held tokens for whatever was pasted; the model gets the
       // text itself. Recall keeps the short form — that is the point of it.
       await this.turn(expandPastes(text));
+      if (await this.maybeGoalTurn()) continue;
     }
 
     this.session.save();
     line();
     hint("Session saved: " + this.session.id);
   }
+
+  // ── goal (/goal) ──────────────────────────────────────────────────────────
+
+  /**
+   * Sends one continuation turn at an active goal. Returns false when nothing
+   * ran: no goal, paused, complete, budget out — or Esc, which pauses the
+   * goal rather than resending into an interrupt.
+   */
+  private async maybeGoalTurn(): Promise<boolean> {
+    const goal = this.session.goal;
+    if (turnGate(goal ?? undefined) !== "ok") return false;
+    // Without an explicit --turns the built-in cap pauses the goal: an agent
+    // running unattended must not be able to burn tokens forever.
+    if (!goal!.maxTurns) {
+      goal!.maxTurns = goal!.turnsUsed + DEFAULT_MAX_TURNS;
+    }
+    spendTurn(goal!);
+    this.session.save();
+    info(goalLine(goal!));
+    await this.turn(goalPrompt(goal!));
+    // Esc during a goal turn means stop, not "skip this round".
+    if (this.lastAborted) {
+      goal!.status = "paused";
+      this.lastAborted = false;
+      this.session.save();
+      warn(tr("Goal paused — /goal resume continues it.", "Цель на паузе — /goal resume продолжит."));
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * The goal set at /goal time decides the prompt; the model's own word
+   * decides when it is done. Completion is declared by a `<goal-complete>`
+   * tag in the answer — a plain "done" in prose would fire on a status note.
+   */
+  private checkGoalComplete(answer: string): void {
+    const goal = this.session.goal;
+    if (!goal || goal.status !== "active") return;
+    if (!/<goal-complete>/i.test(answer)) return;
+    completeGoal(goal);
+    this.session.save();
+    success(tr(`Goal complete: ${goal.objective}`, `Цель достигнута: ${goal.objective}`));
+  }
+
+  // ── end goal ──────────────────────────────────────────────────────────────
 
   /**
    * Runs `fn` with sole ownership of stdin. The editor is idle while commands
@@ -1161,6 +1243,10 @@ export class App {
     // Created before auto-compaction, not after: the compaction request has to
     // hang off the same signal, or Esc cannot reach it.
     this.abort = new AbortController();
+    // Fresh turn — a leftover verdict from the previous one (an Esc, a failed
+    // request) must not reach the goal loop through these flags.
+    this.lastAborted = false;
+    this.lastTurnFailed = false;
     // The bar goes up before auto-compaction and the brief rewrite, not after:
     // either can run for minutes on a full window, and a missing input frame
     // for that long reads as the CLI having died.
@@ -1183,6 +1269,7 @@ export class App {
     if (this.abort.signal.aborted) {
       warn(tr("Interrupted.", "Прервано."));
       this.abort = null;
+      this.lastAborted = true;
       // Nothing went out — not the prompt, not whatever was typed into the
       // frame meanwhile. Hand all of it back instead of losing it.
       const { queued, draft } = bar.stop();
@@ -1439,6 +1526,8 @@ export class App {
 
       stopStream();
       this.session.save();
+      this.lastTurnFailed = false;
+      this.checkGoalComplete(result.finalText);
       this.statusLine(Date.now() - started, result.steps, result.stoppedBecause);
       if (process.env.TRCODE_DEBUG) {
         const t = this.usage.turnTotals();
@@ -1456,6 +1545,7 @@ export class App {
       error((err as Error).message);
       this.suggestAnotherHost(err);
       this.session.save();
+      this.lastTurnFailed = true;
     } finally {
       // Take the bar down before anything else prints, then pick up whatever
       // was typed while the model worked.
@@ -1476,6 +1566,7 @@ export class App {
       // Esc having done nothing at all — the queued text is handed back to the
       // editor instead, where it can be sent again on purpose.
       const interrupted = Boolean(this.abort?.signal.aborted);
+      this.lastAborted = interrupted;
       if (interrupted) {
         const held = [...queued, draft].filter(Boolean).join("\n");
         if (held) this.editor?.prefill(held);

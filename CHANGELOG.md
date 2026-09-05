@@ -4,7 +4,30 @@ All notable changes to TRCode are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the versioning is
 [SemVer](https://semver.org/) while the client stays pre-1.0.
 
-## [0.1.4] — 2026-09-01
+## [0.1.5] — 2026-09-05
+
+### Added
+
+- **`/goal` — a persistent objective the agent keeps working toward** (по образцу Qoder
+  CLI). `/goal <objective> [--turns <n>]` задаёт цель, и после каждого хода пользователя
+  агент сам берёт следующий: цель повторяется вербатимом в промпте каждого goal-хода,
+  модель объявляет завершение тегом `<goal-complete>`. Цель хранится в session-файле и
+  переживает resume; встроенный лимит 25 ходов ставит её на паузу автоматически (`--turns`
+  заменяет лимит, `/goal resume` выдаёт новый бюджет). Esc на goal-ходе — пауза, а не
+  пропуск раунда; упавший ход тоже ставит паузу вместо вечного ретрая. Модуль
+  `src/session/goal.ts`, команды `status | pause | resume | clear`.
+- `src/session/goal.ts` — состояние цели (`Goal`, turnGate/spendTurn/completeGoal,
+  goalPrompt/goalLine) и тесты `test/goal-test.mjs` (24 проверки) и
+  `test/goal-live-test.mjs` (17 проверок, живой REPL на сценарном SSE-сервере).
+
+### Fixed
+
+- Модель сессии больше не подменяется при старте/фоновом обновлении каталога: если
+  каталог пришёл без листинга нужного провайдера (фетч упал/таймаут), `reconcileModel()`
+  теперь не трогает модель, а фолбэк предпочитает модель того же хоста — раньше сессия
+  уходила на чужой хост и каждый ход умирал с 503 «No available channel».
+  Тест `test/model-switch-test.mjs` (9 проверок).
+
 
 ### Added
 

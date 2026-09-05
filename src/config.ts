@@ -5,7 +5,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 
-export const VERSION = "0.1.4";
+export const VERSION = "0.1.5";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";

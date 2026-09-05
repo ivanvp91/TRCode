@@ -113,6 +113,9 @@ const SUITES = [
   "shutdown-test.mjs",
   "update-test.mjs",
   "favorite-test.mjs",
+  "goal-test.mjs",
+  "goal-live-test.mjs",
+  "model-switch-test.mjs",
 ];
 
 /** The suite now in flight, so an interrupt can take it down tree and all. */

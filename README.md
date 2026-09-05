@@ -368,6 +368,7 @@ insert, Esc to dismiss. `/help` prints the full reference.
 | `/compact [focus]` | compact the history into a structured digest |
 | `/rewind [last]` | put files back to how they were before a turn |
 | `/yolo [on\|off]` | skip confirmations — tools run immediately (also Shift+Tab) |
+| `/goal <objective> [--turns <n>]` | set a persistent goal the agent keeps working toward — see [Working toward a goal](#working-toward-a-goal) |
 | `/new` | start a new session |
 
 **Session** — `/sessions`, `/resume [id]`, `/fork [turn]`, `/rename [title]`, `/context [<tokens>|auto]`, `/cost`, `/trace [n]`
@@ -1571,6 +1572,45 @@ line saying so. Delegated runs keep their own bounds regardless (a subagent 40 s
 plan step 30, a swarm step 25): nobody is watching those, they cannot be told to continue,
 and the agent that launched one can always launch another.
 
+## Working toward a goal
+
+A task you have to keep prodding — "get the tests green", "finish the migration", "audit
+every route and fix what is broken" — is exactly what `/goal` is for. It sets a persistent
+objective, and after every turn of yours the agent takes another one on its own, keeping
+at it until the work is done, the budget runs out, or you stop it.
+
+```
+/goal make npm test green          # set it; the agent continues after each of your turns
+/goal rewrite docs --turns 10      # with an explicit budget
+/goal                              # status: the mark, the objective, turns spent
+/goal pause                        # stop the automatic continuation (Esc does the same)
+/goal resume                       # continue; a spent budget is granted anew
+/goal clear                        # remove it
+```
+
+The goal lives on the session, so it survives restart and `-c`/`--resume`: coming back to
+the session comes back to the goal, and the status line under the input carries its mark —
+◉ active, ◎ paused, ✓ complete.
+
+How it works, in brief:
+
+- Every goal turn sends the objective again as its prompt — *assess the state, do the next
+  concrete step, verify the result* — so the model always knows what it is chasing, not
+  just what the last tool call left behind.
+- Only the model's own word ends it: a reply that ends with the `<goal-complete>` tag
+  marks the goal done. Prose like "done" in a status note does not fire.
+- Anything you type between goal turns goes first — a question, a correction, `/goal
+  pause` mid-run lands instead of waiting out the round.
+- **Esc pauses the goal** rather than skipping one round: an interrupt must mean stop, not
+  "try again on your own". `/goal resume` continues it.
+- A turn that fails on the network pauses the goal too — an unattended loop must not
+  retry into a dead host forever.
+
+Without `--turns` a built-in limit of **25 turns** pauses the goal on its own — an agent
+running unattended must not be able to burn tokens forever. The pause is announced once;
+`/goal resume` grants a fresh budget of the same size. An explicit `--turns <n>` replaces
+that limit.
+
 ## Tests
 
 Everything runs against a local mock of the API — no key and no network required:
@@ -1595,7 +1635,7 @@ PASS  codemode-test.mjs      9/9       PASS  fork-test.mjs       10/10
 PASS  stat-test.mjs          17/17     PASS  update-test.mjs     23/23
 ```
 
-51 suites in all. The suites cover the wire protocols, provider routing and the OAuth device flow (against a
+59 suites in all. The suites cover the wire protocols, provider routing and the OAuth device flow (against a
 throwaway server on localhost), history trimming, the request projection log, the code-mode
 sandbox (path guard, snapshots, timeout, abort), session forking, the tool presets and the
 self-update path against a mock of the GitHub API,
@@ -1697,6 +1737,7 @@ src/
     trim.ts            per-request history trimming
     projection.ts      per-request token projection log (/trace)
     checkpoint.ts      file snapshots for /rewind
+    goal.ts            persistent goal (/goal)
     history.ts         prompt history across restarts
   tools/               read, edit, write, ls, glob, grep, shell, read_image,
                        run_code (opt-in), skill, todo, memory, task
@@ -1715,18 +1756,6 @@ src/
     turnbar.ts         the bottom bar shown while a turn runs
     orca.ts            pane status reporting for the Orca terminal
     keyscan.ts         /keys inspector
-```
-
-## License
-
-MIT
-yscan.ts         /keys inspector
-```
-
-## License
-
-MIT
-r
 ```
 
 ## License
