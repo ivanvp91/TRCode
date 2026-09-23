@@ -65,6 +65,15 @@ export interface ProviderMode {
   /** Sent on every request beyond the credential; some hosts 403 without them. */
   headers?: Record<string, string>;
   /**
+   * A header this host wants carrying a stable id for the conversation, so it
+   * can keep one conversation on one backend and hit the prompt cache it
+   * warmed there. Per mode, because the header is the host's own.
+   *
+   * It is not a credential and it is never the local session id — the value
+   * is derived; see conversationTag() in client.ts.
+   */
+  sessionHeader?: string;
+  /**
    * Per-model dialects, for a gateway that serves more than one and whose
    * catalog does not say which is which. Matched against the bare model name,
    * first hit wins; anything unmatched falls back to `protocol`.
@@ -411,6 +420,10 @@ const PROVIDERS: ProviderDef[] = [
         // Required by that same half and ignored by the rest, so it rides on
         // every request rather than being decided per model.
         headers: { "anthropic-version": "2023-06-01" },
+        // Asked for by the docs, and Go refuses without it ("Request is
+        // missing x-opencode-session and cannot be routed efficiently"). Zen
+        // takes it on the same terms, so both modes carry it.
+        sessionHeader: "x-opencode-session",
       },
     },
   },
@@ -435,6 +448,7 @@ const PROVIDERS: ProviderDef[] = [
         seed: [],
         authHeader: "both",
         headers: { "anthropic-version": "2023-06-01" },
+        sessionHeader: "x-opencode-session",
       },
     },
   },
@@ -703,6 +717,8 @@ export interface ResolvedAuth {
   providerId: string;
   baseUrl: string;
   headers: Record<string, string>;
+  /** See ProviderMode.sessionHeader; the caller supplies the value. */
+  sessionHeader?: string;
 }
 
 /** In-flight refreshes, so a burst of parallel requests renews a token once. */
@@ -776,6 +792,7 @@ export async function resolveAuth(providerId: string): Promise<ResolvedAuth> {
   return {
     providerId,
     baseUrl: mode.baseUrl,
+    sessionHeader: mode.sessionHeader,
     headers: {
       ...mode.headers,
       ...authHeaders(mode.authHeader, creds.accessToken),

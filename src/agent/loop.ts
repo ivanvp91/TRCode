@@ -71,6 +71,12 @@ export interface RunOptions {
    * subagents and one-shot runs: their costs land in the caller's tracker.
    */
   projection?: { cwd: string; sessionId: string };
+  /**
+   * Identifies this run to hosts that route and cache per conversation; see
+   * ChatRequest.conversationId. Absent for subagents and one-shot runs, which
+   * are told apart by their own prompt prefix.
+   */
+  conversationId?: string;
 }
 
 export interface RunResult {
@@ -321,6 +327,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         signal: opts.signal,
         onStall: opts.onStall,
         onRateWait: opts.onRateWait,
+        conversationId: opts.conversationId,
       })) {
         if (ev.type === "text" && ev.text) {
           text += ev.text;

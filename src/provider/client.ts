@@ -1,5 +1,6 @@
 /** Chat client with SSE streaming and retries, routed per provider. */
-import { loadConfig, saveConfig, type Effort } from "../config.js";
+import crypto from "node:crypto";
+import { loadConfig, saveConfig, VERSION, type Effort } from "../config.js";
 import type { Message, StreamEvent, ToolCall, ToolDef, Usage } from "../types.js";
 import { type Protocol } from "./protocol.js";
 import {
@@ -43,6 +44,57 @@ export interface ChatRequest {
    * or a compaction runs on the small one, and a subagent on its own.
    */
   onRateWait?: (waitMs: number, model: string, said: string) => void;
+  /**
+   * Which conversation this request belongs to, for hosts that route and cache
+   * per conversation (ProviderMode.sessionHeader). The session id is what the
+   * REPL passes; anything without one — a subagent, a title, a compaction —
+   * is identified by its own prompt prefix instead, which is the thing the
+   * host is actually caching.
+   */
+  conversationId?: string;
+}
+
+/**
+ * How this client names itself. OpenCode Go asks for "its own user agent, such
+ * as my-coding-agent/1.0, rather than a generic SDK or HTTP-library name", and
+ * a version in it is what lets a host tell one release's traffic from
+ * another's when something goes wrong.
+ */
+const USER_AGENT = `trcode/${VERSION}`;
+
+/**
+ * A stable, opaque id for one conversation.
+ *
+ * Opaque because the local session id carries a local timestamp and there is
+ * no reason to ship that to a vendor; stable because the point of the header
+ * is that every step of one conversation lands on the backend that already
+ * holds its cached prefix. Hashing preserves both — the same input always
+ * gives the same tag, across steps and across restarts.
+ *
+ * Callers without an id fall back to a hash of the system prompt and the first
+ * user message: the part of the request that does not change while the
+ * conversation grows. That separates each subagent from the main session and
+ * from its siblings without threading an id through every caller, and two runs
+ * that really do share an opening share a tag — which is a cache hit, not a
+ * collision.
+ */
+const tags = new Map<string, string>();
+function conversationTag(req: ChatRequest): string {
+  const key =
+    req.conversationId ??
+    req.messages
+      .slice(0, 2)
+      .map((m) => (typeof m.content === "string" ? m.content : JSON.stringify(m.content ?? "")))
+      .join("\u0000");
+  let tag = tags.get(key);
+  if (!tag) {
+    tag = crypto.createHash("sha256").update(key).digest("hex").slice(0, 32);
+    // Bounded: a long-running process compacts and re-tags, and nothing here
+    // is worth leaking memory over.
+    if (tags.size > 256) tags.clear();
+    tags.set(key, tag);
+  }
+  return tag;
 }
 
 /**
@@ -101,7 +153,6 @@ export function modelRejectsTemperature(model: string): boolean {
   return temperatureRejected.has(model);
 }
 
-/** True when the failure is specifically about the sampling temperature. */
 function isTemperatureComplaint(err: ApiError): boolean {
   return err.status === 400 && /temperature/i.test(err.body ?? err.message);
 }
@@ -151,7 +202,13 @@ function isImageComplaint(err: ApiError): boolean {
   // wording keeps a plain missing-model 404 whose id happens to read "image"
   // (qwen-image-plus) out of the multimodal path.
   if (err.status === 404) return /no endpoints?\b|support[^.]{0,24}image|image[^.]{0,24}(input|support)/i.test(body);
-  return err.status === 400 && /image_url|input_image|image\b|multimodal|content type|content_type/i.test(body);
+  if (err.status === 400) return /image_url|input_image|image\b|multimodal|content type|content_type/i.test(body);
+  // A schema-validating gateway refuses the array form under 422 before it
+  // gets to the word "image": a tool message in OpenAI's own multimodal shape
+  // carries content as parts, and its schema wants a string. Content is only
+  // ever arrayed here when the request carries images, so matching the status
+  // alone is safe — it strips pixels precisely when some are present.
+  return err.status === 422 && /invalid_request_error/i.test(body);
 }
 
 /** Current form for a model, defaulting to the first one we try. */
@@ -268,7 +325,10 @@ function wireMessages(messages: Message[]): unknown[] {
           ...m.images.map((img) => ({ type: "image_url", image_url: { url: `data:${img.mime};base64,${img.data}` } })),
         ];
       }
-      if (m.name) out.name = m.name;
+      // A tool result carries its tool.name for the UI, trim and compact, but it
+      // never goes on the wire: "name" is not part of the tool-message schema,
+      // and a strict gateway rejects the whole request over it (400 messages[3]:
+      // "name" is not supported by this endpoint) instead of ignoring it.
       if (m.tool_calls?.length) out.tool_calls = m.tool_calls;
       if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
       // An assistant turn that only calls tools must send content:null, not "".
@@ -343,7 +403,7 @@ function buildBody(req: ChatRequest, stream: boolean): Record<string, unknown> {
  * call rather than cached, because an OAuth provider may have to renew its
  * token first — `resolveAuth` handles that, and does it once for a burst.
  */
-async function post(model: string, path: string, body: unknown, signal?: AbortSignal): Promise<Response> {
+async function post(model: string, path: string, body: unknown, signal?: AbortSignal, tag?: string): Promise<Response> {
   const { providerId } = splitModelId(model);
   let auth;
   try {
@@ -358,10 +418,11 @@ async function post(model: string, path: string, body: unknown, signal?: AbortSi
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "User-Agent": "trcode-cli",
+      "User-Agent": USER_AGENT,
       // Provider headers last: a host that gates on its own User-Agent must be
       // able to replace ours, not merely add to it.
       ...auth.headers,
+      ...(auth.sessionHeader && tag ? { [auth.sessionHeader]: tag } : {}),
     },
     body: JSON.stringify(body),
     signal,
@@ -423,6 +484,7 @@ async function postWithRetry(
   body: unknown,
   signal?: AbortSignal,
   onRateWait?: (waitMs: number, model: string, said: string) => void,
+  tag?: string,
 ): Promise<Response> {
   let rateRetries = 0;
   let rateWaited = 0;
@@ -432,7 +494,7 @@ async function postWithRetry(
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     let res: Response;
     try {
-      res = await post(model, path, body, signal);
+      res = await post(model, path, body, signal, tag);
     } catch (err) {
       if ((err as any)?.name === "AbortError") throw err;
       if (transientRetries >= TRANSIENT_RETRIES) throw err;
@@ -532,7 +594,7 @@ async function postChat(req: ChatRequest, stream: boolean): Promise<Response> {
   const path = pathFor(protocolForModel(req.model));
   for (;;) {
     try {
-      return await postWithRetry(req.model, path, buildBodyFor(req, stream), req.signal, req.onRateWait);
+      return await postWithRetry(req.model, path, buildBodyFor(req, stream), req.signal, req.onRateWait, conversationTag(req));
     } catch (err) {
       // A host that does not understand cache breakpoints: drop them and go
       // on. Costs one round-trip once per model, never a failed turn.
@@ -1086,7 +1148,15 @@ async function probeAuth(auth: ResolvedAuth, providerId: string, catalog: any[])
   try {
     const res = await fetch(`${auth.baseUrl}${pathFor(protocol)}`, {
       method: "POST",
-      headers: { ...auth.headers, "Content-Type": "application/json" },
+      headers: {
+        ...auth.headers,
+        "Content-Type": "application/json",
+        "User-Agent": USER_AGENT,
+        // The probe is its own one-request conversation. Without this a host
+        // that requires the header refuses on that ground instead of on the
+        // credential, and the probe learns nothing about the key.
+        ...(auth.sessionHeader ? { [auth.sessionHeader]: conversationTag({ model: "", messages: [], conversationId: "auth-probe" }) } : {}),
+      },
       body: JSON.stringify(body),
     });
     // Only 401, and only when the refusal is actually about the credential.

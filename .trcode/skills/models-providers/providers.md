@@ -84,6 +84,17 @@ curated list (~60 ids), no subscription mode.
   refuses a request carrying both — that is why this is a per-mode setting.)
 - `anthropic-version: 2023-06-01` on every request — required by the `/messages` half of
   the host, ignored by the rest, so it is not decided per model.
+- **`sessionHeader: "x-opencode-session"`.** The gateway routes and caches per
+  conversation and refuses without it: `400 Request is missing x-opencode-session and
+  cannot be routed efficiently`. `conversationTag()` in `client.ts` supplies the value —
+  a hash, never the local session id, which carries a local timestamp. The REPL passes
+  `conversationId: session.id`; anything without one (subagent, compaction, title) is
+  tagged by its own prompt prefix, which is the thing the host is caching, so each
+  subagent gets its own tag for free. The login probe sends it too, or the host refuses
+  on that ground instead of on the credential and the probe learns nothing about the key.
+- `User-Agent: trcode/<version>`. The docs ask a client to identify itself by its own
+  name and version rather than as an HTTP library, and name clients whose missing session
+  support makes them a problem.
 - Live `GET /zen/v1/models` — but it carries **ids only**: no windows, no prices, no
   endpoint types. Nothing is seeded; windows come from `CONTEXT_RULES`, which read the
   bare names Zen publishes (`claude-opus-5`, `kimi-k3`).
@@ -125,7 +136,8 @@ Two places read the rules, through `endpointFor(mode, model)`:
 
 The $10/month subscription half of the same console — ~27 open models, on
 `https://opencode.ai/zen/go/v1`. Same auth shape as Zen (`authHeader: "both"`,
-`anthropic-version`, `publicCatalog`, ids-only listing).
+`anthropic-version`, `sessionHeader`, `publicCatalog`, ids-only listing) — Go is the half
+that actually enforces the session header.
 
 **A separate provider, not a second mode.** It is a different subscription with a
 different key, and credentials are one file per provider — a second mode would mean the

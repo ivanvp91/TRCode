@@ -1379,6 +1379,7 @@ export class App {
         toolConcurrency: this.cfg.toolConcurrency,
         interject: this.stepSkills(),
         projection: { cwd: this.cwd, sessionId: this.session.id },
+        conversationId: this.session.id,
         // A silent stream is a question, not a verdict: the user can see the
         // clock and decide whether the model is worth waiting for.
         onStall: async (idleMs) => {

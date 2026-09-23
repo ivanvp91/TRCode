@@ -558,6 +558,173 @@ ok("отсутствующий файл не роняет импорт", creds.i
   creds.clearCredentials("opencode-go");
 }
 
+// ── x-opencode-session: шлюз отказывает без него ──────────────────────────
+// «Request is missing x-opencode-session and cannot be routed efficiently» —
+// живой 400 от Go. Заголовок нужен ему, чтобы держать один разговор на одном
+// бэкенде и попадать в прогретый там кэш префикса, так что проверяется не
+// только наличие, но и стабильность значения.
+{
+  const seen = [];
+  const go = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      const session = req.headers["x-opencode-session"];
+      seen.push({ session, ua: req.headers["user-agent"] });
+      if (!session) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            error: { message: "Request is missing x-opencode-session and cannot be routed efficiently." },
+          }),
+        );
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "ок" } }] }));
+    });
+  });
+  await new Promise((r) => go.listen(0, "127.0.0.1", r));
+
+  const savedKey = loadConfig().apiKey;
+  creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
+  saveConfig({ apiKey: "", providers: { "opencode-go": { baseUrl: `http://127.0.0.1:${go.address().port}` } } });
+
+  const client = await import("../dist/provider/client.js");
+  const ask = (conversationId, first = "первый вопрос") =>
+    client.complete({
+      model: "opencode-go:kimi-k3",
+      conversationId,
+      messages: [
+        { role: "system", content: "системный промпт" },
+        { role: "user", content: first },
+      ],
+    });
+
+  const first = await ask("sess-A");
+  ok("запрос прошёл, а не упал на 400", first.content === "ок", JSON.stringify(first));
+  ok("заголовок отправлен", Boolean(seen[0].session), String(seen[0].session));
+  // Хосту незачем знать локальный id — он несёт в себе локальную дату.
+  ok("но это не сам id сессии", seen[0].session !== "sess-A", seen[0].session);
+  ok("клиент называет себя и версию", /^trcode\/\d/.test(seen[0].ua ?? ""), seen[0].ua);
+
+  // Весь смысл — в стабильности: каждый шаг одного разговора должен попадать
+  // на тот же бэкенд.
+  await ask("sess-A", "второй вопрос");
+  ok("тот же разговор — тот же тег", seen[1].session === seen[0].session, `${seen[0].session} / ${seen[1].session}`);
+
+  await ask("sess-B");
+  ok("другой разговор — другой тег", seen[2].session !== seen[0].session, seen[2].session);
+
+  // Субагенту, компакту и генератору заголовка id никто не передаёт: их
+  // различает собственный префикс промпта, который у каждого свой.
+  await ask(undefined, "задача субагента");
+  await ask(undefined, "задача субагента");
+  await ask(undefined, "задача другого субагента");
+  ok("без id тег берётся из префикса", seen[3].session === seen[4].session, `${seen[3].session} / ${seen[4].session}`);
+  ok("и разные префиксы разводятся", seen[5].session !== seen[3].session, seen[5].session);
+  ok("а с явным id не путаются", seen[3].session !== seen[0].session, seen[3].session);
+
+  go.close();
+  creds.clearCredentials("opencode-go");
+  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
+}
+
+// ── tool-результат не несёт на провод поле name ───────────────────────────
+// Живой 400 от Console Go: «messages[3]: "name" is not supported by this
+// endpoint». Имя инструмента нужно нам самим — интерфейсу, trim и компакту, —
+// но схема tool-сообщения его не знает, и строгий шлюз роняет весь запрос.
+{
+  let sent = null;
+  const host = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      sent = JSON.parse(body);
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "ок" } }] }));
+    });
+  });
+  await new Promise((r) => host.listen(0, "127.0.0.1", r));
+
+  const savedKey = loadConfig().apiKey;
+  creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
+  saveConfig({ apiKey: "", providers: { "opencode-go": { baseUrl: `http://127.0.0.1:${host.address().port}` } } });
+
+  const client = await import("../dist/provider/client.js");
+  await client.complete({
+    model: "opencode-go:kimi-k3",
+    conversationId: "sess-name",
+    messages: [
+      { role: "user", content: "посмотри нагрузку" },
+      { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "bash", arguments: "{}" } }] },
+      { role: "tool", tool_call_id: "c1", name: "bash", content: "load average: 12" },
+    ],
+  });
+
+  const tool = sent.messages.find((m) => m.role === "tool");
+  ok("tool-сообщение дошло", Boolean(tool), JSON.stringify(sent.messages));
+  ok("но без поля name", tool && !("name" in tool), JSON.stringify(tool));
+  ok("tool_call_id на месте", tool?.tool_call_id === "c1", JSON.stringify(tool));
+  ok("ни одно сообщение не несёт name", sent.messages.every((m) => !("name" in m)), JSON.stringify(sent.messages));
+
+  host.close();
+  creds.clearCredentials("opencode-go");
+  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
+}
+
+// ── 422 от строгой схемы тоже считается отказом от картинок ──────────────
+// Живой ответ шлюза на tool-сообщение с content-массивом (read_image принёс
+// скриншот): «HTTP 422 — [invalid_request_error] Input should be a valid
+// string». Схема требует строку и до слова «image» не доходит — матчить надо
+// статус, иначе ход умирает вместо того, чтобы уйти без пикселей.
+{
+  const seen = [];
+  const host = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      seen.push(JSON.parse(body));
+      if (!imageRefused) {
+        imageRefused = true;
+        res.writeHead(422, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { code: "invalid_request_error", message: "Input should be a valid string" } }));
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "ок" } }] }));
+    });
+  });
+  let imageRefused = false;
+  await new Promise((r) => host.listen(0, "127.0.0.1", r));
+
+  const savedKey = loadConfig().apiKey;
+  creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
+  saveConfig({ apiKey: "", providers: { "opencode-go": { baseUrl: `http://127.0.0.1:${host.address().port}` } } });
+
+  const client = await import("../dist/provider/client.js");
+  const res = await client.complete({
+    model: "opencode-go:kimi-k3",
+    conversationId: "sess-422",
+    messages: [
+      { role: "user", content: "вот скрин" },
+      {
+        role: "tool",
+        tool_call_id: "c9",
+        content: "гифка в приложении",
+        images: [{ data: "aW1n", mime: "image/png", width: 4, height: 4 }],
+      },
+    ],
+  });
+
+  ok("ход пережил 422", res.content === "ок", JSON.stringify(res.content));
+  ok("запросов было два", seen.length === 2, String(seen.length));
+  ok("пикселей во втором нет", !JSON.stringify(seen[1]).includes("aW1n"), "aW1n leaked");
+  ok("и модель запомнена как брезгующая", client.modelStripsImages("opencode-go:kimi-k3"));
+
+  host.close();
+  creds.clearCredentials("opencode-go");
+  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
+}
+
 // ── the authorize URL has to survive the shell ────────────────────────────
 {
   const { browserCommand } = await import("../dist/ui/login.js");
