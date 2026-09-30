@@ -5,7 +5,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 
-export const VERSION = "0.1.6";
+export const VERSION = "0.1.7";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";
@@ -46,6 +46,24 @@ export interface Config {
    * a request has to be one this plan can actually call.
    */
   promptModels: Record<string, string>;
+  /**
+   * Image model generate_image draws with, chosen by /image, with its provider
+   * ("openrouter:bytedance-seed/seedream-4.5"). Empty: no image tool.
+   */
+  imageModel?: string;
+  /**
+   * Video model generate_video and /video use, with its provider
+   * ("openrouter:bytedance/seedance-2.5", "tokenrouter:kling-v3"). A bare id
+   * from before providers were spelled out is OpenRouter's.
+   */
+  videoModel?: string;
+  /** Model generate_audio speaks or plays with, chosen by /audio. Empty: no audio tool. */
+  audioModel?: string;
+  /**
+   * Text model that writes video prompts in /video mode, qualified with its
+   * provider. Empty means the session keeps its own model.
+   */
+  videoPromptModel?: string;
   /**
    * Which models subagents may run on, per provider: "session" — the model the
    * session runs on and nothing else; "list" — the models chosen in

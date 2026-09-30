@@ -58,6 +58,11 @@ export interface ModelPickerOptions {
    * back — so callers never see the action at all.
    */
   favoriteAction?: boolean;
+  /**
+   * A line per model in place of context size and price — what a media model
+   * can do matters there, and "image output" in red would read as an error.
+   */
+  describe?: (m: ModelInfo) => string | undefined;
   /** Passed through to the panel: lets the caller repaint it while open. */
   onOpen?: PickerOptions["onOpen"];
 }
@@ -117,7 +122,7 @@ function poolRows(opts: ModelPickerOptions, models: ModelInfo[], byName = false)
         )
       : group.models;
     for (const m of list) {
-      const why = incompatibleReason(m);
+      const why = opts.describe ? null : incompatibleReason(m);
       const marks = [
         m.id === opts.defaultModel ? c.brightGreen("★") : "",
         m.id === opts.current ? c.brightCyan("●") : "",
@@ -132,7 +137,7 @@ function poolRows(opts: ModelPickerOptions, models: ModelInfo[], byName = false)
         // The provider rides in the hint rather than the label: typing
         // "openrouter" then filters to it, and the dim is the picker's own.
         hint: [hostWidth ? host(m.id).padEnd(hostWidth) : "", marks, ctxWin].filter(Boolean).join(" "),
-        badge: why ? c.red(why) : price,
+        badge: opts.describe ? c.gray(opts.describe(m) ?? "") : why ? c.red(why) : price,
       });
     }
   }

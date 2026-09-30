@@ -3,6 +3,9 @@ import { editTool, lsTool, readTool, writeTool } from "./files.js";
 import { globTool, grepTool } from "./search.js";
 import { shellTool } from "./shell.js";
 import { readImageTool } from "./image.js";
+import { makeGenerateVideoTool, videoAvailable } from "./video.js";
+import { imageGenAvailable, makeGenerateImageTool } from "./imagegen.js";
+import { audioGenAvailable, makeGenerateAudioTool } from "./audiogen.js";
 import { makeSkillTool } from "./skill.js";
 import { fetchTool, webSearchTool } from "./web.js";
 import { makeTodoTool, TodoStore } from "./todo.js";
@@ -41,6 +44,12 @@ export function buildTools(opts: RegistryOptions): ToolDef[] {
   if (opts.preset === "minimal") return [shellTool, editTool];
 
   const tools: ToolDef[] = [readTool, editTool, writeTool, lsTool, globTool, grepTool, shellTool, readImageTool, webSearchTool, fetchTool];
+
+  // Media tools are offered only when the chosen model's host is connected:
+  // otherwise they could only fail, and would cost a paragraph per request.
+  if (videoAvailable()) tools.push(makeGenerateVideoTool());
+  if (imageGenAvailable()) tools.push(makeGenerateImageTool());
+  if (audioGenAvailable()) tools.push(makeGenerateAudioTool());
 
   const skillTool = makeSkillTool(opts.skills, opts.loadedSkills);
   if (skillTool) tools.push(skillTool);

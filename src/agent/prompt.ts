@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { loadConfig, loadProjectInstructions, type Lang } from "../config.js";
 import { skillsPromptSection, type Skill } from "../skills/loader.js";
 import { memorySection } from "../tools/memory.js";
+import { videoModeSection } from "./videomode.js";
 
 const BASE = `You are TRCode, a coding agent in the terminal. You work on a real filesystem and change real files.
 
@@ -277,6 +278,12 @@ Git repository: ${isGitRepo(opts.cwd) ? "yes" : "no"}${sshHostsLine()}
   if (note) parts.push("<model-notes>" + NL + note + NL + "</model-notes>");
 
   if (opts.extraInstructions) parts.push(`<session-instructions>\n${opts.extraInstructions}\n</session-instructions>`);
+
+  // Last, after everything stable: /video toggles it, and a change here should
+  // void as little of the cached prefix as possible. Subagents get coding
+  // assignments, never the studio brief.
+  const video = opts.subagent ? "" : videoModeSection();
+  if (video) parts.push(video);
 
   return parts.join("\n\n");
 }

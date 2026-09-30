@@ -87,6 +87,8 @@ const SUITES = [
   "uilib-test.mjs",
   "mcp-test.mjs",
   "web-test.mjs",
+  "video-test.mjs",
+  "media-test.mjs",
   "orca-test.mjs",
   "editor-harness.mjs",
   "paste-test.mjs",
