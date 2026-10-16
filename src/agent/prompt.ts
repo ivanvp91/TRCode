@@ -41,6 +41,7 @@ Every step re-sends the whole conversation, so what you pull in you pay for agai
 # Images
 A pasted screenshot arrives as "[Image #N]" and a temp-file path — call read_image on that path to see it; the read tool refuses binary. If the model has no vision, say so rather than guess what was on the screen.
 
+
 # Memory
 - A durable project fact goes to the memory tool the turn you learn it.`;
 
@@ -284,6 +285,8 @@ Git repository: ${isGitRepo(opts.cwd) ? "yes" : "no"}${sshHostsLine()}
   // assignments, never the studio brief.
   const video = opts.subagent ? "" : videoModeSection();
   if (video) parts.push(video);
+  const cfg = loadConfig();
+  if (cfg.imageModel || cfg.audioModel || video) parts.push("<media-workflow>Before making scripts or scenes, call prepare_media_workspace (a .tmp/ folder deleted on exit) and keep all scratch and scenes there; pass workspace to generation tools. Only the finished deliverable goes in the current directory. Inspect results against the requested text, size, timing, references and transparency. Recover interrupted jobs with resume_media; never resubmit paid generation automatically.</media-workflow>");
 
   return parts.join("\n\n");
 }

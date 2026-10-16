@@ -139,6 +139,7 @@ async function runToolCalls(
 
   const worker = async () => {
     for (;;) {
+      if (ctx.signal.aborted) return;
       const i = next++;
       if (i >= calls.length) return;
       const call = calls[i];
@@ -285,10 +286,13 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // Half the window, unless a number was pinned. Trimming exists to keep a
     // request inside the model's context, so the window is what it should be
     // measured against; a constant makes a 1M model behave like a 128k one.
-    const budget =
+    const window = contextWindowFor(opts.model, opts.catalog);
+    const reserve = Math.min(4096, Math.floor(window / 4));
+    const overhead = systemPromptSize(opts.systemPrompt) + toolSchemaSize(tools);
+    const budget = Math.max(1, Math.min(window - reserve,
       cfg.maxRequestTokens > 0
         ? cfg.maxRequestTokens
-        : Math.max(40_000, Math.floor(contextWindowFor(opts.model, opts.catalog) / 2));
+        : Math.max(1024, Math.floor(window / 2))) - overhead);
     const trim =
       budget > 0 || cfg.maxToolResultBytes > 0
         ? trimForRequest(messages, {

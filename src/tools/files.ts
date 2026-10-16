@@ -13,6 +13,7 @@ import path from "node:path";
 import type { ToolDef } from "../types.js";
 import { detectLineEnding, isIgnored, looksBinary, rel, resolveInside } from "./fsutil.js";
 import { renderDiff } from "../ui/render.js";
+import { commitFile } from "./filecommit.js";
 
 const MAX_READ_BYTES = 400_000;
 const MAX_READ_LINES = 2000;
@@ -35,6 +36,8 @@ export const readTool: ToolDef = {
   },
   summarize: (a) => String(a.path),
   async run(args, ctx) {
+    ctx.signal.throwIfAborted();
+    if (typeof args.path !== "string" || !args.path.trim()) return { output: "path is required", isError: true };
     const abs = resolveInside(ctx.cwd, String(args.path));
     let st: fs.Stats;
     try {
@@ -48,6 +51,36 @@ export const readTool: ToolDef = {
         output: `File is too large (${(st.size / 1024).toFixed(0)} KB). Read it in parts with offset/limit, or use grep.`,
         isError: true,
       };
+    }
+    if (!Number.isSafeInteger(args.offset ?? 1) || Number(args.offset ?? 1) < 1 || !Number.isSafeInteger(args.limit ?? MAX_READ_LINES) || Number(args.limit ?? MAX_READ_LINES) < 1) {
+      return { output: "offset and limit must be positive integers", isError: true };
+    }
+    if (st.size > MAX_READ_BYTES) {
+      const offset = Number(args.offset ?? 1);
+      const limit = Math.min(Number(args.limit), MAX_READ_LINES);
+      const selected: string[] = [];
+      let pending = ""; let current = 1; let more = false;
+      const stream = fs.createReadStream(abs, { encoding: "utf8", signal: ctx.signal });
+      try {
+        for await (const chunk of stream) {
+          pending += chunk;
+          if (pending.length > 2_000_000) return { output: "A single line exceeds 2 MB; use grep or a programmatic summary.", isError: true };
+          if (looksBinary(Buffer.from(String(chunk).slice(0, 8000)))) return { output: "Binary file, skipped", isError: true };
+          let newline: number;
+          while ((newline = pending.indexOf("\n")) >= 0) {
+            const text = pending.slice(0, newline).replace(/\r$/, ""); pending = pending.slice(newline + 1);
+            if (current >= offset && selected.length < limit) selected.push(text);
+            current++;
+            if (selected.length >= limit) { more = true; break; }
+          }
+          if (more) break;
+        }
+      } finally { stream.destroy(); }
+      if (!more && current >= offset && selected.length < limit && pending) selected.push(pending.replace(/\r$/, ""));
+      if (!selected.length) return { output: `Line ${offset} is past the end of the file.`, isError: true };
+      ctx.readFiles.add(abs);
+      const pad = String(offset + selected.length - 1).length;
+      return { output: selected.map((line, i) => `${String(offset + i).padStart(pad, " ")}\t${line}`).join("\n") + (more ? `\n\n… next chunk: offset=${offset + selected.length}` : ""), display: `${selected.length} lines (streamed)` };
     }
     const buf = await fsp.readFile(abs);
     if (looksBinary(buf)) return { output: `Binary file (${st.size} bytes), skipped.`, isError: true };
@@ -87,6 +120,8 @@ export const writeTool: ToolDef = {
   },
   summarize: (a) => String(a.path),
   async run(args, ctx) {
+    ctx.signal.throwIfAborted();
+    if (typeof args.path !== "string" || !args.path.trim()) return { output: "path is required", isError: true };
     const abs = resolveInside(ctx.cwd, String(args.path));
     const content = String(args.content ?? "");
     const exists = fs.existsSync(abs);
@@ -112,9 +147,8 @@ export const writeTool: ToolDef = {
     if (!ok) return { output: "The user rejected the file write.", isError: true };
 
     // Kept before the write, not after: once the bytes are gone they are gone.
-    ctx.snapshot?.({ path: abs, tool: "write", before: exists ? before : null, after: content });
-    await fsp.mkdir(path.dirname(abs), { recursive: true });
-    await fsp.writeFile(abs, content, "utf8");
+    try { await commitFile(ctx, abs, exists ? before : null, content, "write"); }
+    catch (e) { return { output: (e as Error).message, isError: true }; }
     ctx.readFiles.add(abs);
     const lines = content.split("\n").length;
     return {
@@ -145,6 +179,8 @@ export const editTool: ToolDef = {
   },
   summarize: (a) => String(a.path),
   async run(args, ctx) {
+    ctx.signal.throwIfAborted();
+    if (typeof args.path !== "string" || !args.path.trim()) return { output: "path is required", isError: true };
     const abs = resolveInside(ctx.cwd, String(args.path));
     if (!fs.existsSync(abs)) return { output: `File not found: ${args.path}`, isError: true };
     if (!ctx.readFiles.has(abs)) {
@@ -159,7 +195,7 @@ export const editTool: ToolDef = {
 
     // Tolerate the model echoing back CRLF-normalised text.
     const eol = detectLineEnding(before);
-    const needle = before.includes(oldStr) ? oldStr : oldStr.split("\n").join(eol);
+    const needle = before.includes(oldStr) ? oldStr : oldStr.replace(/\r\n|\r|\n/g, eol);
     const count = countOccurrences(before, needle);
     if (count === 0) {
       return {
@@ -174,7 +210,7 @@ export const editTool: ToolDef = {
       };
     }
 
-    const replacement = newStr.split("\n").join(eol);
+    const replacement = newStr.replace(/\r\n|\r|\n/g, eol);
     const after = args.replace_all
       ? before.split(needle).join(replacement)
       : before.replace(needle, () => replacement);
@@ -184,8 +220,8 @@ export const editTool: ToolDef = {
     const seen = ctx.previewShown?.(preview) ?? false;
     if (!ok) return { output: "The user rejected the edit.", isError: true };
 
-    ctx.snapshot?.({ path: abs, tool: "edit", before, after });
-    await fsp.writeFile(abs, after, "utf8");
+    try { await commitFile(ctx, abs, before, after, "edit"); }
+    catch (e) { return { output: (e as Error).message, isError: true }; }
     return {
       output: `Updated ${rel(ctx.cwd, abs)} (${count > 1 ? `${count} replacements` : "1 replacement"}).`,
       display: seen ? undefined : preview,

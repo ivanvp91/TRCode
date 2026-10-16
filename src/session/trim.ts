@@ -61,8 +61,8 @@ function sizeOf(messages: Message[]): number {
   let n = 0;
   for (const m of messages) {
     n += estimateTokens(String(m.content ?? ""));
-    // Base64 is charged at roughly its byte count: ~4 chars per token group.
-    for (const img of m.images ?? []) n += Math.ceil(img.data.length / 4);
+    // Vision uses model-dependent patch/tile tokens, not base64 text tokens.
+    n += (m.images?.length ?? 0) * 2048;
     for (const tc of m.tool_calls ?? []) n += estimateTokens(tc.function.arguments) + 12;
   }
   return n;

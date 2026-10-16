@@ -22,6 +22,8 @@ export interface ModelUsage {
   daily?: Record<string, DayUsage>;
   /** Which session file the row came from — how /stat dates legacy rows. */
   sessionFile?: string;
+  unknownRequests?: number;
+  mediaJobs?: Record<string, { cost?: number; at: number }>;
 }
 
 /** One day's share of a model's usage — what /stat periods filter on. */
@@ -74,7 +76,9 @@ export class UsageTracker {
     const price = catalog.find((m) => m.id === model)?.pricing;
     const cached = usage.cached_tokens ?? 0;
     const freshInput = Math.max(0, usage.prompt_tokens - cached);
-    const cost = price
+    const actual = typeof usage.cost === "number" && Number.isFinite(usage.cost) && usage.cost >= 0;
+    const unknown = !actual && !price;
+    const cost = actual ? usage.cost! : price
       ? (freshInput / 1e6) * price.input +
         (cached / 1e6) * (price.cachedInput ?? price.input) +
         (usage.completion_tokens / 1e6) * price.output
@@ -88,7 +92,7 @@ export class UsageTracker {
       cached: 0,
       reasoning: 0,
       costUsd: 0,
-      priceUnknown: !price,
+      priceUnknown: unknown,
     };
     entry.requests++;
     entry.input += usage.prompt_tokens;
@@ -96,7 +100,8 @@ export class UsageTracker {
     entry.cached += cached;
     entry.reasoning += usage.reasoning_tokens ?? 0;
     entry.costUsd += cost;
-    entry.priceUnknown = entry.priceUnknown || !price;
+    entry.priceUnknown = entry.priceUnknown || unknown;
+    entry.unknownRequests = (entry.unknownRequests ?? (entry.requests > 1 && entry.priceUnknown ? 1 : 0)) + (unknown ? 1 : 0);
     entry.lastUsed = Math.max(entry.lastUsed ?? 0, at);
     const day = ((entry.daily ??= {})[dayKey(at)] ??= {
       requests: 0,
@@ -119,7 +124,7 @@ export class UsageTracker {
       output: usage.completion_tokens,
       reasoning: usage.reasoning_tokens ?? 0,
       costUsd: cost,
-      priceUnknown: !price,
+      priceUnknown: unknown,
     };
 
     this.turn.requests++;
@@ -127,6 +132,26 @@ export class UsageTracker {
     this.turn.cached += cached;
     this.turn.output += usage.completion_tokens;
     this.turn.reasoning += usage.reasoning_tokens ?? 0;
+  }
+
+  /** One bill per durable media job; later provider cost reconciles it. */
+  recordMedia(model: string, cost: number | undefined, jobId: string): void {
+    const valid = typeof cost === "number" && Number.isFinite(cost) && cost >= 0 ? cost : undefined;
+    let entry = this.byModel.get(model);
+    const previous = entry?.mediaJobs?.[jobId];
+    if (!previous) {
+      this.record(model, { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0, cost: valid }, []);
+      entry = this.byModel.get(model)!;
+      (entry.mediaJobs ??= {})[jobId] = { cost: valid, at: Date.now() };
+    } else if (valid !== undefined && previous.cost !== valid) {
+      const delta = valid - (previous.cost ?? 0);
+      entry!.costUsd += delta;
+      const day = entry!.daily?.[dayKey(previous.at)];
+      if (day) day.costUsd += delta;
+      if (previous.cost === undefined) entry!.unknownRequests = Math.max(0, (entry!.unknownRequests ?? 1) - 1);
+      entry!.priceUnknown = (entry!.unknownRequests ?? 0) > 0;
+      previous.cost = valid;
+    }
   }
 
   /** Starts a new per-turn tally. */
@@ -166,6 +191,8 @@ export class UsageTracker {
       entry.reasoning += u.reasoning ?? 0;
       entry.costUsd += u.costUsd;
       entry.priceUnknown = entry.priceUnknown || u.priceUnknown;
+      entry.unknownRequests = (entry.unknownRequests ?? 0) + (u.unknownRequests ?? (u.priceUnknown ? 1 : 0));
+      if (u.mediaJobs) entry.mediaJobs = { ...entry.mediaJobs, ...u.mediaJobs };
       entry.lastUsed = Math.max(entry.lastUsed ?? 0, u.lastUsed ?? 0);
       if (u.daily) {
         const dst = (entry.daily ??= {});
@@ -252,8 +279,8 @@ function trimZeros(s: string): string {
 
 export function fmtCost(usd: number, unknown = false): string {
   if (unknown && usd === 0) return "n/a";
-  if (usd < 0.01) return "$" + usd.toFixed(4);
-  return "$" + usd.toFixed(2);
+  const value = "$" + usd.toFixed(usd < 0.01 ? 4 : 2);
+  return value + (unknown ? " + ?" : "");
 }
 
 /**
@@ -275,6 +302,7 @@ export function historyTokens(messages: Message[]): number {
   let used = 0;
   for (const m of messages) {
     used += estimateTokens(String(m.content ?? ""));
+    used += (m.images?.length ?? 0) * 2048; // vision estimate, never base64 as text tokens
     for (const tc of m.tool_calls ?? []) used += estimateTokens(tc.function.arguments) + 12;
   }
   return used;

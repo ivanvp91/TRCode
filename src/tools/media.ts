@@ -9,10 +9,13 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { modeConfig, modeFor, resolveAuth } from "../provider/registry.js";
 import { mimeForPath } from "./image.js";
 
 export const REQUEST_TIMEOUT_MS = 60_000;
+/** One generation call or result download: models routinely take minutes. */
+export const GENERATE_TIMEOUT_MS = 5 * 60_000;
 /** A reference image goes up as base64 inside the JSON body; keep it sane. */
 const MAX_REFERENCE_BYTES = 10_000_000;
 
@@ -45,6 +48,7 @@ export async function imageDataUrl(src: string, cwd: string): Promise<{ url: str
     return { error: `file not found: ${src}` };
   }
   if (st.size > MAX_REFERENCE_BYTES) return { error: `image too large (${(st.size / 1_048_576).toFixed(1)} MB; limit 10 MB)` };
+  if (!st.isFile()) return { error: `not a file: ${src}` };
   return { url: `data:${mime};base64,${(await fsp.readFile(abs)).toString("base64")}` };
 }
 
@@ -79,9 +83,10 @@ export function withTimeout(outer: AbortSignal, ms: number): AbortSignal {
 }
 
 /** A JSON request whose failure reads as the provider's message. */
-export async function requestJson<T>(url: string, init: RequestInit, signal: AbortSignal, timeoutMs = REQUEST_TIMEOUT_MS): Promise<T> {
-  const res = await fetch(url, { ...init, signal: withTimeout(signal, timeoutMs) });
-  const text = await res.text();
+export async function requestJson<T>(url: string, init: RequestInit, signal: AbortSignal, timeoutMs = REQUEST_TIMEOUT_MS, maxBytes = 8_000_000): Promise<T> {
+  const combined = withTimeout(signal, timeoutMs);
+  const res = await fetch(url, { ...init, signal: combined });
+  const text = (await readBounded(res, maxBytes)).toString("utf8");
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${apiMessage(text)}`);
   try {
     return JSON.parse(text) as T;
@@ -97,7 +102,8 @@ const listings = new Map<string, Promise<unknown[]>>();
  * read once per process and again on demand. A failed read is not cached.
  */
 export function fetchListing<T extends { id: string }>(route: string, refresh = false): Promise<T[]> {
-  let job = listings.get(route);
+  const key = `${openRouterBase()}${route}`;
+  let job = listings.get(key);
   if (!job || refresh) {
     job = fetch(`${openRouterBase()}${route}`, { signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
       .then(async (res) => {
@@ -107,10 +113,10 @@ export function fetchListing<T extends { id: string }>(route: string, refresh = 
         return rows.filter((r) => typeof r?.id === "string");
       })
       .catch((err) => {
-        listings.delete(route);
+        listings.delete(key);
         throw err;
       });
-    listings.set(route, job);
+    listings.set(key, job);
   }
   return job as Promise<T[]>;
 }
@@ -146,13 +152,47 @@ export function findUrl(obj: unknown, depth = 0): string | undefined {
  * `headers` only for links on the API host itself — a pre-signed CDN link
  * must not receive the key.
  */
-export async function downloadTo(url: string, file: string, headers: Record<string, string> | undefined, signal: AbortSignal): Promise<number> {
-  const res = await fetch(url, { headers: headers ?? {}, signal: withTimeout(signal, 5 * 60_000) });
+export async function downloadTo(url: string, file: string, headers: Record<string, string> | undefined, signal: AbortSignal, scratchDir = path.dirname(file)): Promise<number> {
+  const res = await fetch(url, { headers: headers ?? {}, redirect: headers ? "error" : "follow", signal: withTimeout(signal, GENERATE_TIMEOUT_MS) });
   if (!res.ok) throw new Error(`HTTP ${res.status}: ${apiMessage(await res.text())}`);
-  const buf = Buffer.from(await res.arrayBuffer());
   await fsp.mkdir(path.dirname(file), { recursive: true });
-  await fsp.writeFile(file, buf);
-  return buf.length;
+  await fsp.mkdir(scratchDir, { recursive: true });
+  const temp = path.join(scratchDir, `${path.basename(file)}-${randomUUID()}.part`);
+  const handle = await fsp.open(temp, "wx");
+  let size = 0;
+  let prefix = Buffer.alloc(0);
+  try {
+    if (!res.body) throw new Error("Empty download response");
+    for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+      signal.throwIfAborted();
+      size += chunk.length;
+      if (size > 512_000_000) throw new Error("Download exceeds 512 MB");
+      if (prefix.length < 64) prefix = Buffer.concat([prefix, Buffer.from(chunk)]).subarray(0, 64);
+      await handle.writeFile(chunk);
+    }
+    if (/\.mp4$/i.test(file) && (size < 24 || prefix.toString("ascii", 4, 8) !== "ftyp" || prefix.readUInt32BE(0) > size)) {
+      throw new Error("The provider returned invalid MP4 data (possibly an HTML error page)");
+    }
+    if (!size) throw new Error("Empty media download");
+    signal.throwIfAborted();
+    await handle.close();
+    try { await fsp.link(temp, file); }
+    catch (err) { if ((err as NodeJS.ErrnoException).code !== "EXDEV") throw err; await fsp.copyFile(temp, file, fs.constants.COPYFILE_EXCL); }
+    return size;
+  } finally { await handle.close().catch(() => {}); await fsp.unlink(temp).catch(() => {}); }
+}
+
+export async function readBounded(res: Response, max = 100_000_000): Promise<Buffer> {
+  if (Number(res.headers.get("content-length")) > max) { await res.body?.cancel(); throw new Error(`Response exceeds ${max} bytes`); }
+  if (!res.body) throw new Error("Empty response body");
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of res.body as unknown as AsyncIterable<Uint8Array>) {
+    size += chunk.length;
+    if (size > max) throw new Error(`Response exceeds ${max} bytes`);
+    chunks.push(Buffer.from(chunk));
+  }
+  return Buffer.concat(chunks);
 }
 
 export function sleep(ms: number, signal: AbortSignal): Promise<void> {

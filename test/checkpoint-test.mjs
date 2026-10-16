@@ -107,7 +107,7 @@ await editTool.run({ path: file("kept.txt"), old_string: "turn 1", new_string: "
 
   const res = rewindFiles(s2, 1);
   check("a file changed since is flagged", res.diverged.join() === "hand.txt", JSON.stringify(res));
-  check("it is still restored", read("hand.txt") === "before\n", read("hand.txt"));
+  check("the user's later edit is preserved", read("hand.txt") === "by hand\n" && res.restored.length === 0, read("hand.txt"));
   dropStore(WORK, s2.id);
 }
 

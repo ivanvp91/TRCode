@@ -9,19 +9,22 @@
  * tool result.
  *
  * The program runs in its own node process with one I/O channel: the SDK
- * object passed to it at bootstrap. Importing 'node:*' directly would not be
- * blockable reliably, so it is not attempted — the SDK's own guards are what
- * holds: every path resolves inside the project root, shell calls go through
- * the same permission broker as the shell tool, web calls carry the abort
- * signal and the same timeouts.
+ * object defined inside a restricted JavaScript context, without native
+ * imports or inherited environment secrets. The child also uses Node's
+ * filesystem/child-process permissions. SDK operations are checked by the
+ * host: writes use the normal file guard, shell and web use their brokers.
+ * This is defense in depth, not an OS sandbox for hostile programs.
  */
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { loadConfig } from "../config.js";
 import { resolveInside, looksBinary } from "./fsutil.js";
 import { killTree } from "./shell.js";
+import { writeTool } from "./files.js";
+import { shellTool } from "./shell.js";
 import type { ToolContext, ToolDef, ToolResult } from "../types.js";
 
 /** The channel between the host and the running program. */
@@ -39,41 +42,26 @@ interface SdkResponse {
 
 const BOOTSTRAP = `
 let __rpcSeq = 0;
-const __queue = [];
-let __waiter = null;
-process.stdin.setEncoding("utf8");
+const __pending = new Map();
+const __requests = [];
+const __timers = [];
+const setTimeout = (fn, ms = 0, ...args) => { const t = { fn, args, at: Date.now() + Math.max(0, Number(ms) || 0) }; __timers.push(t); return t; };
+const clearTimeout = (t) => { const i = __timers.indexOf(t); if (i >= 0) __timers.splice(i, 1); };
+const __tick = () => { for (const t of [...__timers]) if (Date.now() >= t.at) { clearTimeout(t); t.fn(...t.args); } };
 const __dispatch = (line) => {
   let msg;
   try { msg = JSON.parse(line); } catch { return; }
-  if (msg.type === "res") __queue.push(msg);
-  if (__waiter) { const w = __waiter; __waiter = null; w(); }
+  const waiter = __pending.get(msg.id);
+  if (!waiter) return;
+  __pending.delete(msg.id);
+  if (msg.ok) waiter.resolve(msg.value); else waiter.reject(new Error(msg.error));
 };
-// Line-delimited JSON on stdin; the parent writes one response per line.
-let __acc = "";
-process.stdin.on("data", (chunk) => {
-  __acc += chunk;
-  for (;;) {
-    const i = __acc.indexOf("\\n");
-    if (i === -1) break;
-    const line = __acc.slice(0, i);
-    __acc = __acc.slice(i + 1);
-    __dispatch(line);
-  }
-});
-const __next = () => (__queue.length ? Promise.resolve(__queue.shift()) : new Promise((res) => { __waiter = res; }));
-const __reply = (res) => process.stdout.write(JSON.stringify(res) + "\\n");
+const __reply = (res) => __requests.push(res);
 const __rpc = (call) => async (...args) => {
   const id = ++__rpcSeq;
-  process.stdout.write(JSON.stringify({ type: "req", id, call, args }) + "\\n");
-  for (;;) {
-    const m = await __next();
-    if (!m) continue;
-    if (m.type === "res" && m.id === id) {
-      if (!m.ok) throw new Error(m.error);
-      return m.value;
-    }
-    await new Promise((r) => setTimeout(r, 0));
-  }
+  const result = new Promise((resolve, reject) => __pending.set(id, { resolve, reject }));
+  __requests.push({ type: "req", id, call, args });
+  return await result;
 };
 
 const sdk = {
@@ -89,14 +77,41 @@ const sdk = {
     search: __rpc("web.search"),
   },
 };
+sdk.glob = sdk.fs.glob;
 `;
 
 /** The program body plus a runner that reports the return value back. */
 function buildScript(code: string): string {
-  return `${BOOTSTRAP}\n(async () => {\n${code}\n})().then(
+  const program = `${BOOTSTRAP}\n(async () => {\n${code}\n})().then(
   (v) => { __reply({ type: "done", ok: true, value: v === undefined ? null : v }); },
   (e) => __reply({ type: "done", ok: false, error: String((e && e.message) || e) }),
 );\n`;
+  // The model receives only context-native objects. No host callbacks,
+  // promises, process, require, fetch, or dynamic imports cross this boundary.
+  // Native filesystem/child-process permissions add a second restriction.
+  return `import vm from 'node:vm';
+const context = vm.createContext(Object.create(null), { codeGeneration: { strings: false, wasm: false } });
+const run = (s) => vm.runInContext(s, context, { timeout: 1000 });
+run(${JSON.stringify(program)});
+let acc = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', c => {
+  acc += c;
+  if (acc.length > 2000000) process.exit(1);
+  let i;
+  while ((i = acc.indexOf('\\n')) >= 0) {
+    const line = acc.slice(0, i); acc = acc.slice(i + 1);
+    run('__dispatch(' + JSON.stringify(line) + ')');
+  }
+});
+process.stdin.on('end', () => process.exit(0));
+setInterval(() => {
+  try {
+    const raw = run('__tick(); JSON.stringify(__requests.splice(0))');
+    for (const m of JSON.parse(raw)) process.stdout.write(JSON.stringify(m) + '\\n');
+  } catch (e) { process.stderr.write(String(e)); process.exit(1); }
+}, 5);
+`;
 }
 
 export interface RunCodeDeps {
@@ -125,15 +140,19 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
 
   try {
     return await new Promise((resolve) => {
-    const child = spawn(process.execPath, ["--no-warnings", scriptPath], {
+    const scope = new AbortController();
+    const scopedCtx = { ...ctx, signal: AbortSignal.any([ctx.signal, scope.signal]) };
+    const active = new Set<Promise<unknown>>();
+    ctx.signal.throwIfAborted();
+    const permissionFlag = process.allowedNodeEnvironmentFlags.has("--permission") ? "--permission" : "--experimental-permission";
+    const child = spawn(process.execPath, ["--no-warnings", permissionFlag, `--allow-fs-read=${scriptPath}`, scriptPath], {
       cwd: ctx.cwd,
-      env: { ...process.env, TRCODE_CODEMODE: "1" },
+      env: { SystemRoot: process.env.SystemRoot, WINDIR: process.env.WINDIR, TRCODE_CODEMODE: "1" },
       windowsHide: true,
       detached: process.platform !== "win32",
       stdio: ["pipe", "pipe", "pipe"],
     });
 
-    const pending = new Map<number, (res: SdkResponse) => void>();
     let acc = "";
     let settled = false;
     let killedReason = "";
@@ -143,7 +162,17 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
       settled = true;
       clearTimeout(ceiling);
       ctx.signal.removeEventListener("abort", onAbort);
-      resolve({ ok, output });
+      scope.abort();
+      child.stdin.end();
+      killTree(child);
+      // Wait for SDK work to observe cancellation and for the process to exit.
+      const closed = child.exitCode !== null ? Promise.resolve() : new Promise<void>((r) => {
+        const timer = setTimeout(r, 2000);
+        child.once("close", () => { clearTimeout(timer); r(); });
+      });
+      const tasks = Promise.allSettled([...active, closed]);
+      const grace = setTimeout(() => resolve({ ok, output }), 2500);
+      void tasks.then(() => { clearTimeout(grace); resolve({ ok, output }); });
     };
 
     const handleLine = (line: string) => {
@@ -155,9 +184,12 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
         return;
       }
       if (msg.type === "req") {
-        void serveSdk(msg as SdkRequest, ctx, deps)
+        if (settled || ctx.signal.aborted) return;
+        const request = serveSdk(msg as SdkRequest, scopedCtx, deps)
           .then((value) => reply({ id: msg.id, ok: true, value }))
           .catch((err) => reply({ id: msg.id, ok: false, error: String((err as Error)?.message ?? err) }));
+        active.add(request);
+        void request.finally(() => active.delete(request));
         return;
       }
       if (msg.type === "done") {
@@ -176,12 +208,13 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
     };
 
     const reply = (res: SdkResponse) => {
-      if (!child.stdin.destroyed) child.stdin.write(JSON.stringify({ type: "res", ...res }) + "\n");
+      if (!settled && !child.stdin.destroyed && !child.stdin.writableEnded) child.stdin.write(JSON.stringify({ type: "res", ...res }) + "\n");
     };
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (c: string) => {
       acc += c;
+      if (acc.length > 2_000_000) return done(false, "Program output exceeded 2 MB.");
       for (;;) {
         const i = acc.indexOf("\n");
         if (i === -1) break;
@@ -190,10 +223,11 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
       }
     });
     child.stderr.setEncoding("utf8");
+    child.stdin.on("error", (err) => done(false, `SDK channel closed: ${err.message}`));
     child.stderr.on("data", (c: string) => {
       // Syntax errors land here before any of our handlers can answer; keep
       // the tail, it is where the message sits.
-      stderrTail += c;
+      stderrTail = (stderrTail + c).slice(-8000);
     });
     let stderrTail = "";
 
@@ -208,6 +242,7 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
       done(false, "[interrupted by the user]");
     };
     ctx.signal.addEventListener("abort", onAbort, { once: true });
+    if (ctx.signal.aborted) onAbort();
 
     child.on("error", (err) => done(false, `Could not start node: ${err.message}`));
     child.on("close", () => {
@@ -220,30 +255,27 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
     });
 
     async function serveSdk(msg: SdkRequest, c: ToolContext, d: RunCodeDeps): Promise<unknown> {
+      c.signal.throwIfAborted();
       switch (msg.call) {
         case "fs.read": {
           const p = resolveInside(c.cwd, String(msg.args[0] ?? ""));
-          const buf = fs.readFileSync(p);
+          const st = await fsp.stat(p);
+          if (!st.isFile() || st.size > 400_000) throw new Error("SDK read requires a text file of at most 400 KB; use a targeted shell/read operation for larger files.");
+          const buf = await fsp.readFile(p);
           if (looksBinary(buf)) return `[binary file, ${buf.length} bytes — skipped by the SDK]`;
           const text = buf.toString("utf8");
+          c.signal.throwIfAborted();
+          c.readFiles.add(p);
           const cap = Number(msg.args[1] ?? 200_000);
           return text.length > cap ? text.slice(0, cap) + `\n… [${text.length - cap} more characters]` : text;
         }
         case "fs.write": {
           const p = resolveInside(c.cwd, String(msg.args[0] ?? ""));
           const body = String(msg.args[1] ?? "");
-          const existed = fs.existsSync(p);
           // Writes go through the snapshot the way writeTool does, so /rewind
           // still reaches into what a program changed.
-          if (c.snapshot) {
-            const before = existed ? fs.readFileSync(p, "utf8") : null;
-            fs.mkdirSync(path.dirname(p), { recursive: true });
-            fs.writeFileSync(p, body);
-            c.snapshot({ path: p, tool: "run_code", before, after: body });
-          } else {
-            fs.mkdirSync(path.dirname(p), { recursive: true });
-            fs.writeFileSync(p, body);
-          }
+          const result = await writeTool.run({ path: p, content: body }, c);
+          if (result.isError) throw new Error(result.output);
           return path.relative(c.cwd, p);
         }
         case "fs.list": {
@@ -272,6 +304,7 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
           const command = String(msg.args[0] ?? "");
           const ok = await d.confirmShell(command);
           if (!ok) throw new Error("The user rejected the command.");
+          c.signal.throwIfAborted();
           return await runShellCapture(command, c);
         }
         case "web.fetch": {
@@ -279,7 +312,8 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
           if (!/^https?:\/\//i.test(url)) throw new Error(`Not an http(s) URL: ${url}`);
           const ok = await d.confirmWeb("fetch", url);
           if (!ok) throw new Error("The user rejected the fetch.");
-          const res = await fetch(url, { headers: { "User-Agent": "trcode-codemode/1", Accept: "*/*" }, redirect: "follow" });
+          c.signal.throwIfAborted();
+          const res = await fetch(url, { headers: { "User-Agent": "trcode-codemode/1", Accept: "*/*" }, redirect: "follow", signal: AbortSignal.any([c.signal, AbortSignal.timeout(60_000)]) });
           if (!res.ok) throw new Error(`HTTP ${res.status} from ${url}`);
           const text = await res.text();
           return text.length > 300_000 ? text.slice(0, 300_000) + "\n… [cut]" : text;
@@ -290,6 +324,7 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
           if (!ok) throw new Error("The user rejected the search.");
           const res = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(query)}`, {
             headers: { "User-Agent": "Mozilla/5.0 (compatible; trcode)", Accept: "text/html" },
+            signal: AbortSignal.any([c.signal, AbortSignal.timeout(60_000)]),
           });
           if (!res.ok) throw new Error(`Search failed: HTTP ${res.status}`);
           const { parseDuckDuckGo } = await import("./web.js");
@@ -301,37 +336,8 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
     }
 
     async function runShellCapture(command: string, c: ToolContext): Promise<string> {
-      // Same launcher rules as the shell tool, minus the live tail: the
-      // program consumes the output itself.
-      const cfg = loadConfig();
-      const mode = cfg.shell === "auto" ? (process.platform === "win32" ? "powershell" : "bash") : cfg.shell;
-      const [cmd, mkArgs]: [string, (s: string) => string[]] =
-        mode === "powershell"
-          ? ["powershell.exe", (s) => ["-NoProfile", "-NonInteractive", "-Command", s]]
-          : mode === "cmd"
-            ? ["cmd.exe", (s) => ["/d", "/s", "/c", s]]
-            : ["bash", (s) => ["-c", s]];
-      return await new Promise((resolve) => {
-        const sh = spawn(cmd, mkArgs(command), {
-          cwd: c.cwd,
-          env: { ...process.env, TRCODE: "1", NO_COLOR: "1", GIT_PAGER: "cat", PAGER: "cat" },
-          windowsHide: true,
-          detached: process.platform !== "win32",
-          stdio: ["ignore", "pipe", "pipe"],
-        });
-        let out = "";
-        let err = "";
-        sh.stdout.setEncoding("utf8");
-        sh.stderr.setEncoding("utf8");
-        const push = (s: string) => {
-          out += s;
-          if (out.length > 300_000) out = out.slice(0, 300_000) + "\n… [output cut]";
-        };
-        sh.stdout.on("data", push);
-        sh.stderr.on("data", (x: string) => (err += x));
-        sh.on("error", (e) => resolve(`Could not start the shell: ${e.message}`));
-        sh.on("close", (code) => resolve(`exit=${code ?? "killed"}\n${out}${err ? `\n[stderr]\n${err}` : ""}`));
-      });
+      const result = await shellTool.run({ command }, { ...c, confirm: async () => true });
+      return result.output;
     }
     });
   } finally {
@@ -344,7 +350,7 @@ async function runProgram(code: string, ctx: ToolContext, deps: RunCodeDeps): Pr
 }
 
 export function makeRunCodeTool(deps: RunCodeDeps): ToolDef {
-  return {
+  const tool: ToolDef = {
     name: "run_code",
     risk: "agent",
     spillBias: "head",
@@ -355,6 +361,7 @@ export function makeRunCodeTool(deps: RunCodeDeps): ToolDef {
       "SDK available in scope: sdk.fs.read(path, maxChars?), sdk.fs.write(path, text), sdk.fs.list(dir), sdk.glob(pattern), " +
       "sdk.shell(command), sdk.web.fetch(url), sdk.web.search(query) — all async; paths are relative to the working directory " +
       "and cannot leave it; shell and web calls ask the user for permission like their dedicated tools do. " +
+      "Only the SDK and standard JavaScript are available: no native imports, process, require, or global fetch. " +
       "Write a plain program ending in `return {...}` — collect data with loops, return the summary, not the dumps.",
     parameters: {
       type: "object",
@@ -371,11 +378,14 @@ export function makeRunCodeTool(deps: RunCodeDeps): ToolDef {
     async run(args, ctx): Promise<ToolResult> {
       const code = String(args.code ?? "").trim();
       if (!code) return { output: "Empty program.", isError: true };
+      if (!(await ctx.confirm(tool, args))) return { output: "User rejected the program.", isError: true };
+      ctx.signal.throwIfAborted();
 
       const res = await runProgram(code, ctx, deps);
       return { output: res.output, isError: !res.ok };
     },
   };
+  return tool;
 }
 
 /** Kept for tests that want the runner without the tool wrapper. */

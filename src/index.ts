@@ -14,7 +14,7 @@ import {
   EFFORT_LEVELS,
   type Effort,
 } from "./config.js";
-import { fetchModels, groupByModality, groupByVendor, resolveModelId } from "./provider/models.js";
+import { fetchModels, groupByModality, groupByVendor, resolveModelId, usableModels } from "./provider/models.js";
 import { fmtTokens } from "./usage.js";
 import { verifyKey, verifyProvider } from "./provider/client.js";
 import { askSecret } from "./ui/secret.js";
@@ -32,6 +32,7 @@ import {
 } from "./provider/registry.js";
 import { clearCredentials, importVendorCredentials, readCredentials } from "./provider/credentials.js";
 import { latestRelease, isNewer, applyUpdate, refreshCache } from "./update.js";
+import { sweepMediaTmp } from "./tools/mediaworkspace.js";
 
 interface Args {
   prompt?: string;
@@ -327,16 +328,21 @@ async function cmdAuth(rest: string[]): Promise<number> {
 async function cmdModels(): Promise<number> {
   const cfg = loadConfig();
   const catalog = await fetchModels({ force: true });
+  if (!catalog.length) {
+    error("No models available — check your connection and keys (trc auth status).");
+    return 1;
+  }
+  const models = usableModels(catalog);
   // Names without the routing prefix; which host serves one is its own column.
   const bare = (id: string) => splitModelId(id).model;
   const hosts = [...new Set(catalog.map((m) => splitModelId(m.id).providerId))].sort((a, b) =>
     providerLabel(a).localeCompare(providerLabel(b)),
   );
-  const width = Math.min(38, Math.max(12, ...catalog.map((m) => bare(m.id).length + 1)));
+  const width = Math.min(38, Math.max(12, ...models.map((m) => bare(m.id).length + 1)));
   // Grouped the way the catalog tags them — [Text], [Images], [Video],
   // [Audio] — and by vendor inside each, so a flat 125-line dump becomes a
   // list you can find something in.
-  for (const type of groupByModality(catalog)) {
+  for (const type of groupByModality(models)) {
     line();
     line(`  ${c.bold(c.brightYellow(`[${type.label}]`))} ${c.gray(String(type.models.length))}`);
     for (const group of groupByVendor(type.models)) {
@@ -353,7 +359,7 @@ async function cmdModels(): Promise<number> {
   }
   line();
   info(
-    `Models: ${catalog.length} · ${groupByModality(catalog)
+    `Models: ${models.length} · ${groupByModality(models)
       .map((g) => `${g.label}: ${g.models.length}`)
       .join(" · ")} · current default: ${cfg.model}`,
   );
@@ -545,6 +551,8 @@ async function main(): Promise<void> {
     return finish(1);
   }
   args.cwd = process.cwd();
+  // Media scratch folders under .tmp/ go away with the process, however it ends.
+  process.once("exit", sweepMediaTmp);
 
   if (args.headless || (!process.stdin.isTTY && args.prompt)) {
     return finish(await headless(args));

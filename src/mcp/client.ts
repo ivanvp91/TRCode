@@ -14,6 +14,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import { loadConfig, VERSION } from "../config.js";
 import type { McpServerConfig, ToolDef, ToolResult } from "../types.js";
 
@@ -21,6 +22,7 @@ export interface McpToolInfo {
   name: string;
   description?: string;
   inputSchema?: Record<string, unknown>;
+  annotations?: { readOnlyHint?: boolean; destructiveHint?: boolean };
 }
 
 export type McpState = "starting" | "ready" | "failed" | "stopped";
@@ -264,15 +266,19 @@ export function mcpPendingCount(): number {
  * worth holding the turn for. Resolves immediately when nothing is pending,
  * which is every turn after the first.
  */
-export function mcpSettled(timeoutMs = 15_000): Promise<void> {
-  if (!pending.size) return Promise.resolve();
-  return Promise.race([
-    Promise.allSettled([...pending]).then(() => undefined),
-    new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, timeoutMs);
-      if (typeof t.unref === "function") t.unref();
-    }),
-  ]);
+export function mcpSettled(timeoutMs = 15_000, signal?: AbortSignal): Promise<void> {
+  if (!pending.size || signal?.aborted) return Promise.resolve();
+  return new Promise<void>((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", done);
+      resolve();
+    };
+    const timer = setTimeout(done, timeoutMs);
+    timer.unref?.();
+    signal?.addEventListener("abort", done, { once: true });
+    void Promise.allSettled([...pending]).then(done);
+  });
 }
 
 export function connectMcpServers(cwd: string, onSettled: (client: McpClient) => void): void {
@@ -318,10 +324,10 @@ function sanitize(s: string): string {
 
 function toToolDef(client: McpClient, t: McpToolInfo): ToolDef {
   const def: ToolDef = {
-    name: `mcp__${sanitize(client.id)}__${sanitize(t.name)}`.slice(0, 64),
+    name: mcpName(client.id, t.name),
     description: String(t.description ?? "").trim() || `${t.name} on the "${client.id}" MCP server`,
     parameters: (t.inputSchema as Record<string, unknown>) ?? { type: "object", properties: {} },
-    risk: "network",
+    risk: t.annotations?.readOnlyHint === true && t.annotations?.destructiveHint !== true ? "network" : "write",
     summarize: (args) => {
       const s = JSON.stringify(args ?? {});
       return s === "{}" ? client.id : s.length > 60 ? s.slice(0, 59) + "…" : s;
@@ -329,10 +335,18 @@ function toToolDef(client: McpClient, t: McpToolInfo): ToolDef {
     async run(args, ctx) {
       const ok = await ctx.confirm(def, args);
       if (!ok) return { output: "The user rejected the call.", isError: true };
+      ctx.signal.throwIfAborted();
       return client.callTool(t.name, args, ctx.signal);
     },
   };
   return def;
+}
+
+function mcpName(server: string, tool: string): string {
+  const name = `mcp__${sanitize(server)}__${sanitize(tool)}`;
+  if (name.length <= 64 && sanitize(server) === server && sanitize(tool) === tool) return name;
+  const hash = createHash("sha256").update(JSON.stringify([server, tool])).digest("hex").slice(0, 12);
+  return `${name.slice(0, 51)}_${hash}`;
 }
 
 /** True when Windows can start it without a shell: a real executable, not a .cmd shim. */

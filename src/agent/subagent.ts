@@ -9,15 +9,12 @@
  */
 import { c } from "../ui/ansi.js";
 import { padded, truncate } from "../ui/render.js";
-import { buildSystemPrompt } from "./prompt.js";
-import { forkSpillStore } from "../tools/spill.js";
-import { runAgent, stepCeiling } from "./loop.js";
+import { runWorker, taskModels, resolveWorkerModel } from "./worker.js";
+export { subagentMode } from "./worker.js";
 import { ApiError } from "../provider/client.js";
 import { UsageTracker, fmtTokens } from "../usage.js";
-import { loadConfig, type Effort } from "../config.js";
-import { splitModelId } from "../provider/registry.js";
-import { pickSkill, skillInjection, skillInterjector } from "../skills/match.js";
-import type { Message, ModelInfo, ToolDef } from "../types.js";
+import type { Effort } from "../config.js";
+import type { ModelInfo, ToolDef } from "../types.js";
 import type { Skill } from "../skills/loader.js";
 
 /**
@@ -34,6 +31,7 @@ export interface SubagentActivity {
 export interface SubagentDeps {
   cwd: string;
   catalog: ModelInfo[];
+  catalogNow?: () => ModelInfo[];
   skills: Skill[];
   /** Tools available to subagents (task is filtered out internally). */
   tools: () => ToolDef[];
@@ -44,54 +42,16 @@ export interface SubagentDeps {
   /** Parent tracker; subagent usage is folded in when it finishes. */
   usage: UsageTracker;
   activity?: SubagentActivity;
+  /** Serialized turn-level approval and model setup, supplied by the REPL. */
+  authorize?: () => Promise<boolean>;
 }
 
 let counter = 0;
 
-/**
- * Which models subagents may run on for this provider. The saved list is kept
- * either way: switching back to it costs a keystroke rather than re-picking
- * every model. An unset mode is read from the list, so configs written before
- * the choice existed behave exactly as they did.
- */
-export function subagentMode(providerId: string): "session" | "list" {
-  const cfg = loadConfig();
-  const saved = cfg.subagentMode?.[providerId];
-  if (saved === "session" || saved === "list") return saved;
-  return (cfg.subagentModels?.[providerId] ?? []).length ? "list" : "session";
-}
-
 export function makeTaskTool(deps: SubagentDeps): ToolDef {
-  const home = splitModelId(deps.defaultModel).providerId;
-  // What cannot serve a chat turn has no business in the offer, and a subagent
-  // is paid for by the key the session is using — so its own provider only.
-  const runnable = deps.catalog.filter(
-    (m) =>
-      m.chatCapable !== false &&
-      (m.modality ?? "text") === "text" &&
-      splitModelId(m.id).providerId === home,
-  );
-  // A shortlist, when one was chosen and switched on: /subagents narrows the
-  // offer to the models you are willing to run several of at once. Anything on
-  // the list that this provider no longer serves is dropped rather than
-  // offered, and in "session" mode the list is kept but not used.
-  const pool = subagentMode(home) === "list" ? loadConfig().subagentModels?.[home] ?? [] : [];
-  const shortlist = pool.length ? runnable.filter((m) => pool.includes(m.id)) : [];
-  // The allowlist: a chosen shortlist, else only the session's own model. Left
-  // open, the offer's "use a cheap one for mechanical work" sent real
-  // reconnaissance to the cheapest id in a reseller's catalogue — hundreds of
-  // requests and megabytes of input on a model nobody chose for this.
-  const allowed = shortlist.length ? new Set(shortlist.map((m) => m.id)) : new Set([deps.defaultModel]);
-  // The enum rides in the tool schema of every request, so it stays as small as
-  // the allowlist; anything else this provider serves is still accepted by name
-  // below, because the check reads the full runnable list.
-  const MAX_OFFERED = 24;
-  const offered = (shortlist.length ? shortlist : runnable.filter((m) => m.id === deps.defaultModel)).slice(
-    0,
-    MAX_OFFERED,
-  );
+  const allowed = taskModels(deps.catalog, deps.defaultModel);
+  const offered = allowed.slice(0, 24);
   const modelIds = offered.map((m) => m.id);
-  const runnableIds = new Set(runnable.map((m) => m.id));
 
   return {
     name: "task",
@@ -114,7 +74,7 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
         model: {
           type: "string",
           description:
-            "Model for the subagent, from this provider only. Defaults to the current one; other models are available only when the user allows them via /subagents. Omit unless told otherwise.",
+            "Model for the subagent, from this provider only. Defaults to the configured helper model, or the session's model in session mode. Omit unless told otherwise.",
           enum: modelIds.length ? modelIds : undefined,
         },
         read_only: {
@@ -127,30 +87,26 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
     summarize: (a) => String(a.description ?? "subagent"),
 
     async run(args, ctx) {
+      if (deps.authorize && !await deps.authorize()) {
+        return { output: "Subagents were not approved or models were not selected for this turn. Continue the work yourself; do not request another subagent in this turn.", isError: true };
+      }
+      if (ctx.signal.aborted) return { output: "Subagent launch interrupted.", isError: true };
       const id = ++counter;
       const label = String(args.description ?? `task ${id}`);
       const readOnly = Boolean(args.read_only);
-      // An enum is a suggestion to a model, not a constraint: asked for a
-      // model that cannot serve a chat turn, run the parent's rather than
-      // failing the subtask on the first request. The same gate enforces the
-      // /subagents allowlist: outside it, the session's own model is what runs,
-      // whatever the caller asked for.
-      const asked = String(args.model || deps.defaultModel);
-      const model = !args.model || (runnableIds.has(asked) && allowed.has(asked)) ? asked : deps.defaultModel;
+      // Approval may have opened the model picker since this schema was built.
+      const catalog = deps.catalogNow?.() ?? deps.catalog;
+      const current = taskModels(catalog, deps.defaultModel);
+      const dflt = current[0]?.id ?? deps.defaultModel;
+      const asked = String(args.model || dflt);
+      const model = resolveWorkerModel(current, asked, dflt);
       if (model !== asked) {
         padded(
           `  ${c.gray(
-            runnableIds.has(asked)
-              ? `[${id}] ${asked} is not in the /subagents list — using ${model}`
-              : `[${id}] ${asked} cannot run a subagent — using ${model}`,
+            `[${id}] ${asked} is not in the /subagents list — using ${model}`,
           )}`,
         );
       }
-
-      const available = deps
-        .tools()
-        .filter((t) => t.name !== "task")
-        .filter((t) => (readOnly ? t.risk === "read" : true));
 
       const usage = new UsageTracker();
       const tag = `  ${c.brightBlue(`├ [${id}]`)}`;
@@ -164,69 +120,29 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
       const started = Date.now();
       act?.begin();
 
-      // A subagent is given no catalogue, so the `skill` tool is the only way
-      // it could ask for a procedure — and it has no idea one exists. Matching
-      // its brief the way a request is matched costs nothing when nothing
-      // fits, and is the only path a procedure has into delegated work.
-      const cfg = loadConfig();
-      const autoSkills = cfg.skillsEnabled && cfg.skillAuto !== false ? deps.skills : [];
-      const loadedHere = new Set<string>();
       const brief = String(args.prompt ?? "");
-      const messages: Message[] = [{ role: "user", content: brief }];
-      const opening = pickSkill(autoSkills, brief);
-      if (opening) {
-        loadedHere.add(opening.skill.name);
-        messages.push({ role: "user", content: skillInjection(opening.skill) });
-        step(`skill ${opening.skill.name}`);
-      }
 
       try {
-        const result = await runAgent({
+        const result = await runWorker({
           model,
-          systemPrompt: buildSystemPrompt({
-            cwd: deps.cwd,
-            model,
-            // The skill catalogue is a lead-agent concern; a subagent pays its
-            // own per-request price and gets nothing out of the list.
-            skills: [],
-            subagent: true,
-          }),
-          messages,
-          tools: available,
-          toolContext: {
-            ...ctx,
-            depth: ctx.depth + 1,
-            // Same artifact directory, its own record of repeats: this agent
-            // cannot scroll up to the lead's transcript.
-            spill: forkSpillStore(ctx.spill),
-            // Subagents share the read-guard set so edits stay coherent.
-            emit: (l: string) => step(truncate(l, 90)),
-          },
-          catalog: deps.catalog,
+          prompt: brief,
+          context: ctx,
+          tools: deps.tools(),
+          readOnly,
+          skills: deps.skills,
+          catalog,
           usage,
-          maxSteps: stepCeiling(deps.maxSteps, 40),
-          signal: ctx.signal,
+          maxSteps: deps.maxSteps,
+          ceiling: 40,
           effort: deps.effortFor(model),
-          toolConcurrency: Math.min(3, cfg.toolConcurrency),
-          // One mid-turn load per subagent: it works on one assignment, so a
-          // second change of subject is the lead agent's problem, not its own.
-          interject: skillInterjector(autoSkills, {
-            loaded: loadedHere,
-            max: 1,
-            onLoad: (skill) => step(`skill ${skill.name}`),
-          }),
-          events: {
-            onToolStart: (tool, targs) => {
-              step(`${tool.name} ${truncate(tool.summarize?.(targs) ?? "", 70)}`);
-            },
-          },
+          activity: step,
         });
 
         deps.usage.absorb(usage);
         const t = usage.totals();
         const secs = ((Date.now() - started) / 1000).toFixed(0);
         padded(
-          `${tag} ${c.green("done")} ${c.gray(
+          `${tag} ${result.stoppedBecause === "stop" ? c.green("done") : c.yellow(result.stoppedBecause)} ${c.gray(
             `${secs}s · ${result.steps} steps · ${fmtTokens(t.input + t.output)} tokens`,
           )}`,
         );

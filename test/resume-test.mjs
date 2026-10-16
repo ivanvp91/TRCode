@@ -129,7 +129,7 @@ const { big, small } = seed();
 
 /** An App with just the fields /resume touches — no network, no tools. */
 function makeApp() {
-  const app = Object.create(App.prototype);
+  const app = new App({ cwd: CWD, model: "moonshotai/kimi-k3" });
   Object.assign(app, {
     cwd: CWD,
     cfg: { model: "moonshotai/kimi-k3" },

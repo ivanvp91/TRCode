@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import { loadConfig } from "../config.js";
 import { fmtDuration } from "../ui/layout.js";
 import { recordChanges, watchTargets } from "./shellsnap.js";
+import { resolveInside } from "./fsutil.js";
 import type { ToolDef, ToolResult } from "../types.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -171,6 +172,7 @@ export const shellTool: ToolDef = {
   // produced the output.
   summarize: (a) => String(a.command || a.description),
   async run(args, ctx) {
+    ctx.signal.throwIfAborted();
     const command = String(args.command ?? "").trim();
     if (!command) return { output: "Empty command.", isError: true };
 
@@ -182,15 +184,17 @@ export const shellTool: ToolDef = {
 
     const ok = await ctx.confirm(shellTool, args, command);
     if (!ok) return { output: "The user rejected the command.", isError: true };
+    ctx.signal.throwIfAborted();
 
     // Read as "how long it may stay silent", not "how long it may run".
     const timeout = Math.min(Number(args.timeout_ms ?? DEFAULT_TIMEOUT_MS), HARD_LIMIT_MS);
     const { cmd, args: mkArgs } = launcher();
-    const cwd = args.cwd ? `${ctx.cwd}/${String(args.cwd)}` : ctx.cwd;
+    const cwd = args.cwd ? resolveInside(ctx.cwd, String(args.cwd)) : ctx.cwd;
 
     // What the command names, read before it runs: the only part of a shell
     // edit /rewind can put back. See tools/shellsnap.ts for what this misses.
     const watched = ctx.snapshot ? await watchTargets(command, cwd) : [];
+    ctx.signal.throwIfAborted();
 
     const result = await new Promise<ToolResult>((resolve) => {
       const child = spawn(cmd, mkArgs(command), {

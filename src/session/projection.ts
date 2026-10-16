@@ -91,16 +91,16 @@ export function systemPromptSize(systemPrompt: string): number {
 /** Tool schemas cost roughly what their JSON costs, plus call overhead per tool. */
 export function toolSchemaSize(tools: ToolDef[]): number {
   let n = 0;
-  for (const t of tools) n += estimateTokens(JSON.stringify(t.parameters ?? {})) + 12;
+  for (const t of tools) n += estimateTokens(JSON.stringify({ name: t.name, description: t.description, parameters: t.parameters ?? {} })) + 12;
   return n;
 }
 
-/** Wire history size after trim, images included at their base64 weight. */
+/** Wire history size after trim, including an approximate vision allowance. */
 export function historyWireSize(messages: Message[]): number {
   let n = 0;
   for (const m of messages) {
     n += estimateTokens(String(m.content ?? ""));
-    for (const img of m.images ?? []) n += Math.ceil(img.data.length / 4);
+    n += (m.images?.length ?? 0) * 2048;
     for (const tc of m.tool_calls ?? []) n += estimateTokens(tc.function.arguments) + 12;
   }
   return n;

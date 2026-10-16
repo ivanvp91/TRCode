@@ -5,7 +5,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 
-export const VERSION = "0.1.7";
+export const VERSION = "0.1.8";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";
@@ -71,10 +71,11 @@ export interface Config {
    * before the choice existed keeps behaving the way it did.
    */
   subagentMode: Record<string, "session" | "list">;
+  /** Per provider: let the lead launch helpers without a per-turn approval. */
+  subagentAuto: Record<string, boolean>;
   /**
-   * Models a subagent may be launched on, per provider. Empty means the model
-   * chooses from everything the provider serves, which is the default; a list
-   * narrows it to what you are willing to pay for in parallel.
+   * Models a subagent may be launched on, per provider. A list restricts helper
+   * launches to those models; session mode uses the lead's current model.
    */
   subagentModels: Record<string, string[]>;
   /**
@@ -154,6 +155,7 @@ export interface Config {
     shell: PermissionMode;
     network: PermissionMode;
     agent: PermissionMode;
+    paidMedia?: PermissionMode;
   };
   /**
    * Extra key sequences that insert a newline instead of sending. Only needed
@@ -335,6 +337,7 @@ const DEFAULTS: Config = {
   promptModels: {},
   subagentModels: {},
   subagentMode: {},
+  subagentAuto: {},
   brainModels: [],
   brainMainModel: "",
   swarmModels: [],
@@ -376,7 +379,7 @@ const DEFAULTS: Config = {
   effortForm: {},
   providerState: {},
   projectState: {},
-  permissions: { read: "allow", write: "ask", shell: "ask", network: "ask", agent: "allow" },
+  permissions: { read: "allow", write: "ask", shell: "ask", network: "ask", agent: "allow", paidMedia: "ask" },
   newlineKeys: [],
   shell: "auto",
   // Not a response deadline — a dead-connection guard: it only fires after
@@ -479,6 +482,7 @@ export function loadConfig(): Config {
     promptModels: { ...DEFAULTS.promptModels, ...(file.promptModels || {}) },
     subagentModels: { ...DEFAULTS.subagentModels, ...(file.subagentModels || {}) },
     subagentMode: { ...DEFAULTS.subagentMode, ...(file.subagentMode || {}) },
+    subagentAuto: { ...DEFAULTS.subagentAuto, ...(file.subagentAuto || {}) },
     modelPrompts: { ...DEFAULTS.modelPrompts, ...(file.modelPrompts || {}) },
     providerState: { ...DEFAULTS.providerState, ...(file.providerState || {}) },
     projectState: { ...DEFAULTS.projectState, ...(file.projectState || {}) },
@@ -537,6 +541,7 @@ export function saveConfig(patch: Partial<Config>, opts: { replace?: (keyof Conf
     promptModels: merge("promptModels", current.promptModels, patch.promptModels),
     subagentModels: merge("subagentModels", current.subagentModels, patch.subagentModels),
     subagentMode: merge("subagentMode", current.subagentMode, patch.subagentMode),
+    subagentAuto: merge("subagentAuto", current.subagentAuto, patch.subagentAuto),
     modelPrompts: merge("modelPrompts", current.modelPrompts, patch.modelPrompts),
     providerState: merge("providerState", current.providerState, patch.providerState),
     projectState: merge("projectState", current.projectState, patch.projectState),

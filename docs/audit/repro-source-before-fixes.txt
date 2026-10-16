@@ -1,0 +1,219 @@
+/** Read-only product audit: exercises bugs on owned temp files and local mocks.
+ * Run after npm run build: node scripts/audit-repro.mjs
+ * REPRODUCED means the defect exists, not that the product passed a regression.
+ */
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import http from 'node:http';
+import crypto from 'node:crypto';
+import childProcess from 'node:child_process';
+import { syncBuiltinESMExports } from 'node:module';
+const ownedChildren = [];
+const realSpawn = childProcess.spawn;
+childProcess.spawn = (...args) => { const child = realSpawn(...args); ownedChildren.push(child); return child; };
+syncBuiltinESMExports();
+const work = fs.mkdtempSync(path.join(os.tmpdir(), 'trcode-audit-'));
+const project = path.join(work, 'project');
+fs.mkdirSync(project);
+process.env.TRCODE_HOME = path.join(work, 'home');
+process.env.HOME = work;
+process.env.USERPROFILE = work;
+for (const key of ['TOKENROUTER_API_KEY', 'TR_API_KEY', 'TOKENROUTER_BASE_URL']) delete process.env[key];
+const config = await import('../dist/config.js');
+const { writeCredentials } = await import('../dist/provider/credentials.js');
+const { __runProgramForTests: runProgram, makeRunCodeTool } = await import('../dist/tools/codemode.js');
+const { readImageTool } = await import('../dist/tools/image.js');
+const { editTool, writeTool } = await import('../dist/tools/files.js');
+const { sniffAudio, collectAudio } = await import('../dist/tools/audiogen.js');
+const { makeGenerateImageTool } = await import('../dist/tools/imagegen.js');
+const { makeGenerateVideoTool } = await import('../dist/tools/video.js');
+const { resolveInside } = await import('../dist/tools/fsutil.js');
+const { markTurn, recordWrite, rewindFiles } = await import('../dist/session/checkpoint.js');
+const { PermissionBroker } = await import('../dist/ui/permissions.js');
+const { runAgent } = await import('../dist/agent/loop.js');
+const { UsageTracker } = await import('../dist/usage.js');
+const { App } = await import('../dist/ui/repl.js');
+const results = [];
+function record(id, reproduced, detail) { results.push({ id, reproduced: Boolean(reproduced), detail }); }
+const ctx = (extra = {}) => ({ cwd: project, signal: new AbortController().signal,
+  depth: 0, confirm: async () => true, emit: () => {}, readFiles: new Set(), ...extra });
+const deps = { confirmShell: async () => false, confirmWeb: async () => false };
+const requests = [];
+const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jD1sAAAAASUVORK5CYII=', 'base64');
+let base;
+let pollFails = false;
+const server = http.createServer((req, res) => {
+  let raw = '';
+  req.on('data', c => raw += c);
+  req.on('end', () => {
+    requests.push({ route: req.url, body: raw ? JSON.parse(raw) : null });
+    const json = (code, obj) => { res.writeHead(code, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+    if (req.url === '/v1/chat/completions') {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const calls = Array.from({ length: 5 }, (_, i) => ({ index: i, id: `owned-call-${i}`, type: 'function', function: { name: 'audit_action', arguments: '{}' } }));
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: calls }, finish_reason: null }] })}\n\n`);
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } })}\n\n`);
+      return res.end('data: [DONE]\n\n');
+    }
+    if (req.url === '/v1/images/generations') return json(200, { data: [{ b64_json: png.toString('base64') }], usage: { cost: 0.5 } });
+    if (req.url === '/v1/videos/generations') return json(200, { request_id: 'owned-audit-job' });
+    if (req.url === '/v1/videos/owned-audit-job') return pollFails
+      ? json(503, { error: { message: 'temporary mock outage' } })
+      : json(200, { status: 'done', video: { url: `${base}/clip` } });
+    if (req.url === '/clip') { res.writeHead(200, { 'content-type': 'text/html' }); return res.end('<html>not a video</html>'); }
+    json(404, { error: 'unknown local audit route' });
+  });
+});
+await new Promise(r => server.listen(0, '127.0.0.1', r));
+base = `http://127.0.0.1:${server.address().port}`;
+config.saveConfig({ apiKey: 'owned-mock-key', baseUrl: `${base}/v1`,
+  providers: { xai: { baseUrl: `${base}/v1` } },
+  imageModel: 'tokenrouter:audit-image', videoModel: 'xai:grok-imagine-video-1.5' });
+writeCredentials('xai', { mode: 'apikey', accessToken: 'owned-mock-key' });
+
+try {
+  fs.writeFileSync(path.join(project, 'a.txt'), 'alpha');
+  fs.writeFileSync(path.join(project, 'b.txt'), 'beta');
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), 2500);
+  const parallel = await runProgram('return await Promise.all([sdk.fs.read("a.txt"), sdk.fs.read("b.txt")]);', ctx({ signal: ac.signal }), deps);
+  clearTimeout(timer);
+  record('CORE-01', !parallel.ok && /interrupted|timed out/.test(parallel.output), parallel.output);
+
+  const documented = await runProgram('return await sdk.glob("*.txt");', ctx(), deps);
+  record('CORE-02', !documented.ok && /not a function/.test(documented.output), documented.output);
+
+  let confirmations = 0;
+  const denied = ctx({ confirm: async () => { confirmations++; return false; } });
+  const unguarded = await makeRunCodeTool(deps).run({ code: 'return await sdk.fs.write("unapproved.txt", "written");' }, denied);
+  record('CORE-03', !unguarded.isError && confirmations === 0 && fs.existsSync(path.join(project, 'unapproved.txt')), 'run_code wrote a file with confirm=false; confirmation calls=' + confirmations);
+
+  const outside = path.join(work, 'outside.txt');
+  const native = await makeRunCodeTool(deps).run({ code: `const f = await import('node:fs/promises'); await f.writeFile(${JSON.stringify(outside)}, 'owned audit marker'); return 'ok';` }, denied);
+  record('CORE-04', !native.isError && fs.existsSync(outside), 'Native node import wrote outside cwd, with all supplied permission callbacks denying actions.');
+
+  const racingFile = path.join(project, 'race.txt');
+  fs.writeFileSync(racingFile, 'old\n');
+  const racing = await writeTool.run({ path: 'race.txt', content: 'agent\n' }, ctx({
+    readFiles: new Set([racingFile]), confirm: async () => { fs.writeFileSync(racingFile, 'user edit\n'); return true; },
+  }));
+  record('CORE-05', !racing.isError && fs.readFileSync(racingFile, 'utf8') === 'agent\n', 'A user edit made during confirmation was silently overwritten.');
+
+  const rootWithDots = path.join(project, '..valid-name.txt');
+  let refused = false;
+  try { resolveInside(project, rootWithDots); } catch { refused = true; }
+  record('CORE-06', refused, 'A path inside cwd beginning with two dots is rejected as an escape.');
+
+  const externalDir = path.join(work, 'external');
+  fs.mkdirSync(externalDir);
+  const link = path.join(project, 'junction');
+  fs.symlinkSync(externalDir, link, process.platform === 'win32' ? 'junction' : 'dir');
+  const linkResult = await writeTool.run({ path: 'junction/marker.txt', content: 'owned audit marker' }, ctx());
+  record('CORE-07', !linkResult.isError && fs.existsSync(path.join(externalDir, 'marker.txt')), 'write traversed a junction/symlink outside cwd.');
+
+  const cp = { cwd: project, id: 'owned-audit-checkpoint', messages: [] };
+  const cpFile = path.join(project, 'checkpoint.txt');
+  fs.writeFileSync(cpFile, 'original');
+  markTurn(cp, 'owned audit checkpoint');
+  const blobDir = path.join(config.sessionsDir(project), `${cp.id}.files`, 'blobs');
+  const blockedBlob = path.join(blobDir, crypto.createHash('sha1').update('original').digest('hex'));
+  const realWrite = fs.writeFileSync;
+  fs.writeFileSync = (file, ...args) => { if (file === blockedBlob) throw new Error('owned simulated ENOSPC'); return realWrite(file, ...args); };
+  try { recordWrite(cp, { path: cpFile, tool: 'write', before: 'original', after: 'agent' }); }
+  finally { fs.writeFileSync = realWrite; }
+  fs.writeFileSync(cpFile, 'agent');
+  const rewind = rewindFiles(cp, 1);
+  record('CORE-08', !fs.existsSync(cpFile) && rewind.deleted.includes('checkpoint.txt'), 'Failed old-content backup became before=null; rewind deleted an existing file.');
+
+  const gif = Buffer.alloc(10);
+  gif.write('GIF89a'); gif.writeUInt16LE(256, 6); gif.writeUInt16LE(128, 8);
+  fs.writeFileSync(path.join(project, 'dimensions.gif'), gif);
+  const dimensions = await readImageTool.run({ path: 'dimensions.gif', describe: false }, ctx());
+  record('MEDIA-01', dimensions.output.includes('1×32768'), 'GIF logical dimensions 256×128 reported as: ' + dimensions.output);
+
+  fs.writeFileSync(path.join(work, 'home-image.png'), png);
+  const tilde = await readImageTool.run({ path: '~/home-image.png' }, ctx());
+  record('MEDIA-02', tilde.isError && /not found/.test(tilde.output), 'Existing ~/home-image.png is not expanded: ' + tilde.output);
+
+  const pcm = Buffer.from([0xff, 0xf8, 0, 0]); // perfectly valid two signed PCM16 samples
+  record('MEDIA-03', sniffAudio(pcm).ext === 'mp3' && !sniffAudio(pcm).raw, 'Requested PCM16 bytes ff f8 00 00 are classified as MP3.');
+
+  const truncatedStream = new Response(`data: ${JSON.stringify({ choices: [{ delta: { audio: { data: 'AQIDBA==' } } }] })}\n\n`, { headers: { 'content-type': 'text/event-stream' } });
+  let partialAudio;
+  try { partialAudio = await collectAudio(truncatedStream); } catch {}
+  record('MEDIA-04', partialAudio?.audio.length === 4, 'SSE EOF without finish_reason or [DONE] returned successful partial audio.');
+
+  const image = await makeGenerateImageTool().run({ prompt: 'owned local mock', out: 'wrong.jpg' }, ctx());
+  record('MEDIA-05', !image.isError && fs.readFileSync(path.join(project, 'wrong.jpg')).subarray(0, 8).equals(png.subarray(0, 8)), 'PNG bytes were saved with a .jpg extension.');
+
+  const RealDate = globalThis.Date;
+  globalThis.Date = class extends RealDate { constructor(...a) { super(...(a.length ? a : [1791100000000])); } static now() { return 1791100000000; } };
+  try {
+    const first = await makeGenerateImageTool().run({ prompt: 'owned first mock' }, ctx());
+    const second = await makeGenerateImageTool().run({ prompt: 'owned second mock' }, ctx());
+    record('MEDIA-06', !first.isError && !second.isError && first.output.split(' (')[0] === second.output.split(' (')[0], 'Two generations in the same second saved to the same default path.');
+  } finally { globalThis.Date = RealDate; }
+
+  const video = await makeGenerateVideoTool({ pollMs: 1 }).run({ prompt: 'owned video mock', duration: -1.5, seed: 42, generate_audio: false, last_frame: path.join(work, 'home-image.png'), out: 'clip.mp4' }, ctx());
+  const submit = requests.find(r => r.route === '/v1/videos/generations');
+  record('MEDIA-07', submit?.body.duration === -1.5, 'Negative fractional duration was submitted instead of rejected before the paid request.');
+  record('MEDIA-08', submit && !('seed' in submit.body) && !('generate_audio' in submit.body), 'xAI silently dropped requested seed=42 and generate_audio=false.');
+  record('MEDIA-09', !video.isError && fs.readFileSync(path.join(project, 'clip.mp4'), 'utf8').startsWith('<html>'), 'HTTP 200 HTML was reported as a successful MP4.');
+  record('MEDIA-13', !('last_frame' in submit.body) && /last_frame is not supported/.test(video.output), 'grok-imagine-video-1.5 last_frame was dropped and described as unsupported; current xAI documentation supports it.');
+  pollFails = true;
+  const before = requests.length;
+  const failedPoll = await makeGenerateVideoTool({ pollMs: 1 }).run({ prompt: 'owned polling mock', out: 'poll.mp4' }, ctx());
+  record('MEDIA-10', failedPoll.isError && requests.slice(before).filter(r => r.route === '/v1/videos/owned-audit-job').length === 1, 'One transient polling 503 stopped waiting: ' + failedPoll.output);
+
+  fs.writeFileSync(path.join(project, 'large.png'), Buffer.alloc(1_600_001));
+  const metadata = await readImageTool.run({ path: 'large.png', describe: false }, ctx());
+  record('MEDIA-11', metadata.isError && /too large/.test(metadata.output), 'Metadata-only read was rejected by the pixel-transfer size limit.');
+
+  config.saveConfig({ permissions: { network: 'allow' } });
+  const permission = await new PermissionBroker({ interactive: false }).confirm(makeGenerateImageTool(), { prompt: 'paid' });
+  record('MEDIA-12', permission, 'Allowing network auto-approved paid generate_image in headless mode.');
+
+  fs.writeFileSync(path.join(project, 'crlf.txt'), 'one\r\ntwo\r\n');
+  const crlfPath = path.join(project, 'crlf.txt');
+  await editTool.run({ path: 'crlf.txt', old_string: 'two', new_string: 'second\r\nthird' }, ctx({ readFiles: new Set([crlfPath]) }));
+  record('CORE-09', fs.readFileSync(crlfPath, 'utf8').includes('\r\r\n'), 'CRLF replacement was normalized again, introducing CR CR LF.');
+
+  await new Promise(r => setTimeout(r, 150));
+  const liveAfterDone = ownedChildren.filter(c => c.exitCode === null && c.signalCode === null);
+  record('CORE-10', liveAfterDone.length > 0, `${liveAfterDone.length} completed run_code child processes still alive until parent shutdown/explicit cleanup.`);
+
+  const abortController = new AbortController();
+  let actions = 0;
+  const action = { name: 'audit_action', risk: 'write', description: 'owned mock action', parameters: { type: 'object' },
+    run: async () => { actions++; if (actions === 1) abortController.abort(); return { output: 'owned mock success' }; } };
+  const interrupted = await runAgent({ model: 'audit-text', systemPrompt: 'owned audit', messages: [{ role: 'user', content: 'owned audit' }],
+    tools: [action], toolContext: ctx({ signal: abortController.signal }), catalog: [], usage: new UsageTracker(),
+    maxSteps: 1, signal: abortController.signal, toolConcurrency: 1 });
+  await new Promise(r => setTimeout(r, 40));
+  record('CORE-11', interrupted.stoppedBecause === 'aborted' && actions > 1, `${actions}/5 queued tool actions started although the signal aborted inside the first action.`);
+
+  const app = new App({ cwd: project, model: 'audit-small' });
+  app.catalog = [{ id: 'audit-small', contextWindow: 32000 }, { id: 'audit-large', contextWindow: 1000000 }];
+  app.session.messages = [{ role: 'user', content: 'owned audit' }];
+  const oldWindow = app.status().contextWindow;
+  app.session.model = 'audit-large';
+  const switchedWindow = app.status().contextWindow;
+  record('CORE-12', oldWindow === 32000 && switchedWindow === 32000, `Switching model 32k -> 1M with unchanged history left footer window=${switchedWindow}. Applies to the pre-existing uncommitted pressureCache edit.`);
+} finally {
+  for (const child of ownedChildren) { child.stdin?.end(); if (child.exitCode === null) child.kill(); }
+  childProcess.spawn = realSpawn;
+  syncBuiltinESMExports();
+  server.closeAllConnections();
+  await new Promise(r => server.close(r));
+}
+for (const r of results) console.log(`${r.reproduced ? 'REPRODUCED' : 'NOT_REPRODUCED'} ${r.id}: ${r.detail}`);
+console.log(`\n${results.filter(r => r.reproduced).length}/${results.length} defects reproduced. No paid/live-provider requests made.`);
+console.log(`Owned reproduction artifacts: ${work}`);
+if (process.argv.includes('--json')) {
+  const dest = process.argv[process.argv.indexOf('--json') + 1];
+  fs.mkdirSync(path.dirname(path.resolve(dest)), { recursive: true });
+  fs.writeFileSync(dest, JSON.stringify({ testedAt: new Date().toISOString(), node: process.version, work, results }, null, 2) + '\n');
+}
+// Nonzero means one of the claimed defects could not be reproduced.
+process.exitCode = results.every(r => r.reproduced) ? 0 : 1;

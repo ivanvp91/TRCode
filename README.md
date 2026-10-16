@@ -19,8 +19,8 @@ subscriptions and API keys side by side, each model served on the wire protocol 
 vendor speaks (OpenAI chat, Responses and Anthropic Messages), with reasoning effort and
 prompt caching shaped per host.
 
-Node 20+ on Windows, macOS and Linux; zero runtime dependencies (native `fetch`,
-raw-mode TTY, ANSI).
+Node 20.10+ on Windows, macOS and Linux. Networking and terminal rendering use native
+Node APIs; Sharp handles image decoding, cropping and bounded previews.
 
 ## Install
 
@@ -363,6 +363,7 @@ insert, Esc to dismiss. `/help` prints the full reference.
 | `/effort [level] [save]` | reasoning budget: `off`, `minimal`, `low`, `medium`, `high` |
 | `/brain <question>` | a panel of models answers together — see [A panel of models](#a-panel-of-models) |
 | `/orchestrate <task>` | split a task into subtasks with dependencies and run them on subagents |
+| `/orchestrate resume \| status \| replan <instructions>` | continue saved work, inspect its plan, or revise unfinished steps |
 | `/swarm <task>` | several models solve it in parallel, then a synthesis pass |
 | `/swarm` | the roster panel: who runs, who merges the answers; `/swarm models` picks them |
 | `/compact [focus]` | compact the history into a structured digest |
@@ -388,7 +389,7 @@ endpoint is per-account; `/settings` groups the toggleable preferences — what 
 line shows, whether skills and UI mockups match themselves automatically, whether updates
 are looked for; `/update` installs the newest GitHub release — details below)
 
-**Agents** — `/subagents [model [id]\|session\|list]`, `/prompt <task> \| model [id] \| off\|command\|auto`,
+**Agents** — `/subagents [model [id]\|session\|list\|auto on\|auto off]`, `/prompt <task> \| model [id] \| off\|command\|auto`,
 `/prompt_model [id]`, `/mcp [reload]`
 (`/subagents` picks between the two ways an agent gets a model — the session's own, or a
 list you chose — with `model <id>` to add one by name; the list survives the switch, so
@@ -1002,7 +1003,7 @@ Precedence: `/effort` in the session → `effortByModel[model]` → `effort` →
 ## Tools
 
 `read`, `edit`, `write`, `ls`, `glob`, `grep`, `shell`, `read_image`, `web_search`, `fetch`,
-`run_code` (opt-in), `skill`, `todo`, `memory`, `task`, plus anything the connected MCP
+`run_code` (opt-in), `skill`, `todo`, `memory`, `task`, `ask_user_question`, plus anything the connected MCP
 servers provide. `generate_image`, `generate_video` and `generate_audio` join them once a
 model is chosen — see [Images, video and audio](#images-video-and-audio).
 
@@ -1010,11 +1011,22 @@ model is chosen — see [Images, video and audio](#images-video-and-audio).
 `fetch` downloads a URL and strips the HTML to readable text. Both sit in the
 `network` permission class, so by default every call asks first.
 
-`read_image` puts a picture in front of a vision model: PNG/JPEG/GIF/WebP/BMP up to
-1.6 MB, sent as real image content rather than a path. A host that refuses images is
+`read_image` puts a picture in front of a vision model: PNG/JPEG/GIF/WebP with automatic
+downscaling to a preview of at most 1.6 MB; `crop` inspects a region. Originals are
+preserved. `describe=false` reads metadata only, also for large files and BMP.
+A host that refuses images is
 remembered, and later reads arrive as text only.
 
 Independent calls in one turn run in parallel (up to 4 at a time).
+
+`ask_user_question` lets the model collect 1–4 related decisions in the same bordered
+modal used by the model and provider pickers. Walk the options with ↑↓ and Enter;
+multi-select questions use Space to mark options. Every question also accepts your own
+answer — choose **Your answer** or start typing. **Back** keeps earlier answers editable.
+The last screen reviews the whole batch; only **Submit** sends it to the model and saves
+it in the conversation. **Esc / Ctrl+C** cancels the turn without submitting partial
+answers. Parallel agents' questions and permission prompts are queued. In headless runs
+the tool reports that interaction is unavailable, leaving the model to ask in its reply.
 
 ### run_code: many calls, one step
 
@@ -1036,7 +1048,11 @@ return out;
 The SDK mirrors the dedicated tools — `sdk.fs.read/write/list/glob`, `sdk.shell`,
 `sdk.web.fetch/search` — with the same guardrails: paths cannot leave the working
 directory, shell and web calls ask for permission like their tools do, and writes go
-through the snapshot store so `/rewind` still reaches them. The program runs under a
+through the ordinary write permission, read-before-overwrite guard, conflict check and
+snapshot store so `/rewind` still reaches them. Native imports, `process`, `require`
+and global `fetch` are unavailable. No environment secrets are inherited. These
+restrictions and Node permissions provide defense in depth, not an OS sandbox for
+hostile code. The program runs under a
 timeout (`codeModeTimeoutMs`, 60s) and Esc kills the whole process tree.
 
 The point is the input bill: intermediate outputs never ride along on later steps. A task
@@ -1072,8 +1088,10 @@ in the same shape:
 ```
 
 Servers start in the background at session start; their tools appear in the registry as
-`mcp__<id>__<tool>` when each one is ready, and fall under the `network` permission class
-(`ask` by default — answer "always" once to stop the prompts for a session). `/mcp` shows
+`mcp__<id>__<tool>` when each one is ready. Names that require sanitizing or truncating
+receive a hash suffix to avoid collisions. Tools explicitly marked read-only use
+`network` permission; other tools use `write` permission. Both ask by default.
+`/mcp` shows
 status and tool lists, `/mcp reload` restarts the servers after a config change.
 
 `"tools"` is optional but worth setting on fat servers: every exposed schema travels in
@@ -1081,7 +1099,7 @@ every request. Remote SSE/HTTP servers are not supported yet — stdio only.
 
 ### Multi-agent work
 
-Four mechanisms, deliberately distinct:
+Three ways to distribute agent work, using the same worker execution policy, plus a panel without tools:
 
 - **`task`** — the model spawns subagents for subtasks itself. Several `task` calls in one
   turn run at once; each has its own context and model, and the lead agent sees only their
@@ -1097,14 +1115,32 @@ Four mechanisms, deliberately distinct:
   and price included — and picks a model per step: the big one where there is a judgement
   call, a cheap one for mechanical reconnaissance. A step naming anything else runs on the
   session's model, and the plan on screen names the model each step will actually use.
+  The planner receives recent conversation context and read tools to inspect the project.
+  The task, plan, step results and each worker's own history are saved as work proceeds.
+  `/orchestrate status` shows saved progress without making requests; `/orchestrate resume`
+  continues interrupted or failed work, skipping completed steps. It also works after
+  reopening the session with `/resume`. `/orchestrate replan <instructions>` revises the
+  unfinished part while preserving completed steps and their results. Replanning is explicit;
+  the scheduler does not silently replace a plan after a failure. Starting a new task replaces
+  the session's saved orchestration. Stopping a task preserves file changes already made.
 - **`/swarm`** — one task goes to several models from different vendors at once, they work
   read-only, and one model then merges the answers and names the disagreements explicitly.
   The roster is picked by hand on `/swarm models` — or, with nothing chosen, automatically:
   the session's model plus one model per other vendor. Bare `/swarm` opens the panel, where
   ★ marks the model that writes the synthesis (unpinned, the session's model writes it).
+  Workers receive recent conversation context. A worker that reaches its step limit or is
+  interrupted is reported as incomplete and does not enter synthesis as a completed answer.
+  Interrupted runs retain available worker text in the conversation, marked as unsynthesized.
 - **`/brain <question>`** — not agents but models talking: several answer the same
   question alone, read each other's answers, revise, and one writes the final text. No
   tools, no file changes — see [A panel of models](#a-panel-of-models).
+
+Chat, `/orchestrate`, `/swarm` and `/brain` keep the input frame and status line visible
+while running. Esc or a single Ctrl+C stops the active task. Enter queues a message for
+the next turn; it does not change the assignment already running. After an interrupt,
+queued messages and the draft return to the editor and are not automatically sent.
+The `toolConcurrency` setting bounds worker fan-out in chat, orchestration and swarm;
+orchestration steps that change files still run one at a time.
 
 ## Confirmations
 
@@ -1113,12 +1149,14 @@ Four mechanisms, deliberately distinct:
 | `read` (read, ls, glob, grep, skill, todo) | `allow` |
 | `write` (write, edit) | `ask` — with a diff |
 | `shell` | `ask` — with the command |
-| `network` (web_search, fetch, MCP tools) | `ask` |
+| `network` (web_search, fetch, explicitly read-only MCP tools) | `ask` |
+| `paidMedia` (generate_image, generate_audio, generate_video) | `ask`, independently of `network` |
 | `agent` (task) | `allow` |
 
 A `run_code` program asks under its own name for everything risky it does: shell commands
 confirm as `run_code>shell`, web calls as `web_search`/`fetch`. File writes inside the
-program go through the same snapshot store as `write` and `edit`, so `/rewind` covers them.
+program use `write` permission and the same file guards and snapshots as the file tools.
+An unclassified MCP tool uses `write` permission too.
 
 The confirmation is a row of buttons: **←/→** to move, **Enter** to confirm. The keys
 `y` / `a` / `n` work as shortcuts, Esc rejects. In headless mode without `--yolo`,
@@ -1393,6 +1431,7 @@ Prices are not published either, so no money is shown anywhere — only tokens.
   "promptModels": { "tokenrouter": "moonshotai/kimi-k3-free" },
   "promptMode": "command",
   "subagentModels": {},
+  "subagentAuto": {},
   "brainModels": [],
   "brainMainModel": "",
   "toolConcurrency": 4,
@@ -1502,7 +1541,25 @@ list` is the separate, deliberate button.
 /subagents model qwen3.8-max   # add one by name — alias or prefix resolve, as in /model
 /subagents session      # run on the session's model; the list stays, unused
 /subagents list         # use the list again
+/subagents auto on      # let the lead launch helpers without asking, for this provider
+/subagents auto off     # ask before autonomous delegation (the default)
 ```
+
+The panel includes an Auto on/off button, independent of the model choice. With auto off,
+an autonomous `task` launch asks **Yes / No / Enable auto mode**. Yes approves helper
+launches for the current turn; No makes the lead continue on its own. Parallel launches
+share one decision. Enable auto mode saves the setting for the current provider, so later
+turns do not ask. An explicit request such as "launch subagents" or "запусти субагентов"
+authorizes that turn without changing the saved setting; an explicit prohibition still
+blocks delegation with auto on. YOLO does not override this preference.
+
+If helper models have never been chosen, an approved launch opens the provider's model
+picker before starting helpers. Mark models to use that list, or save an empty selection
+to explicitly use the session's model. Cancelling the picker stops the turn. A helper
+with no explicit model uses the first available configured model in list mode.
+`/orchestrate` is an explicit delegation request and also checks model setup. In a
+noninteractive session, configure models in advance; with auto off, autonomous launches
+are declined unless the user's request explicitly asks for helpers.
 
 The same shortlist is what `/orchestrate` offers its planner, so one choice governs every
 agent this session may launch.
@@ -1524,8 +1581,9 @@ Asking for a model outside the allowlist — or one from another provider — ru
 on the session's model instead, with a line saying so; an `enum` is a suggestion to a model,
 not a constraint on it.
 
-How many run at once is `toolConcurrency` (default 4) — subagents are tool calls, so on a
-host that meters requests this is also how many of them race for the same slot.
+How many workers run at once is `toolConcurrency` (default 4), including orchestration
+and swarm workers. On a host that meters requests this bounds how many workers race for
+the same slot. Each worker may make up to three concurrent tool calls of its own.
 
 ## Writing the prompt
 
@@ -1619,8 +1677,9 @@ that limit.
 
 Image, video and audio models do not answer `/chat/completions`, so they are not chat
 models here — they are tools. You pick one, and the model you are talking to writes the
-prompt and calls it when you ask for a picture, a clip or a voice-over. The file lands in
-the project directory.
+prompt and calls it when you ask for a picture, a clip or a voice-over. The result lands
+in the directory trcode was started from (`image-<timestamp>.png`, `video-….mp4`,
+`audio-….wav`); scratch files live in `.tmp/` and are deleted once they are not needed.
 
 ```
 /image                 # the model panel: provider tabs, search, what each model can do
@@ -1647,21 +1706,43 @@ subscription (OAuth) reaches only the chat proxy, so xAI media needs the API key
 
 Every generation is paid, so each one asks first, like a shell command, and shows the
 model and parameters. Esc stops waiting for a video; the job may still finish on the
-provider's side.
+provider's side. Allowing ordinary network access does not authorize paid generation:
+`permissions.paidMedia` controls it separately; `--yolo` explicitly allows it too.
+
+Each generation works in its own folder, `.tmp/<kind>-<timestamp>-<id>/`, holding a
+`manifest.json` (prompt, parameters, reference hashes, status, cost, job id), references
+and the retained paid response. Once the result is saved, the folder is removed.
+
+For planning and assembly, the agent first calls `prepare_media_workspace`, which creates a
+`.tmp/` folder for scripts, downloads and scenes; passing it as `workspace` keeps scene
+generations (each with its own record and `result.*`) inside it. Only the finished
+deliverable goes to the current directory. Project workspaces are removed when trcode exits.
+A folder that still holds paid but unsaved output, or a video job in flight, is kept until
+`resume_media` finishes it. An explicit `out` can export elsewhere; existing files are
+refused before payment and are never silently replaced.
+`resume_media` recovers retained image/audio or resumes polling/downloading the existing
+video job, without a new generation POST. A failed submission with no job id remains
+`submission_unknown`; it must not be automatically repeated.
 
 - **Images** — `generate_image`: prompt, aspect ratio, resolution or size, quality,
   format, background, variants, and reference images (local paths or URLs) for models that
-  take them. An option the model does not take is dropped with a note; a value outside its
-  list is an error that names the allowed ones.
+  take them. Unsupported options and values are rejected before payment. Returned
+  images must actually decode; filenames follow the real format. Size, aspect ratio,
+  requested format and transparency are checked and mismatches are reported.
 - **Audio** — `generate_audio`: a speech model reads the text word for word in the chosen
   voice and delivery ("cheerful", "whispered"); a music model takes a brief. The format is
-  read off the bytes, and raw PCM is wrapped in a WAV header.
+  checked from the protocol: requested speech PCM16 is wrapped as 24 kHz mono WAV.
+  Truncated/malformed streams fail rather than publish partial speech. Available
+  transcripts, silence and clipping are checked and discrepancies are reported.
 - **Video** — `generate_video`: duration, resolution, aspect ratio, sound, first and last
-  frame. Nothing is filled in by default: omitted values are the provider's own.
+  frame, plus reference images on supported hosts. Invalid parameters are refused before
+  submission; temporary polling failures are retried. MP4 downloads are streamed,
+  bounded and checked for a valid container signature; this is not full codec or visual QA.
 
 ### Video mode
 
-`/video` turns the session into a studio. Every message becomes a video request: a text
+`/video` turns the session into a studio. Questions, planning and settings do not trigger
+paid generation. For a generation request, a text
 model — any one, chosen with `/video prompt_model`, or the session's own — looks at
 attached images, writes the shot description with timed beats, and calls the video
 model. The durations, resolutions and aspect ratios the video model accepts go into its
@@ -1669,10 +1750,10 @@ system prompt, so it does not guess. The first `/video on` asks for both models;
 `/video off` goes back to the model the session had before. The mode lasts until the
 program exits — after a restart it is off, so nothing is generated by accident.
 
-The video model cannot open links, reuse existing footage or audio, or edit a video: the
-prompt model says so and recreates the idea from a description. When a job fails on
-content policy (real logos and people are often refused), it rewrites the prompt once
-with a generic look and says what changed.
+Reference and editing capabilities depend on the selected model. External links need
+appropriate reading tools; local editing and assembly can use shell tools. A failed
+paid job is not automatically resubmitted. xAI Imagine 1.5 supports a pinned last frame
+and respects an explicit request for silent video.
 
 ## Tests
 

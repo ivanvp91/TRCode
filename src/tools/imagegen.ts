@@ -11,13 +11,15 @@
  * TokenRouter, xAI and Z.AI speak OpenAI's /images/generations. Either way
  * the call is synchronous (seconds) and images come back as base64 or links.
  */
-import fsp from "node:fs/promises";
 import path from "node:path";
+import fsp from "node:fs/promises";
+import { inspectGeneratedImage } from "./mediaquality.js";
 import type { ToolDef, ToolResult } from "../types.js";
-import { fetchListing, imageDataUrl, mediaAuth, requestJson, resolvePath, stamp } from "./media.js";
+import { fetchListing, imageDataUrl, mediaAuth, requestJson, readBounded, withTimeout, openRouterBase, GENERATE_TIMEOUT_MS } from "./media.js";
+import { prepareMedia, updateMedia, mediaOutputPath, saveMedia, checkMediaOutput, finishMedia } from "./mediaworkspace.js";
+import { imageDimensions, sniffImage, IMAGE_EXT } from "./image.js";
 import { mediaAvailable, mediaModelId, parseMediaId, providerServes } from "./mediamodels.js";
 
-const GENERATE_TIMEOUT_MS = 5 * 60_000;
 
 type Param = { type: "enum"; values: (string | number)[] } | { type: "range"; min?: number; max?: number } | { type?: string };
 
@@ -61,7 +63,7 @@ const capsCache = new Map<string, ImageModelInfo>();
 
 export async function fetchImageModels(refresh = false): Promise<ImageModelInfo[]> {
   const rows = await fetchListing<ImageModelInfo>("/images/models", refresh);
-  for (const r of rows) capsCache.set(r.id, r);
+  for (const r of rows) capsCache.set(`${openRouterBase()}:${r.id}`, r);
   return rows;
 }
 
@@ -95,27 +97,24 @@ function specLine(m: ImageModelInfo): string {
 
 /**
  * Checks the arguments against what the model takes. Unknown parameters are
- * dropped with a note rather than refused — the picture is what was asked
- * for, the knob is incidental — but a value outside a stated list is an error
- * the model can fix in one retry.
+ * rejected before a paid submission. Required quality/format choices must
+ * not disappear silently; a value outside a stated list names valid values.
  */
 function fitParams(
   args: Record<string, any>,
   caps: ImageModelInfo | undefined,
   accepts?: readonly string[],
-): { body: Record<string, unknown>; dropped: string[] } | { error: string } {
+): { body: Record<string, unknown> } | { error: string } {
   const body: Record<string, unknown> = {};
-  const dropped: string[] = [];
   const params = caps?.supported_parameters;
   for (const key of FORWARDED) {
     const raw = args[key];
     if (raw === undefined || raw === null || raw === "") continue;
     const numeric = key === "n" || key === "seed";
     const value = numeric ? Number(raw) : String(raw);
-    if (numeric && !Number.isFinite(value as number)) return { error: `${key} must be a number` };
+    if (numeric && (!Number.isSafeInteger(value) || (key === "n" && ((value as number) < 1 || (value as number) > 16)))) return { error: `${key} must be an integer${key === "n" ? " between 1 and 16" : ""}` };
     if (accepts && !accepts.includes(key)) {
-      dropped.push(key);
-      continue;
+      return { error: `${key} is not supported by this provider. Remove it or select a model that supports it before generating.` };
     }
     if (!params) {
       body[key] = value;
@@ -123,8 +122,7 @@ function fitParams(
     }
     const spec = params[key];
     if (!spec) {
-      dropped.push(key);
-      continue;
+      return { error: `${key} is not supported by ${caps!.id}. Remove it or choose another model before generating.` };
     }
     if (spec.type === "enum" && "values" in spec && !spec.values.map(String).includes(String(value))) {
       return { error: `${key}=${value} is not supported by ${caps!.id}; use one of: ${spec.values.join(", ")}` };
@@ -136,29 +134,7 @@ function fitParams(
     }
     body[key] = value;
   }
-  return { body, dropped };
-}
-
-const EXT: Record<string, string> = { "image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "image/svg+xml": "svg", "image/gif": "gif" };
-
-/** Where image i of `count` goes: `out` as given for one, numbered for several. */
-function targetPath(out: string | undefined, i: number, count: number, ext: string, cwd: string): string {
-  if (!out) return resolvePath(`image-${stamp()}${count > 1 ? `-${i + 1}` : ""}.${ext}`, cwd);
-  const abs = resolvePath(out, cwd);
-  if (/[\\/]$/.test(out)) return path.join(abs, `image-${stamp()}${count > 1 ? `-${i + 1}` : ""}.${ext}`);
-  const has = path.extname(abs);
-  const base = has ? abs.slice(0, -has.length) : abs;
-  return `${base}${count > 1 ? `-${i + 1}` : ""}.${has ? has.slice(1) : ext}`;
-}
-
-/** The first bytes say what a file is better than a missing content type. */
-function sniffImage(buf: Buffer): string | undefined {
-  if (buf.length >= 4 && buf.readUInt32BE(0) === 0x89504e47) return "image/png";
-  if (buf.length >= 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return "image/jpeg";
-  if (buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return "image/webp";
-  if (buf.length >= 3 && buf.toString("ascii", 0, 3) === "GIF") return "image/gif";
-  if (/^\s*(<\?xml|<svg)/.test(buf.toString("utf8", 0, 64))) return "image/svg+xml";
-  return undefined;
+  return { body };
 }
 
 /**
@@ -168,12 +144,13 @@ function sniffImage(buf: Buffer): string | undefined {
 export function makeGenerateImageTool(): ToolDef {
   const current = imageModelId();
   const { providerId, model: wire } = parseMediaId(current);
-  const caps = providerId === "openrouter" ? capsCache.get(wire) : undefined;
+  const caps = providerId === "openrouter" ? capsCache.get(`${openRouterBase()}:${wire}`) : undefined;
   const edits = caps ? caps.architecture?.input_modalities?.includes("image") : providerId !== "zai";
   const known = ACCEPTS[providerId];
   const tool: ToolDef = {
     name: "generate_image",
     risk: "network",
+    paidMedia: true,
     description:
       `Draws an image with ${wire} (on ${providerId}) and saves it to disk. ` +
       "Use it when the user asks for a picture, illustration, logo, icon, mockup or edit of an image. Paid: one call per request unless asked for variants. " +
@@ -181,8 +158,8 @@ export function makeGenerateImageTool(): ToolDef {
       (caps
         ? `Supported by ${wire}: ${specLine(caps) || "no options"}. `
         : known
-          ? `This host takes: ${known.join(", ")}; anything else is dropped. `
-          : "Pass only options the user cared about; unsupported ones are dropped. ") +
+          ? `This host takes: ${known.join(", ")}; unsupported options are rejected before payment. `
+          : "Pass only supported options; unsupported ones are rejected before payment. ") +
       (edits ? "references: images to edit or draw from (local paths or https URLs). " : "This model takes no reference images. ") +
       "To look at the result, call read_image on the saved path.",
     parameters: {
@@ -202,7 +179,8 @@ export function makeGenerateImageTool(): ToolDef {
           items: { type: "string" },
           description: "Reference or source images: local paths or https URLs",
         },
-        out: { type: "string", description: "File path, or a directory ending in /, for the result (default ./image-<time>.png)" },
+        out: { type: "string", description: "Optional export path. Default: image-<timestamp>.<actual-format> in the current directory" },
+        workspace: { type: "string", description: "Workspace returned by prepare_media_workspace; scene output stays inside it" },
       },
       required: ["prompt"],
     },
@@ -213,6 +191,8 @@ export function makeGenerateImageTool(): ToolDef {
     async run(args, ctx): Promise<ToolResult> {
       const prompt = String(args.prompt ?? "").trim();
       if (!prompt) return { output: "prompt is required.", isError: true };
+      const conflict = checkMediaOutput(args.out, ctx.cwd, Number(args.n) || 1);
+      if (conflict) return { output: conflict, isError: true };
       if (!current) return { output: "No image model chosen. The user picks one with /image.", isError: true };
       if (!providerServes(providerId, "image")) {
         return { output: `${providerId} is not connected with an API key. Run: trc auth login --provider ${providerId}`, isError: true };
@@ -228,6 +208,7 @@ export function makeGenerateImageTool(): ToolDef {
       const body: Record<string, unknown> = { model: wire, prompt, ...fitted.body };
 
       const refs = Array.isArray(args.references) ? args.references.map(String).filter(Boolean) : args.references ? [String(args.references)] : [];
+      const inputSources: string[] = [];
       let route = providerId === "openrouter" ? "/images" : "/images/generations";
       if (refs.length) {
         if ((info && !info.architecture?.input_modalities?.includes("image")) || providerId === "zai") {
@@ -238,6 +219,7 @@ export function makeGenerateImageTool(): ToolDef {
           const url = await imageDataUrl(r, ctx.cwd);
           if ("error" in url) return { output: `reference ${r}: ${url.error}`, isError: true };
           urls.push(url.url);
+          inputSources.push(url.url);
         }
         if (providerId === "xai") {
           // xAI edits on their own route, one source image or several.
@@ -253,6 +235,9 @@ export function makeGenerateImageTool(): ToolDef {
 
       const preview = `${tool.summarize!(args)}\n(paid ${providerId} image generation)`;
       if (!(await ctx.confirm(tool, args, preview))) return { output: "User rejected the image generation.", isError: true };
+      ctx.signal.throwIfAborted();
+      const work = await prepareMedia(ctx, "image", current, args, inputSources);
+      ctx.emit(`media workspace ${work.dir}`);
 
       let auth;
       try {
@@ -262,6 +247,8 @@ export function makeGenerateImageTool(): ToolDef {
       }
 
       const started = Date.now();
+      await updateMedia(work, { status: "submitting" });
+      ctx.billMedia?.(current, undefined, work.manifest.id);
       let res: ImagesResponse;
       try {
         res = await requestJson<ImagesResponse>(
@@ -269,16 +256,23 @@ export function makeGenerateImageTool(): ToolDef {
           { method: "POST", headers: { ...auth.headers, "Content-Type": "application/json" }, body: JSON.stringify(body) },
           ctx.signal,
           GENERATE_TIMEOUT_MS,
+          140_000_000,
         );
       } catch (err) {
+        await updateMedia(work, { status: "submission_unknown", error: (err as Error).message });
         if (ctx.signal.aborted) return { output: "Interrupted.", isError: true };
         return { output: `Image generation failed: ${(err as Error).message}`, isError: true };
       }
+      ctx.billMedia?.(current, res.usage?.cost, work.manifest.id);
+      await updateMedia(work, { status: "generated", cost: res.usage?.cost });
+      // Keep the paid response for recovery, even if decoding/export fails.
+      await fsp.writeFile(path.join(work.tmp, "generated-response.json"), JSON.stringify(res), { flag: "wx", mode: 0o600 });
 
-      const items = (res.data ?? []).filter((d) => d.b64_json || d.url);
+      const items = (Array.isArray(res.data) ? res.data : []).filter((d) => d.b64_json || d.url);
       if (!items.length) return { output: `No image in the response: ${JSON.stringify(res).slice(0, 300)}`, isError: true };
 
       const saved: string[] = [];
+      const qa: Record<string, unknown>[] = [];
       for (let i = 0; i < items.length; i++) {
         const d = items[i];
         let buf: Buffer;
@@ -287,27 +281,44 @@ export function makeGenerateImageTool(): ToolDef {
           if (d.b64_json) buf = Buffer.from(d.b64_json.replace(/^data:[^,]+,/, ""), "base64");
           else {
             // Result links are pre-signed CDN URLs: they never get the key.
-            const r = await fetch(d.url!, { signal: ctx.signal });
+            const r = await fetch(d.url!, { signal: withTimeout(ctx.signal, GENERATE_TIMEOUT_MS) });
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             mime ??= r.headers.get("content-type")?.split(";")[0];
-            buf = Buffer.from(await r.arrayBuffer());
+            buf = await readBounded(r);
           }
         } catch (err) {
-          return { output: `Image ${i + 1} could not be read: ${(err as Error).message}`, isError: true };
+          await updateMedia(work, { status: "download_failed", saved, error: (err as Error).message });
+          return { output: `Image ${i + 1} could not be read: ${(err as Error).message}. Workspace: ${work.dir}. Already saved: ${saved.join(", ") || "none"}`, isError: true };
         }
-        const type = sniffImage(buf) ?? mime ?? "image/png";
-        const file = targetPath(args.out ? String(args.out) : undefined, i, items.length, EXT[type] ?? "png", ctx.cwd);
-        await fsp.mkdir(path.dirname(file), { recursive: true });
-        await fsp.writeFile(file, buf);
+        const type = sniffImage(buf);
+        if (!type || (type !== "image/svg+xml" && !imageDimensions(buf))) {
+          await updateMedia(work, { status: "invalid_result", saved });
+          return { output: `Invalid image ${i + 1} from provider. Workspace: ${work.dir}`, isError: true };
+        }
+        try {
+          qa.push(await inspectGeneratedImage(buf, args));
+        } catch (err) {
+          await updateMedia(work, { status: "invalid_result", saved, error: (err as Error).message });
+          return { output: `Image ${i + 1} failed decoding: ${(err as Error).message}. Paid response retained in ${work.tmp}`, isError: true };
+        }
+        const file = mediaOutputPath(work, args.out, IMAGE_EXT[type], ctx.cwd, i, items.length);
+        try { await saveMedia(file, buf, work, ctx.signal); }
+        catch (err) {
+          await updateMedia(work, { status: "save_failed", saved, error: (err as Error).message });
+          return { output: `Image save failed: ${(err as Error).message}. Workspace: ${work.dir}. Already saved: ${saved.join(", ") || "none"}`, isError: true };
+        }
         saved.push(file);
       }
+      const warnings = qa.flatMap((row) => row.warnings as string[]);
+      await updateMedia(work, { status: warnings.length ? "quality_mismatch" : "completed", saved, qa });
+      const where = (await finishMedia(work)) ? "" : `\nWorkspace: ${work.dir}`;
 
       const cost = typeof res.usage?.cost === "number" ? ` · $${res.usage.cost.toFixed(3)}` : "";
       const secs = ((Date.now() - started) / 1000).toFixed(0);
-      const note = fitted.dropped.length ? ` Ignored (not supported by ${wire}): ${fitted.dropped.join(", ")}.` : "";
       const revised = items.find((d) => d.revised_prompt)?.revised_prompt;
       return {
-        output: `Saved ${saved.join(", ")} (${wire} on ${providerId}, ${secs}s${cost}).${note}` + (revised ? `\nRevised prompt: ${revised}` : ""),
+        output: `Saved ${saved.join(", ")} (${wire} on ${providerId}, ${secs}s${cost}).${where}` + (revised ? `\nRevised prompt: ${revised}` : "") + (warnings.length ? `\nResult does not meet the requested constraints: ${warnings.join("; ")}. Do not regenerate without approval.` : ""),
+        isError: warnings.length > 0,
         display: `${saved.map((f) => path.basename(f)).join(", ")}${cost}`,
       };
     },

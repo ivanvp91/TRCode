@@ -78,10 +78,11 @@ export class PermissionBroker {
 
   private mode(tool: ToolDef): PermissionMode {
     const cfg = loadConfig();
-    return cfg.permissions[tool.risk] ?? "ask";
+    return (tool.paidMedia ? cfg.permissions.paidMedia : cfg.permissions[tool.risk]) ?? "ask";
   }
 
-  async confirm(tool: ToolDef, args: Record<string, any>, preview?: string): Promise<boolean> {
+  async confirm(tool: ToolDef, args: Record<string, any>, preview?: string, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return false;
     if (this.autoApprove) return true;
     const mode = this.mode(tool);
     if (mode === "allow") return true;
@@ -90,12 +91,16 @@ export class PermissionBroker {
     if (!this.interactive) return false;
 
     // Queue: one prompt at a time, in arrival order.
-    const run = this.chain.then(() => this.prompt(tool, args, preview));
+    const run = this.chain.then(() => this.prompt(tool, args, preview, signal));
     this.chain = run.catch(() => undefined);
     return run;
   }
 
-  private async prompt(tool: ToolDef, args: Record<string, any>, preview?: string): Promise<boolean> {
+  private prompt(tool: ToolDef, args: Record<string, any>, preview?: string, signal?: AbortSignal): Promise<boolean> {
+    return this.exclusive(() => signal?.aborted ? Promise.resolve(false) : this.showPrompt(tool, args, preview));
+  }
+
+  private async showPrompt(tool: ToolDef, args: Record<string, any>, preview?: string): Promise<boolean> {
     const title =
       tool.risk === "shell"
         ? t("Run this command?", "Выполнить эту команду?")
@@ -127,15 +132,13 @@ export class PermissionBroker {
     }
     line();
 
-    const answer = await this.exclusive(() =>
-      choose<"once" | "always" | "reject">(
-        [
-          { value: "once", label: t("Allow", "Разрешить"), key: "y", tone: "ok" },
-          { value: "always", label: t(`Always allow ${tool.name} this session`, `Всегда разрешать ${tool.name} в этой сессии`), key: "a", tone: "warn" },
-          { value: "reject", label: t("Reject", "Отклонить"), key: "n", tone: "danger" },
-        ],
-        { initial: "once", fallback: "reject", cancel: () => this.onCancel?.() },
-      ),
+    const answer = await choose<"once" | "always" | "reject">(
+      [
+        { value: "once", label: t("Allow", "Разрешить"), key: "y", tone: "ok" },
+        { value: "always", label: t(`Always allow ${tool.name} this session`, `Всегда разрешать ${tool.name} в этой сессии`), key: "a", tone: "warn" },
+        { value: "reject", label: t("Reject", "Отклонить"), key: "n", tone: "danger" },
+      ],
+      { initial: "once", fallback: "reject", cancel: () => this.onCancel?.() },
     );
     line();
     this.onAnswered?.();

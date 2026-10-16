@@ -14,3 +14,15 @@ mock-output.txt
 
 *.zip
 site/
+
+# Local scratch: media .tmp/ workspaces, probe and profiling output, one-off scripts
+.tmp/
+.tmp-*
+.t/
+.trcode/tmp-*
+.trcode/tsc-out.txt
+.trcode/xai-wire-ref.ts
+kilo*.html
+kilo_repo.txt
+sitemap.txt
+tokens.json

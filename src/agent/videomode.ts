@@ -106,8 +106,7 @@ export function videoModeSection(): string {
   // Capabilities come from OpenRouter's listing; other hosts publish none.
   const caps = providerId === "openrouter" && state.caps?.id === model ? state.caps : undefined;
   const lines = [
-    "Video mode is on. Every user message is a request for a video, not a coding task. " +
-      "Your job is to turn it into the best prompt this video model can take, then call generate_video.",
+    "Video mode is on. Help plan, generate, inspect, and revise video. Generate paid media only when the user asks for generation; questions, status, planning, and settings need no paid call.",
     `Video model: ${id}${caps?.name ? ` (${caps.name})` : ""}.`,
   ];
   if (caps) {
@@ -125,13 +124,14 @@ export function videoModeSection(): string {
   lines.push(
     "",
     "How to work:",
+    "- Before creating scripts, scratch files, downloads, or scene assets, call prepare_media_workspace and keep every scratch file, script, download and scene in it (it lives under .tmp/ and is deleted on exit). Pass workspace to generation tools. Save only the finished deliverable to the current directory; never leave media scratch files there.",
     "- A request clear enough to shoot goes straight to generate_video; the user confirms the cost before anything runs. Ask one short question only when something essential is missing and has no sensible default.",
     "- Write the prompt in English as a shot description: subject and its look, action, setting, camera (shot size, angle, movement), lighting, style or genre, mood, and sound when the model makes audio. Concrete visible details, no abstractions.",
     "- For clips longer than about 6 seconds, write timed beats: \"0–4s: …; 4–9s: …; 9–15s: …\". Keep one continuous scene or clearly ordered cuts.",
     "- Pass only parameters the model supports; leave out what the user did not care about.",
     "- Attached images: look at them with read_image first. Pass one as first_frame/last_frame only when it should literally open or close the clip; a logo, character or style reference is described in words instead.",
-    "- The video model cannot open links (YouTube and the like), reuse existing footage or audio, or edit a video. Say so in one line and recreate the idea from a description.",
-    "- Video providers often refuse real logos, trademarks and real people. If a job fails on content policy, rewrite the prompt with a generic look and retry once, telling the user what changed.",
+    "- External links must be read with appropriate tools. Reference/edit support depends on the chosen model; validate capabilities. Local assembly, soundtrack replacement, and editing can use shell tools when available; do not claim that every provider supports these operations.",
+    "- A failed or interrupted paid submission may still be running. Recover its recorded job with resume_media; never resubmit automatically. Ask for a revised brief when content policy blocks the request.",
     "- On an invalid-parameter error, switch to a supported value from the list above and retry once.",
     "- After success, give the file path and the final prompt, so the user can ask for a variation.",
   );

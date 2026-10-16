@@ -119,7 +119,7 @@ const node = process.execPath;
   await new Promise((resolve) => connectMcpServers(proj, resolve));
   const defs = mcpToolDefs();
   check("tool defs use the mcp__ prefix", defs.some((d) => d.name === "mcp__tv__get_quote"), defs.map((d) => d.name).join(","));
-  check("defs carry risk network", defs.every((d) => d.risk === "network"));
+  check("unclassified MCP effects require write permission", defs.every((d) => d.risk === "write"));
   check("the schema passes through", defs[0].parameters?.properties?.symbol?.type === "string");
 
   // run() must ask permission first and honour a refusal.

@@ -1,0 +1,132 @@
+{
+  "testedAt": "2026-10-03T22:41:39.190Z",
+  "node": "v24.16.0",
+  "work": "C:\\Users\\3C8A~1\\AppData\\Local\\Temp\\trcode-audit-YlOdbc",
+  "results": [
+    {
+      "id": "CORE-01",
+      "reproduced": true,
+      "detail": "[interrupted by the user]"
+    },
+    {
+      "id": "CORE-02",
+      "reproduced": true,
+      "detail": "The program threw: sdk.glob is not a function"
+    },
+    {
+      "id": "CORE-03",
+      "reproduced": true,
+      "detail": "run_code wrote a file with confirm=false; confirmation calls=0"
+    },
+    {
+      "id": "CORE-04",
+      "reproduced": true,
+      "detail": "Native node import wrote outside cwd, with all supplied permission callbacks denying actions."
+    },
+    {
+      "id": "CORE-05",
+      "reproduced": true,
+      "detail": "A user edit made during confirmation was silently overwritten."
+    },
+    {
+      "id": "CORE-06",
+      "reproduced": true,
+      "detail": "A path inside cwd beginning with two dots is rejected as an escape."
+    },
+    {
+      "id": "CORE-07",
+      "reproduced": true,
+      "detail": "write traversed a junction/symlink outside cwd."
+    },
+    {
+      "id": "CORE-08",
+      "reproduced": true,
+      "detail": "Failed old-content backup became before=null; rewind deleted an existing file."
+    },
+    {
+      "id": "MEDIA-01",
+      "reproduced": true,
+      "detail": "GIF logical dimensions 256×128 reported as: C:\\Users\\3C8A~1\\AppData\\Local\\Temp\\trcode-audit-YlOdbc\\project/dimensions.gif — GIF, 1×32768, 0 KB."
+    },
+    {
+      "id": "MEDIA-02",
+      "reproduced": true,
+      "detail": "Existing ~/home-image.png is not expanded: File not found: ~/home-image.png"
+    },
+    {
+      "id": "MEDIA-03",
+      "reproduced": true,
+      "detail": "Requested PCM16 bytes ff f8 00 00 are classified as MP3."
+    },
+    {
+      "id": "MEDIA-04",
+      "reproduced": true,
+      "detail": "SSE EOF without finish_reason or [DONE] returned successful partial audio."
+    },
+    {
+      "id": "MEDIA-05",
+      "reproduced": true,
+      "detail": "PNG bytes were saved with a .jpg extension."
+    },
+    {
+      "id": "MEDIA-06",
+      "reproduced": true,
+      "detail": "Two generations in the same second saved to the same default path."
+    },
+    {
+      "id": "MEDIA-07",
+      "reproduced": true,
+      "detail": "Negative fractional duration was submitted instead of rejected before the paid request."
+    },
+    {
+      "id": "MEDIA-08",
+      "reproduced": true,
+      "detail": "xAI silently dropped requested seed=42 and generate_audio=false."
+    },
+    {
+      "id": "MEDIA-09",
+      "reproduced": true,
+      "detail": "HTTP 200 HTML was reported as a successful MP4."
+    },
+    {
+      "id": "MEDIA-13",
+      "reproduced": true,
+      "detail": "grok-imagine-video-1.5 last_frame was dropped and described as unsupported; current xAI documentation supports it."
+    },
+    {
+      "id": "MEDIA-10",
+      "reproduced": true,
+      "detail": "One transient polling 503 stopped waiting: Polling failed: HTTP 503: temporary mock outage (job owned-audit-job)"
+    },
+    {
+      "id": "MEDIA-11",
+      "reproduced": true,
+      "detail": "Metadata-only read was rejected by the pixel-transfer size limit."
+    },
+    {
+      "id": "MEDIA-12",
+      "reproduced": true,
+      "detail": "Allowing network auto-approved paid generate_image in headless mode."
+    },
+    {
+      "id": "CORE-09",
+      "reproduced": true,
+      "detail": "CRLF replacement was normalized again, introducing CR CR LF."
+    },
+    {
+      "id": "CORE-10",
+      "reproduced": true,
+      "detail": "3 completed run_code child processes still alive until parent shutdown/explicit cleanup."
+    },
+    {
+      "id": "CORE-11",
+      "reproduced": true,
+      "detail": "5/5 queued tool actions started although the signal aborted inside the first action."
+    },
+    {
+      "id": "CORE-12",
+      "reproduced": true,
+      "detail": "Switching model 32k -> 1M with unchanged history left footer window=32000. Applies to the pre-existing uncommitted pressureCache edit."
+    }
+  ]
+}

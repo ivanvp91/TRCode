@@ -1013,6 +1013,7 @@ function normalizeUsage(u: any): Usage {
     completion_tokens: Number(u.completion_tokens ?? u.output_tokens ?? 0),
     total_tokens: Number(u.total_tokens ?? (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0)),
     cached_tokens: cached || undefined,
+    cost: typeof u.cost === "number" && Number.isFinite(u.cost) && u.cost >= 0 ? u.cost : undefined,
     reasoning_tokens:
       Number(u.completion_tokens_details?.reasoning_tokens ?? u.reasoning_tokens ?? 0) || undefined,
   };

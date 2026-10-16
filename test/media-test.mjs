@@ -8,6 +8,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import http from "node:http";
+import { PNG, MP4 } from "./media-fixtures.mjs";
 
 const results = [];
 const ok = (name, cond, detail = "") => results.push({ name, ok: Boolean(cond), detail });
@@ -20,8 +21,6 @@ delete process.env.TOKENROUTER_API_KEY;
 delete process.env.TR_API_KEY;
 delete process.env.TOKENROUTER_BASE_URL;
 
-const PNG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]);
-const MP4 = Buffer.from("....ftypisom-fake-video");
 const PCM = Buffer.alloc(4800, 7);
 const seen = [];
 let pollCount = 0;
@@ -152,8 +151,9 @@ const last = (frag) => [...seen].reverse().find((r) => r.url.includes(frag));
   saveConfig({ imageModel: "openrouter:bytedance-seed/seedream-4.5" });
   ok("с выбранной моделью инструмент в чате", tools().includes("generate_image"));
   let r = await makeGenerateImageTool().run({ prompt: "a fox", aspect_ratio: "16:9", quality: "high", out: "img/or.png" }, ctx());
+  ok("OpenRouter: неподдержанное отклонено до оплаты", r.isError && /quality.*not supported/.test(r.output) && !seen.some((s) => s.method === "POST" && s.url === "/or/api/v1/images"), r.output);
+  r = await makeGenerateImageTool().run({ prompt: "a fox", aspect_ratio: "16:9", out: "img/or.png" }, ctx());
   ok("OpenRouter: картинка сохранена", !r.isError && fs.readFileSync(path.join(HOME, "img/or.png")).equals(PNG), r.output);
-  ok("OpenRouter: неподдержанное отброшено с пометкой", !("quality" in last("/or/api/v1/images").body) && /Ignored.*quality/.test(r.output), r.output);
   r = await makeGenerateImageTool().run({ prompt: "x", aspect_ratio: "4:3" }, ctx());
   ok("OpenRouter: недопустимое значение — ошибка со списком", r.isError && /use one of: 1:1, 16:9/.test(r.output), r.output);
 
@@ -166,9 +166,10 @@ const last = (frag) => [...seen].reverse().find((r) => r.url.includes(frag));
   saveConfig({ imageModel: "xai:grok-imagine-image-2.0" });
   fs.writeFileSync(path.join(HOME, "src.png"), PNG);
   r = await makeGenerateImageTool().run({ prompt: "make it blue", references: ["src.png"], size: "1024x1024" }, ctx());
+  ok("xAI: неподдержанное отклонено до оплаты", r.isError && /size.*not supported/.test(r.output) && !seen.some((s) => s.method === "POST" && s.url === "/xai/v1/images/edits"), r.output);
+  r = await makeGenerateImageTool().run({ prompt: "make it blue", references: ["src.png"] }, ctx());
   const xe = last("/xai/v1/images/edits");
   ok("xAI: правка идёт на /images/edits с картинкой", !r.isError && /^data:image\/png;base64,/.test(xe?.body?.image?.url ?? ""), r.output);
-  ok("xAI: чего хост не берёт, то отброшено", !("size" in xe.body) && /Ignored.*size/.test(r.output), r.output);
 
   saveConfig({ imageModel: "zai:glm-image" });
   r = await makeGenerateImageTool().run({ prompt: "a fox", quality: "hd" }, ctx());
@@ -188,7 +189,7 @@ const last = (frag) => [...seen].reverse().find((r) => r.url.includes(frag));
   saveConfig({ videoModel: "xai:grok-imagine-video-1.5" });
   r = await makeGenerateVideoTool({ pollMs: 5 }).run({ prompt: "a fox", duration: 6, last_frame: "src.png", out: "v/x.mp4" }, ctx());
   ok("xAI: done → video.url скачан", !r.isError && fs.existsSync(path.join(HOME, "v/x.mp4")), r.output);
-  ok("xAI: last_frame честно не поддержан", /last_frame is not supported/.test(r.output), r.output);
+  ok("xAI 1.5: last_frame передан", /^data:image\/png/.test(last("/xai/v1/videos/generations")?.body?.last_frame?.url ?? ""), r.output);
 
   saveConfig({ videoModel: "zai:cogvideox-3" });
   r = await makeGenerateVideoTool({ pollMs: 5 }).run({ prompt: "a fox", generate_audio: true }, ctx());

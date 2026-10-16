@@ -7,6 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import http from "node:http";
+import { MP4 } from "./media-fixtures.mjs";
 
 const results = [];
 const ok = (name, cond, detail = "") => results.push({ name, ok: Boolean(cond), detail });
@@ -23,12 +24,11 @@ const vm = await import("../dist/agent/videomode.js");
 const { buildSystemPrompt } = await import("../dist/agent/prompt.js");
 const { buildTools, TodoStore } = await import("../dist/tools/index.js");
 
-const MP4 = Buffer.from("fake-mp4-bytes");
 const seen = { submit: null, auth: [], polls: 0 };
 let failNext = false;
 
 const server = http.createServer((req, res) => {
-  seen.auth.push(req.headers.authorization);
+  if (req.method === "POST" || (req.url !== "/api/v1/videos/models" && !req.url?.includes("/content"))) seen.auth.push(req.headers.authorization);
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {

@@ -31,8 +31,21 @@ export function resolveInside(cwd: string, p: string): string {
   const abs = path.isAbsolute(p) ? path.resolve(p) : path.resolve(cwd, p);
   const root = path.resolve(cwd);
   const rel = path.relative(root, abs);
-  if (rel.startsWith("..") || (path.isAbsolute(rel) && rel !== "")) {
+  const outside = (r: string) => r === ".." || r.startsWith(`..${path.sep}`) || path.isAbsolute(r);
+  if (outside(rel)) {
     throw new Error(`Path outside the working directory is refused: ${p}`);
+  }
+  // New files can have missing parents. Check the nearest existing ancestor
+  // against the real root, so junctions/symlinks cannot bypass containment.
+  let ancestor = abs;
+  while (!fs.existsSync(ancestor)) {
+    const parent = path.dirname(ancestor);
+    if (parent === ancestor) break;
+    ancestor = parent;
+  }
+  if (fs.existsSync(root) && fs.existsSync(ancestor) &&
+      outside(path.relative(fs.realpathSync(root), fs.realpathSync(ancestor)))) {
+    throw new Error(`Path through a link outside the working directory is refused: ${p}`);
   }
   return abs;
 }
@@ -173,7 +186,8 @@ export function extraIgnoresFrom(cwd: string): string[] {
     return body
       .split(/\r?\n/)
       .map((l) => l.trim())
-      .filter((l) => l && !l.startsWith("#") && !l.includes("*") && !l.includes("/"))
+      .filter((l) => l && !l.startsWith("#") && !l.startsWith("!") && !l.includes("*") && !l.replace(/^\//, "").replace(/\/$/, "").includes("/"))
+      .map((l) => l.replace(/^\//, ""))
       .map((l) => l.replace(/\/$/, ""))
       .slice(0, 200);
   } catch {

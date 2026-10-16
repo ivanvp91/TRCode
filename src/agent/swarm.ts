@@ -5,13 +5,14 @@
  * (write-capable) turns can act on it afterwards.
  */
 import { c } from "../ui/ansi.js";
-import { MarkdownStream, Spinner, assistantPrefix, info, line, padded, rule, truncate, warn } from "../ui/render.js";
-import { buildSystemPrompt } from "./prompt.js";
-import { runAgent, stepCeiling } from "./loop.js";
+import { MarkdownStream, assistantPrefix, info, line, padded, rule, truncate, warn } from "../ui/render.js";
+import { runWorker, runPool } from "./worker.js";
+import { attachHistory } from "./brain.js";
+import { markTurn } from "../session/checkpoint.js";
 import { UsageTracker, fmtTokens } from "../usage.js";
 import { loadConfig } from "../config.js";
 import { effortFor, servesModality, usableModels } from "../provider/models.js";
-import type { ModelInfo, ToolDef } from "../types.js";
+import type { ModelInfo } from "../types.js";
 import type { App } from "../ui/repl.js";
 
 /**
@@ -20,7 +21,8 @@ import type { App } from "../ui/repl.js";
  * hands the pick back to defaultRoster.
  */
 export function configuredRoster(catalog: ModelInfo[]): string[] {
-  return loadConfig().swarmModels.filter((id) => catalog.some((m) => m.id === id));
+  const runnable = usableModels(catalog).filter((m) => m.chatCapable !== false && servesModality(m, "text"));
+  return loadConfig().swarmModels.filter((id) => runnable.some((m) => m.id === id));
 }
 
 /**
@@ -90,144 +92,108 @@ Merge them into one answer:
 Write the final answer as if you were answering the user yourself: no "model A said…" in every paragraph. Put the disagreement analysis at the end as a short separate block, and only if the disagreements matter.`;
 
 export async function runSwarm(app: App, task: string, given?: string[]): Promise<void> {
-  const cfg = loadConfig();
-  // The panel hands its own roster in so what it showed is what runs; a bare
-  // /swarm <task> resolves the same list here.
-  const roster = given?.length ? given : swarmRoster(app.catalog, app.session.model, 3);
-  const synthModel = swarmMain(app.session.model, roster);
+  await app.runTask("swarm", async (progress) => {
+    const cfg = loadConfig();
+    const roster = [...new Set(given?.length ? given : swarmRoster(app.catalog, app.session.model, 3))];
+    const synthModel = swarmMain(app.session.model, roster);
+    const context = attachHistory(app.session.messages);
+    const ctx = app.toolContext();
+    const started = Date.now();
+    markTurn(app.session, `[swarm] ${task}`);
+    app.session.add({ role: "user", content: `[swarm: ${roster.join(", ")}] ${task}` });
+    app.session.save();
+    if (roster.length < 2) warn("Fewer than two models — running one independent worker.");
+    line();
+    rule(c.brightMagenta(` swarm · ${roster.length} models `));
+    padded(`${c.bold("task")} ${truncate(task, 90)}`);
+    for (const model of roster) padded(`${c.brightBlue("├")} ${model}${model === synthModel ? c.gray(" · synthesis") : ""}`);
+    line();
 
-  if (roster.length < 2) {
-    warn("Fewer than two models in the catalog — the swarm degenerates into a plain request.");
-  }
-
-  line();
-  rule(c.brightMagenta(` swarm · ${roster.length} ${roster.length === 1 ? "model" : "models"} `));
-  padded(`${c.bold("task")} ${truncate(task, 90)}`);
-  for (const m of roster) padded(`${c.brightBlue("├")} ${m}${m === synthModel ? c.gray(" · synthesis") : ""}`);
-  line();
-
-  const readOnlyTools: ToolDef[] = app.toolList().filter((t) => t.risk === "read");
-  const started = Date.now();
-  const ctx = app.toolContext();
-
-  const runs = roster.map(async (model, i) => {
-    const usage = new UsageTracker();
-    const tag = `  ${c.brightBlue(`├ [${i + 1}] ${model}`)}`;
-    const t0 = Date.now();
-    try {
-      const res = await runAgent({
-        model,
-        systemPrompt: buildSystemPrompt({ cwd: app.cwd, model, skills: app.activeSkills, subagent: true }),
-        messages: [{ role: "user", content: task + WORKER_SUFFIX }],
-        tools: readOnlyTools,
-        toolContext: { ...ctx, depth: 1 },
-        catalog: app.catalog,
-        usage,
-        maxSteps: stepCeiling(cfg.maxSteps, 25),
-        signal: ctx.signal,
-        effort: effortFor(model, app.effortOverride),
-        toolConcurrency: Math.min(3, loadConfig().toolConcurrency),
-        events: {
-          onToolStart: (tool, args) => {
-            padded(`${tag} ${c.cyan(tool.name)} ${c.gray(truncate(tool.summarize?.(args) ?? "", 60))}`);
-          },
-        },
-      });
-      app.usage.absorb(usage);
-      const t = usage.totals();
-      padded(
-        `${tag} ${c.green("done")} ${c.gray(
-          `${((Date.now() - t0) / 1000).toFixed(0)}s · ${fmtTokens(t.input + t.output)} tokens`,
-        )}`,
-      );
-      return { model, text: res.finalText, ok: Boolean(res.finalText.trim()) };
-    } catch (err) {
-      app.usage.absorb(usage);
-      const msg = (err as Error)?.name === "AbortError" ? "interrupted" : (err as Error).message;
-      padded(`${tag} ${c.red("failed")} ${c.dim(msg)}`);
-      return { model, text: "", ok: false };
-    }
-  });
-
-  const results = await Promise.all(runs);
-  const good = results.filter((r) => r.ok);
-
-  if (!good.length) {
-    warn("No model returned a result.");
-    return;
-  }
-  if (good.length === 1) {
-    info(`Only one model finished (${good[0].model}) — no synthesis needed.`);
-    printAnswer(good[0].model, good[0].text);
-    commit(app, task, good[0].text, roster, good[0].model);
-    return;
-  }
-
-  line();
-  const sp = new Spinner(`merging ${good.length} answers into one`);
-  sp.start();
-
-  const bundle = good
-    .map((r, i) => `<answer model="${r.model}" index="${i + 1}">\n${r.text}\n</answer>`)
-    .join("\n\n");
-
-  const synthUsage = new UsageTracker();
-  let synth = "";
-  // Held in an object so the callback assignment stays visible to the caller.
-  const stream: { md: MarkdownStream | null } = { md: null };
-
-  try {
-    const res = await runAgent({
-      model: synthModel,
-      systemPrompt: SYNTH_PROMPT,
-      messages: [{ role: "user", content: `Task:\n${task}\n\nModel answers:\n\n${bundle}` }],
-      tools: [],
-      toolContext: { ...ctx, depth: 1 },
-      catalog: app.catalog,
-      usage: synthUsage,
-      maxSteps: 1,
-      signal: ctx.signal,
-      effort: effortFor(synthModel, app.effortOverride),
-      events: {
-        onText: (delta) => {
-          if (!stream.md) {
-            sp.stop();
-            line();
-            assistantPrefix(`${synthModel} ${c.gray("· synthesis")}`);
-            stream.md = new MarkdownStream();
-          }
-          stream.md.push(delta);
-        },
-      },
+    const results: { model: string; text: string; ok: boolean; reason: string }[] = new Array(roster.length);
+    let finished = 0;
+    const savePartial = () => {
+      const partial = results.filter((r) => r?.text.trim());
+      if (partial.length) app.session.add({ role: "assistant", content:
+        "Swarm interrupted; these worker results are incomplete and have not been synthesized.\n\n" +
+        partial.map((r) => `## ${r.model}${r.ok ? "" : " (unfinished)"}\n${r.text}`).join("\n\n"),
+        meta: { model: app.session.model } });
+      app.session.save();
+    };
+    await runPool(roster, cfg.toolConcurrency, ctx.signal, async (model, index) => {
+      const tag = `  ${c.brightBlue(`├ [${index + 1}] ${model}`)}`;
+      const t0 = Date.now();
+      progress.label(`swarm · ${finished}/${roster.length} done`);
+      try {
+        const res = await runWorker({
+          model, prompt: task + context + WORKER_SUFFIX, context: ctx,
+          tools: app.toolList(), readOnly: true, skills: app.activeSkills, catalog: app.catalog,
+          usage: app.usage, maxSteps: cfg.maxSteps, ceiling: 25, effort: effortFor(model, app.effortOverride),
+          activity: (text) => progress.activity(`[${index + 1}] ${model} · ${text}`), events: progress.events(),
+        });
+        const ok = !ctx.signal.aborted && res.stoppedBecause === "stop" && Boolean(res.finalText.trim());
+        results[index] = { model, text: res.finalText, ok, reason: ok ? "" : res.stoppedBecause };
+        padded(`${tag} ${ok ? c.green("done") : c.yellow(res.stoppedBecause)} ${c.gray(`${Math.round((Date.now() - t0) / 1000)}s`)}`);
+      } catch (err) {
+        const reason = ctx.signal.aborted ? "interrupted" : (err as Error).message;
+        results[index] = { model, text: "", ok: false, reason };
+        padded(`${tag} ${c.red("failed")} ${c.dim(reason)}`);
+      } finally {
+        finished++;
+        progress.label(`swarm · ${finished}/${roster.length} done`);
+        app.session.save();
+      }
     });
-    sp.stop();
-    stream.md?.end();
-    synth = res.finalText;
-    if (!synth.trim()) {
-      warn("Synthesis came back empty — showing the raw answers.");
-      for (const r of good) printAnswer(r.model, r.text);
-      synth = good.map((r) => `## ${r.model}\n${r.text}`).join("\n\n");
+    if (ctx.signal.aborted) { savePartial(); return; }
+    const good = results.filter((r) => r?.ok);
+    if (!good.length) {
+      app.lastTurnFailed = true;
+      warn("No model completed the task.");
+      return;
     }
-  } catch (err) {
-    sp.stop();
-    warn(`Synthesis failed: ${(err as Error).message}. Raw answers below.`);
-    for (const r of good) printAnswer(r.model, r.text);
-    synth = good.map((r) => `## ${r.model}\n${r.text}`).join("\n\n");
-  }
-
-  app.usage.absorb(synthUsage);
-  commit(app, task, synth, roster, synthModel);
-
-  line();
-  padded(
-    [
-      c.brightMagenta(`swarm ${roster.length}×`),
-      c.gray(`${((Date.now() - started) / 1000).toFixed(0)}s`),
-      c.gray(fmtTokens(app.usage.totals().input + app.usage.totals().output) + " tokens this session"),
-    ].join(c.gray(" · ")),
-  );
-  padded(c.gray("The result is in the history — carry on with normal requests."));
-  line();
+    const failures = results.filter((r) => r && !r.ok).map((r) => `${r.model}: ${r.reason}`).join("\n");
+    let answer = "";
+    let answerModel = synthModel;
+    if (good.length === 1) {
+      info(`Only one model finished (${good[0].model}) — no synthesis needed.`);
+      answer = good[0].text;
+      answerModel = good[0].model;
+      printAnswer(answerModel, answer);
+    } else {
+      progress.label(`merging ${good.length} answers into one`);
+      const bundle = good.map((r, i) => `<answer model="${r.model}" index="${i + 1}">\n${r.text}\n</answer>`).join("\n\n");
+      const stream: { md: MarkdownStream | null } = { md: null };
+      const events = progress.events();
+      try {
+        const res = await runWorker({
+          model: synthModel, systemPrompt: SYNTH_PROMPT,
+          prompt: `Task:\n${task}${context}\n\nModel answers:\n${bundle}\n\nIncomplete workers (report these):\n${failures || "none"}`,
+          context: ctx, tools: [], readOnly: true, skills: [], catalog: app.catalog, usage: app.usage,
+          maxSteps: 1, ceiling: 1, effort: effortFor(synthModel, app.effortOverride),
+          events: { ...events, onText: (delta) => {
+            events.onText?.(delta);
+            if (!stream.md) { line(); assistantPrefix(`${synthModel} ${c.gray("· synthesis")}`); stream.md = new MarkdownStream(); }
+            stream.md.push(delta);
+          } },
+        });
+        if (ctx.signal.aborted) { savePartial(); return; }
+        if (res.stoppedBecause !== "stop" || !res.finalText.trim()) throw new Error(`Synthesis did not finish (${res.stoppedBecause}).`);
+        answer = res.finalText;
+      } catch (err) {
+        if (ctx.signal.aborted) { savePartial(); return; }
+        app.lastTurnFailed = true;
+        warn(`Synthesis failed: ${(err as Error).message}. Raw answers below.`);
+        for (const result of good) printAnswer(result.model, result.text);
+        answer = "Synthesis failed; independent worker answers:\n\n" + good.map((r) => `## ${r.model}\n${r.text}`).join("\n\n");
+      } finally { stream.md?.end(); }
+    }
+    if (failures) answer += `\n\nIncomplete workers:\n${failures}`;
+    app.session.add({ role: "assistant", content: answer, meta: { model: answerModel } });
+    app.session.save();
+    const totals = app.usage.turnTotals();
+    line();
+    padded([c.brightMagenta(`swarm ${good.length}/${roster.length}`), c.gray(`${Math.round((Date.now() - started) / 1000)}s`),
+      c.gray(fmtTokens(totals.input + totals.output) + " tokens this turn")].join(c.gray(" · ")));
+  });
 }
 
 function printAnswer(model: string, text: string): void {
@@ -236,11 +202,4 @@ function printAnswer(model: string, text: string): void {
   const md = new MarkdownStream();
   md.push(text);
   md.end();
-}
-
-/** Folds the swarm result into the session so the dialogue stays coherent. */
-function commit(app: App, task: string, answer: string, roster: string[], model?: string): void {
-  app.session.add({ role: "user", content: `[swarm: ${roster.join(", ")}] ${task}` });
-  app.session.add({ role: "assistant", content: answer, meta: { model: model ?? app.session.model } });
-  app.session.save();
 }

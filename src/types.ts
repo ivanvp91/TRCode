@@ -1,5 +1,6 @@
 /** Shared types for the TokenRouter agentic CLI. */
 import type { SpillStore } from "./tools/spill.js";
+import type { UserQuestion, UserAnswer } from "./tools/questions.js";
 
 export type Role = "system" | "user" | "assistant" | "tool";
 
@@ -44,6 +45,8 @@ export interface Usage {
    * separately — otherwise the bill looks inexplicable.
    */
   reasoning_tokens?: number;
+  /** Actual billed USD, when the provider reports it. */
+  cost?: number;
 }
 
 export interface ModelPricing {
@@ -106,6 +109,7 @@ export interface ToolDef {
   parameters: Record<string, unknown>;
   /** Risk class drives the permission prompt. */
   risk: "read" | "write" | "shell" | "network" | "agent";
+  paidMedia?: boolean;
   /** Short one-line summary shown in the transcript while running. */
   summarize?(args: Record<string, any>): string;
   /**
@@ -137,6 +141,8 @@ export interface ToolContext {
   signal: AbortSignal;
   /** Depth in the agent tree: 0 = main agent, 1+ = spawned subagents. */
   depth: number;
+  /** Interactive clarification; absent in headless runs. */
+  askUser?(questions: UserQuestion[]): Promise<UserAnswer[] | null>;
   /** Returns true when the user (or policy) approves the action. */
   confirm(tool: ToolDef, args: Record<string, any>, preview?: string): Promise<boolean>;
   /**
@@ -152,6 +158,7 @@ export interface ToolContext {
   snapshot?(opts: { path: string; tool: string; before: string | null; after: string }): void;
   /** Emits a line into the live transcript. */
   emit(line: string): void;
+  billMedia?(model: string, cost?: number, jobId?: string): void;
   /** Files already read this session, used to guard blind overwrites. */
   readFiles: Set<string>;
   /**

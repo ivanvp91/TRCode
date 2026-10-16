@@ -49,6 +49,7 @@ interface EditEntry {
   after: string;
   /** Set when the file was too big to store: the entry is a record, not an undo. */
   oversize?: boolean;
+  backupFailed?: boolean;
 }
 
 type Entry = TurnEntry | EditEntry;
@@ -86,12 +87,12 @@ function hashOf(buf: Buffer): string {
   return crypto.createHash("sha1").update(buf).digest("hex");
 }
 
-function append(session: Session, entry: Entry): void {
+function append(session: Session, entry: Entry, required = false): void {
   try {
     fs.mkdirSync(path.join(storeDir(session), "blobs"), { recursive: true });
     fs.appendFileSync(logFile(session), JSON.stringify(entry) + "\n");
-  } catch {
-    /* a checkpoint is insurance, never a reason to fail the write */
+  } catch (err) {
+    if (required) throw new Error(`Checkpoint log could not be saved; file write refused: ${(err as Error).message}`);
   }
 }
 
@@ -149,6 +150,7 @@ export function recordWrite(
   const oversize = (beforeBuf?.length ?? 0) > MAX_SNAPSHOT_BYTES;
 
   let beforeHash: string | null = null;
+  let backupFailed = false;
   if (beforeBuf && !oversize) {
     beforeHash = hashOf(beforeBuf);
     const dest = blobFile(session, beforeHash);
@@ -157,7 +159,7 @@ export function recordWrite(
       // Content-addressed: the same bytes are only ever stored once.
       if (!fs.existsSync(dest)) fs.writeFileSync(dest, beforeBuf);
     } catch {
-      beforeHash = null;
+      backupFailed = true;
     }
   }
 
@@ -170,7 +172,9 @@ export function recordWrite(
     before: beforeHash,
     after: hashOf(afterBuf),
     ...(oversize ? { oversize: true } : {}),
-  });
+    ...(backupFailed ? { backupFailed: true } : {}),
+  }, true);
+  if (backupFailed) throw new Error("Checkpoint backup failed; file write refused to preserve the original.");
 }
 
 function relPath(session: Session, abs: string): string {
@@ -231,12 +235,15 @@ export function rewindFiles(session: Session, turn: number): RewindResult {
     const latest = last.get(rel);
     try {
       const now = fs.existsSync(abs) ? fs.readFileSync(abs) : null;
-      if (now && latest && hashOf(now) !== latest.after) result.diverged.push(rel);
+      if (latest && (!now || hashOf(now) !== latest.after)) {
+        result.diverged.push(rel);
+        continue;
+      }
     } catch {
       /* unreadable now, still worth trying to restore */
     }
 
-    if (entry.oversize) {
+    if (entry.oversize || entry.backupFailed) {
       result.failed.push(rel);
       continue;
     }
@@ -263,8 +270,10 @@ export function rewindFiles(session: Session, turn: number): RewindResult {
  * same turns again. Their blobs stay: they are shared by hash and go with the
  * session.
  */
-export function forgetFrom(session: Session, turn: number): void {
-  const kept = readLog(session).filter((e) => e.turn < turn);
+export function forgetFrom(session: Session, turn: number, preserve: string[] = []): void {
+  const log = readLog(session);
+  const needed = new Set(log.filter((e): e is EditEntry => e.kind === "edit" && e.turn >= turn && preserve.includes(e.path)).map((e) => e.turn));
+  const kept = log.filter((e) => e.turn < turn || (e.kind === "edit" ? preserve.includes(e.path) : needed.has(e.turn)));
   try {
     fs.writeFileSync(logFile(session), kept.map((e) => JSON.stringify(e)).join("\n") + (kept.length ? "\n" : ""));
   } catch {

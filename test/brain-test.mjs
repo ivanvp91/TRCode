@@ -21,7 +21,12 @@ const mock = spawn(process.execPath, [path.join(HERE, "mock-server.mjs")], {
 });
 process.env.TOKENROUTER_BASE_URL = `http://127.0.0.1:${port}/v1`;
 process.env.TOKENROUTER_API_KEY = "sk-test";
-await new Promise((r) => setTimeout(r, 1200));
+for (let attempt = 0; ; attempt++) {
+  try { const res = await fetch(`${process.env.TOKENROUTER_BASE_URL}/models`, { signal: AbortSignal.timeout(500) }); if (res.ok) break; }
+  catch { /* server is starting */ }
+  if (attempt >= 100 || mock.exitCode !== null) throw new Error("Brain mock server did not become ready");
+  await new Promise((r) => setTimeout(r, 100));
+}
 
 const { runBrain } = await import("../dist/agent/brain.js");
 const { UsageTracker } = await import("../dist/usage.js");

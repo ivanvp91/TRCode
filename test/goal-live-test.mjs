@@ -37,6 +37,7 @@ const server = http.createServer((req, res) => {
     const lastUser = [...msgs].reverse().find((m) => m.role === "user");
     calls.push({ text: typeof lastUser?.content === "string" ? lastUser.content.slice(0, 120) : "" });
     const answer = script.length > 1 ? script.shift() : script[0] ?? "ok";
+    if (answer === "<FAIL>") { res.writeHead(400, { "content-type": "application/json" }); res.end(JSON.stringify({ error: { message: "deliberate test failure" } })); return; }
     res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
     const sse = (o) => res.write("data: " + JSON.stringify(o) + "\n\n");
     const chunk = (delta) => ({
@@ -97,7 +98,10 @@ const check = (name, cond, detail = "") => {
   else { failed++; say("  FAIL " + name + (detail ? "\n       " + detail : "")); }
 };
 
-const type = (text) => {
+const type = async (text) => {
+  // A paused budget is recorded before its final turn finishes. Wait for
+  // an actual editor/bar consumer rather than injecting into the transition.
+  await waitFor(() => Boolean(app.editor?.abortRead || app.bar));
   stdin.emit("data", Buffer.from(text, "utf8"));
   stdin.emit("data", Buffer.from("\r", "utf8"));
 };
@@ -127,7 +131,7 @@ check("requests land on the scenario server", calls.length > 0, `calls=${calls.l
 script = ["step one done", "all finished <goal-complete>"];
 const runP = app.run();
 await sleep(400);
-type("/goal make the tests green");
+await type("/goal make the tests green");
 check(
   "the session holds an active goal after /goal",
   await waitFor(() => app.session.goal?.status === "active" && app.session.goal?.objective === "make the tests green"),
@@ -149,7 +153,7 @@ check("no goal turn fires after completion", app.session.goal?.turnsUsed === 2, 
 // ── Scenario B: budget pause, /goal status, /goal resume ───────────────────
 script = ["still working"];
 const beforeB = calls.length;
-type("/goal endless grind --turns 2");
+await type("/goal endless grind --turns 2");
 check(
   "the new goal replaces the old one and spends its budget",
   await waitFor(() => app.session.goal?.objective === "endless grind" && app.session.goal?.status === "paused" && app.session.goal?.turnsUsed === 2),
@@ -160,7 +164,9 @@ check(
   calls.slice(beforeB).some((c) => c.text.includes("endless grind")),
   `calls=${JSON.stringify(calls.slice(beforeB).map((c) => c.text.slice(0, 40)))}`,
 );
-type("/goal status");
+await waitFor(() => Boolean(app.editor?.abortRead));
+painted = "";
+await type("/goal status");
 check(
   "/goal status marks the paused goal",
   await waitFor(() => /◎/.test(strip(painted).slice(-800))),
@@ -168,7 +174,7 @@ check(
 );
 painted = "";
 const grindCallsAtResume = calls.filter((c) => c.text.includes("endless grind")).length;
-type("/goal resume");
+await type("/goal resume");
 check(
   "resume grants a fresh budget: two more turns go out, then the cap pauses it again",
   await waitFor(() => {
@@ -180,13 +186,14 @@ check(
 
 // ── no --turns: the built-in cap lands on the first continuation turn ──────
 script = ["still going"];
-type("/goal uncapped work");
+await waitFor(() => Boolean(app.editor?.abortRead));
+await type("/goal uncapped work");
 check(
   "an uncapped goal gets the built-in 25-turn limit on its first turn",
   await waitFor(() => app.session.goal?.objective === "uncapped work" && (app.session.goal?.turnsUsed ?? 0) >= 1 && app.session.goal?.maxTurns === 25),
   JSON.stringify(app.session.goal),
 );
-type("/goal pause");
+await type("/goal pause");
 check(
   "/goal pause stops the uncapped goal",
   await waitFor(() => app.session.goal?.status === "paused"),
@@ -195,7 +202,8 @@ check(
 
 // ── Esc during a running goal turn pauses it, not skips it ─────────────────
 script = ["<HANG>"];
-type("/goal hang forever --turns 10");
+await waitFor(() => Boolean(app.editor?.abortRead));
+await type("/goal hang forever --turns 10");
 check(
   "the hanging goal turn is in flight",
   await waitFor(() => calls.some((c) => c.text.includes("hang forever")), 15000),
@@ -215,7 +223,8 @@ check("no further turn was fired after Esc", app.session.goal?.turnsUsed === 1, 
 // a dropped connection would only be retried, which is exactly what the pause
 // exists to avoid burning through.
 script = ["<FAIL>"];
-type("/goal fragile task --turns 5");
+await waitFor(() => Boolean(app.editor?.abortRead));
+await type("/goal fragile task --turns 5");
 check(
   "the new goal starts active",
   await waitFor(() => app.session.goal?.objective === "fragile task", 15000),
@@ -227,7 +236,8 @@ check(
   `status=${app.session.goal?.status} turnsUsed=${app.session.goal?.turnsUsed}`,
 );
 
-type("/quit");
+await waitFor(() => Boolean(app.editor?.abortRead));
+await type("/quit");
 await Promise.race([runP, sleep(4000)]);
 
 // ── persistence: the goal is in the session file on disk ──────────────────

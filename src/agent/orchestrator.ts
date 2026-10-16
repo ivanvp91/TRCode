@@ -10,36 +10,18 @@
  * time and still go through the normal permission prompts.
  */
 import { c } from "../ui/ansi.js";
-import { MarkdownStream, Spinner, assistantPrefix, error, hint, info, line, padded, rule, truncate, warn } from "../ui/render.js";
-import { buildSystemPrompt } from "./prompt.js";
-import { runAgent, stepCeiling } from "./loop.js";
-import { complete } from "../provider/client.js";
-import { effortFor, servesModality, usableModels } from "../provider/models.js";
-import { splitModelId, wireModelId } from "../provider/registry.js";
-import { subagentMode } from "./subagent.js";
-import { UsageTracker, fmtTokens } from "../usage.js";
+import { MarkdownStream, assistantPrefix, hint, line, padded, rule, truncate, warn } from "../ui/render.js";
+import { runWorker, runPool, workerModels, resolveWorkerModel } from "./worker.js";
+import { attachHistory, attachReferenced } from "./brain.js";
+import { markTurn } from "../session/checkpoint.js";
+import type { OrchestrationStep as Step, OrchestrationState } from "../session/orchestration.js";
+import { effortFor } from "../provider/models.js";
+import { wireModelId } from "../provider/registry.js";
+import { fmtTokens } from "../usage.js";
 import { loadConfig } from "../config.js";
 import { fmtDuration } from "../ui/layout.js";
-import type { ModelInfo, ToolDef } from "../types.js";
-import type { App } from "../ui/repl.js";
-
-interface Step {
-  id: string;
-  title: string;
-  prompt: string;
-  /** Ids this step needs finished first. */
-  deps: string[];
-  /** Investigation steps stay read-only so they can run in parallel. */
-  writes: boolean;
-  model?: string;
-}
-
-interface StepResult {
-  step: Step;
-  text: string;
-  ok: boolean;
-  ms: number;
-}
+import type { ModelInfo } from "../types.js";
+import type { App, TaskProgress } from "../ui/repl.js";
 
 const PLANNER_PROMPT = `You are the planner of an agent system. You are given a task and you split it into subtasks, each of which a separate agent will carry out with its own context.
 
@@ -74,20 +56,7 @@ Rules:
  * step, exactly as it did before.
  */
 export function stepModels(app: App): ModelInfo[] {
-  const home = splitModelId(app.session.model).providerId;
-  const runnable = usableModels(app.catalog).filter(
-    (m) => m.chatCapable !== false && servesModality(m, "text") && splitModelId(m.id).providerId === home,
-  );
-  const list = subagentMode(home) === "list" ? loadConfig().subagentModels?.[home] ?? [] : [];
-  const shortlist = runnable.filter((m) => list.includes(m.id));
-  if (!shortlist.length) return runnable.filter((m) => m.id === app.session.model);
-  // The session's model leads and is always on the offer: it is the default
-  // every step without a "model" falls back to.
-  const withDefault = shortlist.some((m) => m.id === app.session.model)
-    ? shortlist
-    : [...runnable.filter((m) => m.id === app.session.model), ...shortlist];
-  // The list rides in the planner's prompt, so it stays as short as the offer.
-  return withDefault.slice(0, 12);
+  return workerModels(app.catalog, app.session.model).slice(0, 12);
 }
 
 /**
@@ -96,9 +65,7 @@ export function stepModels(app: App): ModelInfo[] {
  * rather than on a 404.
  */
 export function resolveStepModel(offered: ModelInfo[], want: string | undefined, dflt: string): string {
-  if (!want) return dflt;
-  const hit = offered.find((m) => m.id === want || wireModelId(m.id) === want);
-  return hit ? hit.id : dflt;
+  return resolveWorkerModel(offered, want, dflt);
 }
 
 /** What the planner is told about those models — ids, size, price. */
@@ -138,7 +105,7 @@ function extractJson(text: string): any {
   return JSON.parse(body.slice(start, end + 1));
 }
 
-function normalizePlan(raw: any): Step[] {
+export function normalizePlan(raw: any): Step[] {
   const list: any[] = Array.isArray(raw?.steps) ? raw.steps : [];
   const steps: Step[] = list
     .map((s, i) => ({
@@ -152,16 +119,19 @@ function normalizePlan(raw: any): Step[] {
     .filter((s) => s.prompt);
 
   if (!steps.length) throw new Error("the plan is empty");
+  if (steps.length > 24) throw new Error("the plan has too many steps");
+  if (steps.some((s) => !/^[a-zA-Z][\w-]{0,63}$/.test(s.id) || s.id in Object.prototype)) throw new Error("invalid step id");
 
-  // Drop references to steps that do not exist, else the DAG never drains.
   const ids = new Set(steps.map((s) => s.id));
-  for (const s of steps) s.deps = s.deps.filter((d) => ids.has(d) && d !== s.id);
+  if (ids.size !== steps.length) throw new Error("duplicate step ids in plan");
+  for (const s of steps) for (const d of s.deps) if (!ids.has(d) || d === s.id) throw new Error(`invalid dependency ${d} of ${s.id}`);
+  waves(steps); // validate the entire DAG before any side effects
 
   return steps;
 }
 
 /** Groups steps into dependency waves; throws on a cycle. */
-function waves(steps: Step[]): Step[][] {
+export function waves(steps: Step[]): Step[][] {
   const done = new Set<string>();
   const out: Step[][] = [];
   let remaining = [...steps];
@@ -169,9 +139,7 @@ function waves(steps: Step[]): Step[][] {
   while (remaining.length) {
     const ready = remaining.filter((s) => s.deps.every((d) => done.has(d)));
     if (!ready.length) {
-      // Cycle or unreachable dependency: run the rest sequentially instead.
-      out.push(...remaining.map((s) => [s]));
-      return out;
+      throw new Error("cyclic or unreachable dependencies in plan");
     }
     // Writers run alone and after readers of the same wave.
     const readers = ready.filter((s) => !s.writes);
@@ -188,7 +156,8 @@ function renderPlan(steps: Step[], statuses: Map<string, string>, dflt?: string)
   for (const s of steps) {
     const st = statuses.get(s.id) ?? "pending";
     const mark =
-      st === "done" ? c.green("✔") : st === "running" ? c.brightYellow("▸") : st === "failed" ? c.red("✖") : c.gray("○");
+      st === "done" ? c.green("✔") : st === "running" ? c.brightYellow("▸") :
+        st === "failed" || st === "skipped" ? c.red("✖") : st === "interrupted" ? c.yellow("‖") : c.gray("○");
     const deps = s.deps.length ? c.gray(` ← ${s.deps.join(", ")}`) : "";
     const kind = s.writes ? c.yellow(" [writes]") : "";
     // Only when it is not the model everything else runs on — a column of the
@@ -198,221 +167,213 @@ function renderPlan(steps: Step[], statuses: Map<string, string>, dflt?: string)
   }
 }
 
-export async function runOrchestration(app: App, task: string): Promise<void> {
+/** Inspect saved work without starting requests. */
+export function orchestrationStatus(app: App): void {
+  const state = app.session.orchestration;
+  if (!state) return void hint("No saved orchestration. /orchestrate <task> starts one.");
+  padded(`${c.bold(state.status)} · ${state.phase} · ${state.task}`);
+  renderPlan(state.steps, new Map(Object.entries(state.statuses)), app.session.model);
+  if (state.status !== "complete") hint("/orchestrate resume · /orchestrate replan <instructions>");
+}
+
+export async function runOrchestration(app: App, task: string, mode: "new" | "resume" | "replan" = "new"): Promise<void> {
+  const saved = app.session.orchestration;
+  if (mode !== "new" && (!saved || saved.status === "complete")) {
+    hint("No unfinished orchestration. /orchestrate <task> starts one.");
+    return;
+  }
+  await app.runTask("orchestration", async (progress) => {
+    if (!await app.authorizeSubagents(true)) return;
+    const state: OrchestrationState = mode === "new" ? {
+      task, model: app.session.model,
+      context: attachHistory(app.session.messages) + attachReferenced(app.cwd, task),
+      status: "running", phase: "planning", steps: [], statuses: {}, results: {}, messages: {},
+      startedAt: Date.now(), updatedAt: Date.now(),
+    } : saved!;
+    app.session.orchestration = state;
+    if (mode === "new") {
+      markTurn(app.session, `[orchestration] ${task}`);
+      app.session.add({ role: "user", content: `[orchestration] ${task}` });
+    }
+    if (mode === "replan") {
+      state.phase = "planning";
+      state.revision = task;
+      state.messages.__planner = [];
+      state.context = attachHistory(app.session.messages) + attachReferenced(app.cwd, state.task + " " + task);
+    }
+    state.status = "running";
+    const save = () => { state.updatedAt = Date.now(); app.session.save(); };
+    save();
+    try {
+      await execute(app, state, progress, save);
+    } catch (err) {
+      state.status = app.toolContext().signal.aborted ? "paused" : "failed";
+      throw err;
+    } finally {
+      if (app.toolContext().signal.aborted) {
+        state.status = "paused";
+        for (const step of state.steps) {
+          if (state.statuses[step.id] === "running") state.statuses[step.id] = "interrupted";
+        }
+        hint("Plan and results saved. /orchestrate resume continues; /orchestrate status shows progress.");
+      }
+      save();
+    }
+  });
+}
+
+async function execute(app: App, state: OrchestrationState, progress: TaskProgress, save: () => void): Promise<void> {
   const cfg = loadConfig();
   const ctx = app.toolContext();
-  const started = Date.now();
-
+  const offered = stepModels(app);
   line();
   rule(c.brightMagenta(" orchestration "));
-  padded(c.bold("task") + "  " + truncate(task, 90));
+  padded(c.bold("task") + "  " + truncate(state.task, 90));
   line();
 
-  // ── plan ────────────────────────────────────────────────────────────────
-  // Only worth offering when there is a choice: one model is what happens
-  // anyway, and a list of one in the prompt is tokens spent on nothing.
-  const offered = stepModels(app);
-  const canChoose = offered.length > 1;
-  const planner = canChoose ? PLANNER_PROMPT + modelBlock(offered, app.session.model) : PLANNER_PROMPT;
-  const sp = new Spinner("planning the breakdown");
-  sp.start();
-  let steps: Step[];
-  const planUsage = new UsageTracker();
-  try {
-    const res = await complete({
+  if (state.phase === "planning" || !state.steps.length) {
+    progress.label("planning the breakdown");
+    const completed = state.steps.filter((s) => state.results[s.id]?.ok);
+    const prior = completed.map((s) => `${s.id}: ${s.title}\n${state.results[s.id].text}`).join("\n\n");
+    const unfinished = state.steps.filter((s) => !state.results[s.id]?.ok)
+      .map((s) => `${s.id}: ${state.results[s.id]?.text || "not finished"}${attachHistory(state.messages[s.id], 6000)}`).join("\n\n");
+    const revision = state.steps.length ? `\n\nRevise the unfinished work. Keep completed steps intact; return ONLY remaining steps, which may depend on completed ids. Incomplete writing steps may already have changed files: inspect the current workspace before assigning another write.\nCompleted steps:\n${prior || "none"}\nIncomplete work:\n${unfinished || "none"}\nPrevious plan:\n${JSON.stringify(state.steps)}\nUser instructions:\n${state.revision || "Continue the remaining task."}` : "";
+    const messages = state.messages.__planner ??= [];
+    if (messages.length) messages.push({ role: "user", content: "Continue planning. Inspect files as needed, then return a complete valid JSON plan from the beginning; do not continue a partial JSON fragment." });
+    const events = progress.events();
+    const res = await runWorker({
       model: app.session.model,
-      messages: [
-        { role: "system", content: planner },
-        { role: "user", content: `Working directory: ${app.cwd}\n\nTask:\n${task}` },
-      ],
-      temperature: 0.2,
-      effort: effortFor(app.session.model, app.effortOverride),
-      signal: ctx.signal,
+      systemPrompt: PLANNER_PROMPT + (offered.length > 1 ? modelBlock(offered, app.session.model) : "") +
+        "\nYou have read tools: inspect relevant project files before finalizing the plan. Your final answer must be the JSON object.",
+      prompt: `Working directory: ${app.cwd}\n\nTask:\n${state.task}${state.context}${revision}`,
+      messages,
+      context: ctx, tools: app.toolList(), readOnly: true, skills: [], catalog: app.catalog,
+      usage: app.usage, maxSteps: cfg.maxSteps, ceiling: 8, effort: effortFor(app.session.model, app.effortOverride),
+      activity: (text) => progress.activity(`planner · ${text}`),
+      events: { ...events, onStep: () => save() },
     });
-    planUsage.record(app.session.model, res.usage, app.catalog);
-    app.usage.absorb(planUsage);
-    steps = normalizePlan(extractJson(res.content));
-    // Resolved once, here: the plan on screen has to name the model that will
-    // actually run, not the one the planner wished for.
-    for (const s of steps) s.model = resolveStepModel(canChoose ? offered : [], s.model, app.session.model);
-    sp.stop();
-  } catch (err) {
-    sp.stop();
-    app.usage.absorb(planUsage);
-    error(`Could not build a plan: ${(err as Error).message}`);
-    hint("Try a more concrete task, or just run it as a normal request.");
-    return;
-  }
-
-  const statuses = new Map<string, string>();
-  padded(c.bold("plan"));
-  renderPlan(steps, statuses, app.session.model);
-  line();
-
-  // ── execute ─────────────────────────────────────────────────────────────
-  const results = new Map<string, StepResult>();
-  const readTools: ToolDef[] = app.toolList().filter((t) => t.risk === "read");
-  const allTools: ToolDef[] = app.toolList().filter((t) => t.name !== "task");
-
-  for (const wave of waves(steps)) {
-    if (ctx.signal.aborted) break;
-
-    const runs = wave.map(async (step) => {
-      const model = step.model ?? app.session.model;
-      const usage = new UsageTracker();
-      const tag = c.brightBlue(`  ├ ${step.id}`);
-      statuses.set(step.id, "running");
-      padded(`${tag} ${c.bold(step.title)} ${c.gray(`· ${model}${step.writes ? "" : " · read-only"}`)}`);
-
-      // A dependency that failed is named, not dropped: silently handing on
-      // an empty context lets the step build on work that never happened.
-      const prior = step.deps.map((d) => results.get(d)).filter((r): r is StepResult => Boolean(r));
-      const context = prior
-        .map((r) =>
-          r.ok
-            ? `<step-result id="${r.step.id}" title="${r.step.title}">\n${r.text}\n</step-result>`
-            : `<step-failed id="${r.step.id}" title="${r.step.title}">${
-                r.text.trim() || "This step produced no result."
-              }</step-failed>`,
-        )
-        .join("\n\n");
-      const failedDep = prior.some((r) => !r.ok);
-
-      const prompt = context
-        ? `${step.prompt}\n\nWhat other agents already established — build on this, do not re-verify it.${
-            failedDep
-              ? " A step shown as step-failed produced nothing: whatever it was meant to establish is still open, so do not assume its work was done."
-              : ""
-          }\n\n${context}`
-        : step.prompt;
-
-      const t0 = Date.now();
-      try {
-        const res = await runAgent({
-          model,
-          systemPrompt: buildSystemPrompt({ cwd: app.cwd, model, skills: app.activeSkills, subagent: true }),
-          messages: [{ role: "user", content: prompt }],
-          tools: step.writes ? allTools : readTools,
-          toolContext: { ...ctx, depth: 1 },
-          catalog: app.catalog,
-          usage,
-          maxSteps: stepCeiling(cfg.maxSteps, 30),
-          signal: ctx.signal,
-          effort: effortFor(model, app.effortOverride),
-          toolConcurrency: Math.min(3, loadConfig().toolConcurrency),
-          events: {
-            onToolStart: (tool, args) => {
-              padded(`${tag} ${c.cyan(tool.name)} ${c.gray(truncate(tool.summarize?.(args) ?? "", 60))}`);
-            },
-          },
-        });
-
-        app.usage.absorb(usage);
-        const t = usage.totals();
-        const ms = Date.now() - t0;
-        const ok = Boolean(res.finalText.trim()) && res.stoppedBecause !== "aborted";
-        statuses.set(step.id, ok ? "done" : "failed");
-        padded(
-          `${tag} ${ok ? c.green("done") : c.red("no result")} ${c.gray(
-            `${fmtDuration(ms)} · ${fmtTokens(t.input + t.output)} tokens`,
-          )}`,
-        );
-        results.set(step.id, { step, text: res.finalText, ok, ms });
-      } catch (err) {
-        app.usage.absorb(usage);
-        const msg = (err as Error)?.name === "AbortError" ? "interrupted" : (err as Error).message;
-        statuses.set(step.id, "failed");
-        padded(`${tag} ${c.red("failed")} ${c.dim(msg)}`);
-        // The reason is kept: a step that depends on this one is told what
-        // went wrong, and only `ok` results ever reach the synthesis.
-        results.set(step.id, { step, text: `This step failed: ${msg}`, ok: false, ms: Date.now() - t0 });
-      }
-    });
-
-    await Promise.all(runs);
-  }
-
-  const good = [...results.values()].filter((r) => r.ok);
-  line();
-  padded(c.bold("step results"));
-  renderPlan(steps, statuses, app.session.model);
-  line();
-
-  if (!good.length) {
-    warn("No step produced a result.");
-    return;
-  }
-
-  // ── synthesise ──────────────────────────────────────────────────────────
-  const bundle = good
-    .map((r) => `<step id="${r.step.id}" title="${r.step.title}">\n${r.text}\n</step>`)
-    .join("\n\n");
-
-  const synthUsage = new UsageTracker();
-  const stream: { md: MarkdownStream | null } = { md: null };
-  const sp2 = new Spinner("merging the results");
-  sp2.start();
-  let answer = "";
-
-  try {
-    const res = await runAgent({
-      model: app.session.model,
-      systemPrompt: SYNTH_PROMPT,
-      messages: [{ role: "user", content: `Task:\n${task}\n\nStep results:\n\n${bundle}` }],
-      tools: [],
-      toolContext: { ...ctx, depth: 1 },
-      catalog: app.catalog,
-      usage: synthUsage,
-      maxSteps: 1,
-      signal: ctx.signal,
-      effort: effortFor(app.session.model, app.effortOverride),
-      events: {
-        onText: (delta) => {
-          if (!stream.md) {
-            sp2.stop();
-            line();
-            assistantPrefix(`${app.session.model} ${c.gray("· synthesis")}`);
-            stream.md = new MarkdownStream();
-          }
-          stream.md.push(delta);
-        },
-      },
-    });
-    sp2.stop();
-    stream.md?.end();
-    answer = res.finalText;
-  } catch (err) {
-    sp2.stop();
-    warn(`Synthesis failed: ${(err as Error).message}`);
-  }
-
-  app.usage.absorb(synthUsage);
-
-  if (!answer.trim()) {
-    warn("Synthesis was empty — raw step results below.");
-    for (const r of good) {
-      line();
-      assistantPrefix(`${r.step.id} · ${r.step.title}`);
-      const md = new MarkdownStream();
-      md.push(r.text);
-      md.end();
+    if (ctx.signal.aborted) return;
+    if (res.stoppedBecause !== "stop") throw new Error(`Planner did not finish (${res.stoppedBecause}). /orchestrate resume retries it.`);
+    const raw = extractJson(res.finalText);
+    const doneIds = new Set(completed.map((s) => s.id));
+    const remaining = (Array.isArray(raw.steps) ? raw.steps : []).filter((s: any) => !doneIds.has(String(s?.id)));
+    const steps = normalizePlan({ steps: [...completed, ...remaining] });
+    for (const step of steps) if (!doneIds.has(step.id)) step.model = resolveStepModel(offered, step.model, app.session.model);
+    state.steps = steps;
+    if (state.revision !== undefined) {
+      for (const id of Object.keys(state.results)) if (!doneIds.has(id)) delete state.results[id];
+      for (const id of Object.keys(state.messages)) if (id !== "__planner" && !doneIds.has(id)) delete state.messages[id];
+      state.statuses = Object.fromEntries(completed.map((s) => [s.id, "done" as const]));
+      delete state.revision;
     }
-    answer = good.map((r) => `## ${r.step.title}\n${r.text}`).join("\n\n");
+    state.phase = "execution";
+    save();
   }
 
-  app.session.add({ role: "user", content: `[orchestration: ${steps.length} steps] ${task}` });
-  app.session.add({ role: "assistant", content: answer, meta: { model: app.session.model } });
-  app.session.save();
+  padded(c.bold("plan"));
+  renderPlan(state.steps, new Map(Object.entries(state.statuses)), app.session.model);
+  line();
+  for (const wave of waves(state.steps)) {
+    if (ctx.signal.aborted) return;
+    const pending = wave.filter((step) => !state.results[step.id]?.ok);
+    await runPool(pending, cfg.toolConcurrency, ctx.signal, async (step) => {
+      if (step.deps.some((id) => !state.results[id]?.ok)) {
+        state.statuses[step.id] = "skipped";
+        state.results[step.id] = { text: "Skipped because a required dependency failed.", ok: false, ms: 0 };
+        save();
+        return;
+      }
+      const model = resolveStepModel(workerModels(app.catalog, app.session.model), step.model, app.session.model);
+      step.model = model;
+      state.phase = "execution";
+      state.statuses[step.id] = "running";
+      const tag = c.brightBlue(`  ├ ${step.id}`);
+      progress.label(`orchestration · ${Object.values(state.results).filter((r) => r.ok).length}/${state.steps.length} done`);
+      padded(`${tag} ${c.bold(step.title)} ${c.gray(`· ${model}${step.writes ? "" : " · read-only"}`)}`);
+      const prior = step.deps.map((id) => `<step-result id="${id}">\n${state.results[id].text}\n</step-result>`).join("\n\n");
+      const prompt = `${step.prompt}\n\nOriginal task:\n${state.task}${state.context}${prior ? `\n\nCompleted dependencies:\n${prior}` : ""}`;
+      const messages = state.messages[step.id] ??= [];
+      if (messages.length) messages.push({ role: "user", content: "Continue this unfinished assignment. Preserve completed changes; verify the current files before repeating any write or command." });
+      const events = progress.events();
+      const t0 = Date.now();
+      save();
+      try {
+        const res = await runWorker({
+          model, prompt, messages, context: ctx, tools: app.toolList(), readOnly: !step.writes,
+          skills: app.activeSkills, catalog: app.catalog, usage: app.usage,
+          maxSteps: cfg.maxSteps, ceiling: 30, effort: effortFor(model, app.effortOverride),
+          activity: (text) => progress.activity(`${step.id} · ${text}`),
+          events: { ...events, onStep: () => save() },
+        });
+        const ok = !ctx.signal.aborted && res.stoppedBecause === "stop" && Boolean(res.finalText.trim());
+        state.statuses[step.id] = ctx.signal.aborted ? "interrupted" : ok ? "done" : "failed";
+        state.results[step.id] = {
+          text: ok ? res.finalText : `${res.finalText}\n\nUnfinished: ${res.stoppedBecause}.`,
+          ok, ms: Date.now() - t0,
+        };
+        padded(`${tag} ${ok ? c.green("done") : c.yellow(state.statuses[step.id])} ${c.gray(fmtDuration(Date.now() - t0))}`);
+      } catch (err) {
+        state.statuses[step.id] = ctx.signal.aborted ? "interrupted" : "failed";
+        state.results[step.id] = { text: `This step failed: ${(err as Error).message}`, ok: false, ms: Date.now() - t0 };
+        padded(`${tag} ${c.red(state.statuses[step.id])} ${c.dim((err as Error).message)}`);
+      } finally { save(); }
+    });
+  }
+  if (ctx.signal.aborted) return;
+  const good = state.steps.filter((s) => state.results[s.id]?.ok);
+  padded(c.bold("step results"));
+  renderPlan(state.steps, new Map(Object.entries(state.statuses)), app.session.model);
+  if (!good.length) {
+    state.status = "failed";
+    app.lastTurnFailed = true;
+    warn("No step produced a result. /orchestrate resume retries; /orchestrate replan <instructions> revises the plan.");
+    return;
+  }
 
-  const totals = app.usage.totals();
+  state.phase = "synthesis";
+  save();
+  progress.label("merging the results");
+  const bundle = good.map((s) => `<step id="${s.id}" title="${s.title}">\n${state.results[s.id].text}\n</step>`).join("\n\n");
+  const failures = state.steps.filter((s) => !state.results[s.id]?.ok).map((s) => `${s.id}: ${state.results[s.id]?.text || "not run"}`).join("\n");
+  const stream: { md: MarkdownStream | null } = { md: null };
+  const events = progress.events();
+  let answer = "";
+  try {
+    const res = await runWorker({
+      model: app.session.model, systemPrompt: SYNTH_PROMPT,
+      prompt: `Task:\n${state.task}${state.context}\n\nStep results:\n${bundle}\n\nFailed or skipped steps (report as incomplete):\n${failures || "none"}`,
+      context: ctx, tools: [], readOnly: true, skills: [], catalog: app.catalog, usage: app.usage,
+      maxSteps: 1, ceiling: 1, effort: effortFor(app.session.model, app.effortOverride),
+      events: { ...events, onText: (delta) => {
+        events.onText?.(delta);
+        if (!stream.md) { line(); assistantPrefix(`${app.session.model} ${c.gray("· synthesis")}`); stream.md = new MarkdownStream(); }
+        stream.md.push(delta);
+      } },
+    });
+    answer = res.finalText;
+    if (ctx.signal.aborted) { state.answer = answer; return; }
+    if (res.stoppedBecause !== "stop") throw new Error(`Synthesis did not finish (${res.stoppedBecause}).`);
+  } catch (err) {
+    if (ctx.signal.aborted) return;
+    warn(`Synthesis failed: ${(err as Error).message}. Completed step results are saved.`);
+    state.status = "failed";
+    app.lastTurnFailed = true;
+    hint("/orchestrate resume retries synthesis without repeating completed steps.");
+    return;
+  } finally { stream.md?.end(); }
+  if (!answer.trim()) {
+    state.status = "failed";
+    app.lastTurnFailed = true;
+    warn("Synthesis was empty. /orchestrate resume retries it.");
+    return;
+  }
+  state.answer = answer;
+  state.status = failures ? "failed" : "complete";
+  app.lastTurnFailed = Boolean(failures);
+  app.session.add({ role: "assistant", content: answer, meta: { model: app.session.model } });
+  save();
   line();
-  padded(
-    [
-      c.brightMagenta(`orchestration ${good.length}/${steps.length}`),
-      c.gray(fmtDuration(Date.now() - started)),
-      c.gray(fmtTokens(totals.input + totals.output) + " tokens this session"),
-    ].join(c.gray(" · ")),
-  );
-  hint("The result is in the history — carry on with normal requests.");
-  line();
+  padded([c.brightMagenta(`orchestration ${good.length}/${state.steps.length}`), c.gray(fmtDuration(Date.now() - state.startedAt)),
+    c.gray(fmtTokens(app.usage.turnTotals().input + app.usage.turnTotals().output) + " tokens this turn")].join(c.gray(" · ")));
+  if (failures) hint("Incomplete steps saved. /orchestrate resume · /orchestrate replan <instructions>");
 }

@@ -5,6 +5,7 @@ import crypto from "node:crypto";
 import { sessionsDir } from "../config.js";
 import { removeProjection } from "./projection.js";
 import type { Goal } from "./goal.js";
+import type { OrchestrationState } from "./orchestration.js";
 import { UsageTracker, historyTokens, type ModelUsage } from "../usage.js";
 import type { Message } from "../types.js";
 
@@ -28,6 +29,7 @@ interface SessionFile {
   meta: SessionMeta;
   messages: Message[];
   usage: ModelUsage[];
+  orchestration?: OrchestrationState;
 }
 
 /**
@@ -48,6 +50,8 @@ export class Session {
   compactions = 0;
   /** The persistent goal (/goal); null when none was set. */
   goal: Goal | null = null;
+  orchestration: OrchestrationState | null = null;
+  saveError: string | null = null;
 
   constructor(opts: { id?: string; cwd: string; model: string; title?: string; createdAt?: number }) {
     this.id = opts.id ?? newId();
@@ -105,18 +109,35 @@ export class Session {
       },
       messages: this.messages,
       usage: this.usage.toJSON(),
+      orchestration: this.orchestration ?? undefined,
     };
+    const file = this.file();
+    const temp = `${file}.${crypto.randomUUID()}.tmp`;
+    const backupTemp = `${file}.${crypto.randomUUID()}.bak.tmp`;
     try {
-      fs.writeFileSync(this.file(), JSON.stringify(payload, null, 2));
-    } catch {
-      /* never let a disk hiccup kill the turn */
+      fs.writeFileSync(temp, JSON.stringify(payload, null, 2), { flag: "wx", mode: 0o600 });
+      if (fs.existsSync(file)) {
+        fs.copyFileSync(file, backupTemp);
+        fs.renameSync(backupTemp, `${file}.bak`);
+      }
+      fs.renameSync(temp, file);
+      this.saveError = null;
+    } catch (err) {
+      const message = `Could not save session ${this.id}: ${(err as Error).message}`;
+      if (this.saveError !== message) process.stderr.write(message + "\n");
+      this.saveError = message;
+    } finally {
+      for (const p of [temp, backupTemp]) { try { fs.unlinkSync(p); } catch { /* absent */ } }
     }
   }
 
   static load(cwd: string, id: string): Session | null {
     try {
-      const raw = fs.readFileSync(path.join(sessionsDir(cwd), `${id}.json`), "utf8");
-      const data = JSON.parse(raw) as SessionFile;
+      if (!/^[\w-]+$/.test(id)) return null;
+      const file = path.join(sessionsDir(cwd), `${id}.json`);
+      let data: SessionFile;
+      try { data = JSON.parse(fs.readFileSync(file, "utf8")) as SessionFile; }
+      catch { data = JSON.parse(fs.readFileSync(`${file}.bak`, "utf8")) as SessionFile; }
       const s = new Session({
         id: data.meta.id,
         cwd: data.meta.cwd || cwd,
@@ -128,6 +149,13 @@ export class Session {
       s.usage = UsageTracker.fromJSON(data.usage);
       s.compactions = data.meta.compactions ?? 0;
       s.goal = data.meta.goal ?? null;
+      s.orchestration = data.orchestration ?? null;
+      if (s.orchestration?.status === "running") {
+        s.orchestration.status = "paused";
+        for (const [id, status] of Object.entries(s.orchestration.statuses)) {
+          if (status === "running") s.orchestration.statuses[id] = "interrupted";
+        }
+      }
       return s;
     } catch {
       return null;
@@ -162,6 +190,7 @@ export class Session {
   static remove(cwd: string, id: string): boolean {
     try {
       fs.unlinkSync(path.join(sessionsDir(cwd), `${id}.json`));
+      try { fs.unlinkSync(path.join(sessionsDir(cwd), `${id}.json.bak`)); } catch { /* absent */ }
       removeProjection(cwd, id);
       return true;
     } catch {

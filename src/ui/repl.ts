@@ -1,6 +1,7 @@
 /** Interactive REPL: input loop, turn execution, live transcript. */
 import path from "node:path";
 import os from "node:os";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { c } from "./ansi.js";
 import {
   MarkdownStream,
@@ -36,13 +37,15 @@ import { expandPastes, rememberCollapsed } from "./paste.js";
 import { InputEditor, PipeReader, setExtraNewlineKeys } from "./editor.js";
 import { choose } from "./choice.js";
 import { askLine } from "./prompt.js";
+import { questionModal } from "./questions.js";
+import type { UserQuestion, UserAnswer } from "../tools/questions.js";
 import { TurnBar, InterruptWatcher } from "./turnbar.js";
 import { OrcaReporter } from "./orca.js";
 import { pushConsumer } from "./stdin.js";
 import { PermissionBroker } from "./permissions.js";
-import { loadConfig, projectState, VERSION, type Config, type Effort } from "../config.js";
+import { loadConfig, saveConfig, projectState, VERSION, type Config, type Effort } from "../config.js";
 import { refreshCache, appliedUpdate, versionBadge } from "../update.js";
-import { fetchModels, cachedModels, catalogIsFresh, effortFor, usableModels, resolveModelId, findModel, sameModelElsewhere } from "../provider/models.js";
+import { fetchModels, cachedModels, catalogIsFresh, contextWindowFor, effortFor, usableModels, resolveModelId, findModel, sameModelElsewhere } from "../provider/models.js";
 import { defaultProviderId, hasProvider, modeFor, providerLabel, providerState, splitModelId, wireModelId } from "../provider/registry.js";
 
 /**
@@ -67,7 +70,9 @@ function startingModel(cwd: string): string {
 import { ApiError, modelRejectsEffort } from "../provider/client.js";
 import { buildSystemPrompt } from "../agent/prompt.js";
 import { composePrompt, promptModelFor } from "../agent/promptwriter.js";
-import { runAgent } from "../agent/loop.js";
+import { runAgent, type AgentEvents } from "../agent/loop.js";
+import { delegationPreference } from "../agent/delegation.js";
+import { subagentModelsConfigured } from "../agent/worker.js";
 import { buildTools, TodoStore } from "../tools/index.js";
 import { shellTool } from "../tools/shell.js";
 import { createSpillStore, type SpillStore } from "../tools/spill.js";
@@ -91,10 +96,16 @@ import { compactSession, contextPressure, shouldAutoCompact } from "../session/c
 import { markTurn, pruneOrphanStores, recordWrite } from "../session/checkpoint.js";
 import { UsageTracker, estimateTokens, fmtTokens } from "../usage.js";
 import type { Message, ModelInfo, ToolCall, ToolContext, ToolDef } from "../types.js";
-import { runCommand, isCommand, commandNames, commandSuggestions, printCommandIndex } from "./commands.js";
+import { runCommand, isCommand, commandNames, commandSuggestions, printCommandIndex, subagentsModal } from "./commands.js";
 
 const ESC = String.fromCharCode(27);
 const CTRL_C = String.fromCharCode(3);
+
+export interface TaskProgress {
+  label(text: string): void;
+  activity(text: string): void;
+  events(): AgentEvents;
+}
 
 /**
  * A share, as a percentage that cannot exceed 100. Hosts disagree on whether
@@ -156,6 +167,10 @@ export class App {
   loadedSkills = new Set<string>();
 
   private abort: AbortController | null = null;
+  private subagentDecision: Promise<boolean> | null = null;
+  private subagentDecisionProvider = "";
+  private explicitSubagents = false;
+  private forbiddenSubagents = false;
   private quitting = false;
   private tools: ToolDef[] = [];
 
@@ -211,6 +226,9 @@ export class App {
   private orca = OrcaReporter.detect();
   /** Releases the turn-cancel key listener; null when no turn is running. */
   private turnKeys: (() => void) | null = null;
+  /** All interactive gates share stdin, including concurrent workers. */
+  private inputQueue: Promise<unknown> = Promise.resolve();
+  private inputScope = new AsyncLocalStorage<boolean>();
 
   constructor(opts: { cwd: string; model?: string; autoApprove?: boolean; session?: Session }) {
     this.cwd = opts.cwd;
@@ -340,7 +358,7 @@ export class App {
         if (hit) this.loadedSkills.add(hit[1]);
       }
     }
-    this.tools = buildTools({
+    const tools = buildTools({
       skills: this.activeSkills,
       loadedSkills: this.loadedSkills,
       todo: this.todo,
@@ -361,6 +379,7 @@ export class App {
       subagentDeps: {
         cwd: this.cwd,
         catalog: this.catalog,
+        catalogNow: () => this.catalog,
         skills: this.skills,
         tools: () => this.tools,
         defaultModel: this.session.model,
@@ -369,8 +388,12 @@ export class App {
         usage: this.usage,
         // In a pipe there is no bar to preview into — print steps as before.
         activity: process.stdout.isTTY ? this.subagentActivity : undefined,
+        authorize: () => this.authorizeSubagents(),
       },
     });
+    // A model picker can run inside a task call. Update the active loop's
+    // shared tool array so its next request sees the selected helper models.
+    this.tools.splice(0, this.tools.length, ...tools);
   }
 
   /** Sends text as a turn, the same way a queued message is sent. */
@@ -381,6 +404,141 @@ export class App {
   /** Puts text in the input box for the user to finish. */
   prefill(text: string): void {
     this.editor?.prefill(text);
+  }
+
+  /** The same terminal owner for ordinary chat and command-driven work. */
+  private startTurn(): TurnBar {
+    if (this.abort || this.bar) throw new Error("A task is already running.");
+    this.abort = new AbortController();
+    this.lastAborted = false;
+    this.lastTurnFailed = false;
+    this.activityLines = [];
+    this.activityActive = 0;
+    this.subagentDecision = null;
+    this.subagentDecisionProvider = "";
+    this.explicitSubagents = false;
+    this.forbiddenSubagents = false;
+    this.usage.beginTurn();
+    const bar = new TurnBar({
+      status: () => composeStatus({ ...this.status(), hint: "esc to interrupt · enter to queue" }),
+      onInterrupt: () => this.abort?.abort(),
+      onToggleMode: () => this.toggleAutoApprove(),
+      history: this.history,
+    });
+    this.bar = bar;
+    bar.start();
+    return bar;
+  }
+
+  private async finishTurn(typed: { queued: string[]; draft: string }, unsent = ""): Promise<void> {
+    this.bar = null;
+    const interrupted = Boolean(this.abort?.signal.aborted);
+    this.lastAborted = interrupted;
+    if (interrupted) {
+      const held = [unsent, ...typed.queued, typed.draft].filter(Boolean).join("\n");
+      if (held) this.editor?.prefill(held);
+      if (typed.queued.length) hint(tr("Queued messages were not sent.", "Сообщения из очереди не отправлены."));
+    } else {
+      this.pending.push(...typed.queued);
+      if (typed.draft) this.editor?.prefill(typed.draft);
+    }
+    this.abort = null;
+    this.activityLines = [];
+    this.activityActive = 0;
+    this.session.save();
+    if (!this.pending.length) await this.orca?.idle(this.session.id);
+  }
+
+  /** Long slash commands own stdin, cancellation, accounting and the footer like chat. */
+  async runTask(label: string, run: (progress: TaskProgress) => Promise<void>): Promise<void> {
+    if (!hasProvider()) {
+      error(tr("No provider connected. Run /login.", "Поставщик не подключён. Наберите /login."));
+      return;
+    }
+    const bar = this.startTurn();
+    bar.setLabel(label);
+    this.orca?.busy(this.session.id);
+    let input = 0, output = 0, cached = 0;
+    const repaint = () => bar.setTokens(input, Math.max(0, output), cached);
+    const progress: TaskProgress = {
+      label: (text) => bar.setLabel(text),
+      activity: (text) => this.subagentActivity.push(truncate(text, 120)),
+      events: () => {
+        let streamed = 0;
+        const bump = (delta: string) => {
+          const tokens = estimateTokens(delta);
+          streamed += tokens;
+          output += tokens;
+          repaint();
+        };
+        return {
+          onText: bump,
+          onReasoning: bump,
+          onUsage: (_model, usage) => {
+            if (!usage) return;
+            input += usage.prompt_tokens;
+            output += usage.completion_tokens - streamed;
+            cached += usage.cached_tokens ?? 0;
+            streamed = 0;
+            repaint();
+          },
+        };
+      },
+    };
+    try {
+      await run(progress);
+    } catch (err) {
+      if (!this.abort?.signal.aborted && (err as Error)?.name !== "AbortError") {
+        this.lastTurnFailed = true;
+        error((err as Error).message);
+        this.suggestAnotherHost(err);
+      }
+    } finally {
+      if (this.abort?.signal.aborted) warn(tr("Interrupted.", "Прервано."));
+      await this.finishTurn(bar.stop());
+    }
+  }
+
+  /** One decision for a batch of helper launches; concurrent tool calls share it. */
+  authorizeSubagents(explicit = false): Promise<boolean> {
+    if (this.abort?.signal.aborted || this.forbiddenSubagents) return Promise.resolve(false);
+    const provider = splitModelId(this.session.model).providerId;
+    if (this.subagentDecisionProvider !== provider) {
+      this.subagentDecisionProvider = provider;
+      this.subagentDecision = null;
+    }
+    this.subagentDecision ??= this.decideSubagents(explicit || this.explicitSubagents);
+    return this.subagentDecision;
+  }
+
+  private async decideSubagents(explicit: boolean): Promise<boolean> {
+    const provider = splitModelId(this.session.model).providerId;
+    if (!explicit && loadConfig().subagentAuto?.[provider] !== true) {
+      if (!process.stdin.isTTY) return false;
+      const answer = await this.exclusiveInput(async () => {
+        line();
+        padded(c.bold(tr("Allow the agent to launch subagents?", "Разрешить запуск субагентов?")));
+        return choose<"yes" | "no" | "auto">([
+          { value: "yes", label: tr("Yes", "Да"), key: "y", tone: "ok" },
+          { value: "no", label: tr("No", "Нет"), key: "n", tone: "danger" },
+          { value: "auto", label: tr("Enable auto mode", "Включить авто"), key: "a", tone: "warn" },
+        ], { initial: "yes", fallback: "no", cancel: () => this.abort?.abort() });
+      });
+      if (answer === "no" || this.abort?.signal.aborted) return false;
+      if (answer === "auto") {
+        saveConfig({ subagentAuto: { [provider]: true } });
+        this.cfg = loadConfig();
+      }
+    }
+    if (!subagentModelsConfigured(this.catalog, this.session.model)) {
+      if (!process.stdin.isTTY) return false;
+      await subagentsModal(this, true);
+      if (!subagentModelsConfigured(this.catalog, this.session.model)) {
+        this.abort?.abort();
+        return false;
+      }
+    }
+    return !this.abort?.signal.aborted;
   }
 
   /**
@@ -448,17 +606,35 @@ export class App {
   }
 
   toolContext(): ToolContext {
+    const signal = this.abort?.signal ?? new AbortController().signal;
     return {
       cwd: this.cwd,
-      signal: this.abort?.signal ?? new AbortController().signal,
+      signal,
       depth: 0,
-      confirm: (tool, args, preview) => this.broker.confirm(tool, args, preview),
+      askUser: process.stdin.isTTY && process.stdout.isTTY ? (questions) => this.askUserQuestions(questions, signal) : undefined,
+      confirm: (tool, args, preview) => this.broker.confirm(tool, args, preview, signal),
       previewShown: (preview) => this.broker.previewShown(preview),
       snapshot: (opts) => recordWrite(this.session, opts),
+      billMedia: (model, cost, id) => {
+        this.session.usage.recordMedia(model, cost, id ?? crypto.randomUUID());
+        this.session.save();
+      },
       emit: (l) => this.progress(l),
       readFiles: this.readFiles,
       spill: this.spillStore(),
     };
+  }
+
+  private askUserQuestions(questions: UserQuestion[], signal: AbortSignal): Promise<UserAnswer[] | null> {
+    return this.exclusiveInput(async () => {
+      if (signal.aborted) return null;
+      this.orca?.waiting("ask_user_question", questions[0].question);
+      try {
+        return await questionModal(questions, { signal, onCancel: () => this.abort?.abort() });
+      } finally {
+        this.orca?.busy(this.session.id);
+      }
+    });
   }
 
   /**
@@ -512,26 +688,17 @@ export class App {
       );
       hint(tr("Name one: /brain discuss ideas/001.md", "Назовите файл: /brain обсудите ideas/001.md"));
     }
-    this.abort = new AbortController();
     // The same bar an ordinary turn runs under, and for the same reasons: it
     // is what holds the input frame, the status line and the queue. A panel
     // that runs for minutes behind a bare spinner takes the box off the screen
     // exactly when the user most wants to type the next thing.
-    const bar = new TurnBar({
-      status: () => composeStatus({ ...this.status(), hint: "esc to interrupt · enter to queue" }),
-      onInterrupt: () => this.abort?.abort(),
-      onToggleMode: () => this.toggleAutoApprove(),
-      history: this.history,
-    });
-    this.bar = bar;
+    const bar = this.startTurn();
     const spinner = {
       setLabel: (l: string) => bar.setLabel(l),
       start: () => {},
       stop: () => {},
     };
     const started = Date.now();
-    this.usage.beginTurn();
-    bar.start();
     try {
       const res = await runBrain({
         task: question,
@@ -551,7 +718,7 @@ export class App {
         catalog: this.catalog,
         effortFor: (m) => effortFor(m, this.effortOverride),
         usage: this.usage,
-        signal: this.abort.signal,
+        signal: this.abort!.signal,
         events: {
           onStart: (model, round) => {
             spinner.setLabel(
@@ -599,17 +766,7 @@ export class App {
     } finally {
       // Same hand-back as an ordinary turn: what was typed while the panel ran
       // is queued, and an interrupt gives it back instead of sending it.
-      const { queued, draft } = bar.stop();
-      this.bar = null;
-      const interrupted = Boolean(this.abort?.signal.aborted);
-      if (interrupted) {
-        const held = [...queued, draft].filter(Boolean).join("\n");
-        if (held) this.editor?.prefill(held);
-      } else {
-        this.pending.push(...queued);
-        if (draft) this.editor?.prefill(draft);
-      }
-      this.abort = null;
+      await this.finishTurn(bar.stop());
     }
   }
 
@@ -679,8 +836,23 @@ export class App {
     this.showBanner({ compact: true });
   }
 
+  /**
+   * contextPressure is O(transcript) — it must not run per footer frame
+   * (8 ticks a second plus one per streamed line), or long turns read as a
+   * frozen terminal. The estimate only moves when the history itself does,
+   * so it is memoized on the messages array reference and its length:
+   * compaction/load/fork reassign the array, tool results grow it.
+   */
+  private pressureCache: { ref: Message[]; len: number; model: string; catalog: ModelInfo[]; window: number; pressure: { used: number; window: number } } | null = null;
+
   private status(): StatusInfo {
-    const { used, window } = contextPressure(this.session, this.catalog);
+    let pressure = this.pressureCache;
+    const configuredWindow = contextWindowFor(this.session.model, this.catalog);
+    if (!pressure || pressure.ref !== this.session.messages || pressure.len !== this.session.messages.length || pressure.model !== this.session.model || pressure.catalog !== this.catalog || pressure.window !== configuredWindow) {
+      pressure = { ref: this.session.messages, len: this.session.messages.length, model: this.session.model, catalog: this.catalog, window: configuredWindow, pressure: contextPressure(this.session, this.catalog) };
+      this.pressureCache = pressure;
+    }
+    const { used, window } = pressure.pressure;
     return {
       mode: this.broker.autoApprove ? "yolo" : undefined,
       provider: providerLabel(splitModelId(this.session.model).providerId),
@@ -794,7 +966,7 @@ export class App {
     info(goalLine(goal!));
     await this.turn(goalPrompt(goal!));
     // Esc during a goal turn means stop, not "skip this round".
-    if (this.lastAborted) {
+    if (this.lastAborted || this.lastTurnFailed) {
       goal!.status = "paused";
       this.lastAborted = false;
       this.session.save();
@@ -811,7 +983,7 @@ export class App {
    */
   private checkGoalComplete(answer: string): void {
     const goal = this.session.goal;
-    if (!goal || goal.status !== "active") return;
+    if (!goal || goal.status === "complete") return;
     if (!/<goal-complete>/i.test(answer)) return;
     completeGoal(goal);
     this.session.save();
@@ -825,6 +997,15 @@ export class App {
    * run, so this only has to step aside for the turn-cancel key listener.
    */
   async exclusiveInput<T>(fn: () => Promise<T>): Promise<T> {
+    // Commands can open another chooser from their own exclusive callback.
+    // Keep those calls reentrant while unrelated tools wait their turn.
+    if (this.inputScope.getStore()) return fn();
+    const run = this.inputQueue.then(() => this.inputScope.run(true, () => this.withExclusiveInput(fn)));
+    this.inputQueue = run.catch(() => undefined);
+    return run;
+  }
+
+  private async withExclusiveInput<T>(fn: () => Promise<T>): Promise<T> {
     const hadTurnKeys = Boolean(this.turnKeys);
     if (hadTurnKeys) this.detachTurnKeys();
     // A permission prompt draws its own rows; the bar has to get out of the
@@ -1242,41 +1423,40 @@ export class App {
 
     // Created before auto-compaction, not after: the compaction request has to
     // hang off the same signal, or Esc cannot reach it.
-    this.abort = new AbortController();
-    // Fresh turn — a leftover verdict from the previous one (an Esc, a failed
-    // request) must not reach the goal loop through these flags.
-    this.lastAborted = false;
-    this.lastTurnFailed = false;
     // The bar goes up before auto-compaction and the brief rewrite, not after:
     // either can run for minutes on a full window, and a missing input frame
     // for that long reads as the CLI having died.
-    const bar = new TurnBar({
-      status: () => composeStatus({ ...this.status(), hint: "esc to interrupt · enter to queue" }),
-      onInterrupt: () => this.abort?.abort(),
-      onToggleMode: () => this.toggleAutoApprove(),
-      history: this.history,
-    });
-    this.bar = bar;
+    const bar = this.startTurn();
+    let unsent = "";
+    const delegation = delegationPreference(text);
+    this.explicitSubagents = delegation === "allow";
+    this.forbiddenSubagents = delegation === "deny";
+    try {
+      unsent = (await this.performTurn(text, bar)) ?? "";
+    } catch (err) {
+      this.lastTurnFailed = !this.abort?.signal.aborted;
+      if (this.lastTurnFailed) error((err as Error).message);
+      unsent = text;
+    } finally {
+      await this.finishTurn(bar.stop(), unsent);
+    }
+  }
+
+  private async performTurn(text: string, bar: TurnBar): Promise<string | undefined> {
+    const original = text;
     const spinner = {
       setLabel: (l: string) => bar.setLabel(l),
       setTokens: (i: number, o: number, cached?: number) => bar.setTokens(i, o, cached),
       start: () => {},
       stop: () => {},
     };
-    bar.start();
 
     await this.maybeAutoCompact();
-    if (this.abort.signal.aborted) {
+    if (this.abort!.signal.aborted) {
       warn(tr("Interrupted.", "Прервано."));
-      this.abort = null;
-      this.lastAborted = true;
       // Nothing went out — not the prompt, not whatever was typed into the
       // frame meanwhile. Hand all of it back instead of losing it.
-      const { queued, draft } = bar.stop();
-      this.bar = null;
-      const held = [text, ...queued, draft].filter(Boolean).join("\n");
-      if (held) this.editor?.prefill(held);
-      return;
+      return original;
     }
 
     userEcho(text);
@@ -1284,6 +1464,7 @@ export class App {
     // they typed it, with the brief under it. The bar stays up — a missing
     // frame here is the same bug as during auto-compaction.
     text = await this.maybeRewrite(text);
+    if (this.abort!.signal.aborted) return original;
     this.coldCacheNudge();
     // Opened before the prompt joins the history, so /rewind can cut the
     // conversation exactly here as well as put the files back.
@@ -1292,7 +1473,6 @@ export class App {
     this.autoLoadSkill(text);
     await this.autoLoadDesign(text);
 
-    this.usage.beginTurn();
     this.lastReasoning = "";
     this.orca?.busy(this.session.id);
     this.orca?.userPrompt(text, this.session.id);
@@ -1355,7 +1535,7 @@ export class App {
     // the first send does, and only while something is genuinely coming up.
     if (mcpPendingCount()) {
       this.progress(tr("waiting for MCP servers…", "жду MCP-серверы…"));
-      await mcpSettled();
+      await mcpSettled(15_000, this.abort!.signal);
     }
 
     try {
@@ -1374,7 +1554,7 @@ export class App {
         catalog: this.catalog,
         usage: this.usage,
         maxSteps: this.cfg.maxSteps,
-        signal: this.abort.signal,
+        signal: this.abort!.signal,
         effort: this.effort(),
         toolConcurrency: this.cfg.toolConcurrency,
         interject: this.stepSkills(),
@@ -1473,7 +1653,10 @@ export class App {
             }
             md?.push(delta);
             answer += delta;
-            this.orca?.assistantText(answer, this.session.id);
+            // answer += on every delta is O(answer) per chunk (quadratic over a
+            // long turn); Orca caps its payload anyway, so it needs a window,
+            // not the whole text.
+            if (this.orca) this.orca.assistantText(answer.length > 4000 ? answer.slice(-4000) : answer, this.session.id);
           },
           onToolStart: (tool, args) => {
             endRateWait();
@@ -1527,8 +1710,8 @@ export class App {
 
       stopStream();
       this.session.save();
-      this.lastTurnFailed = false;
-      this.checkGoalComplete(result.finalText);
+      this.lastTurnFailed = result.stoppedBecause !== "stop" && result.stoppedBecause !== "aborted";
+      if (result.stoppedBecause === "stop") this.checkGoalComplete(result.finalText);
       this.statusLine(Date.now() - started, result.steps, result.stoppedBecause);
       if (process.env.TRCODE_DEBUG) {
         const t = this.usage.turnTotals();
@@ -1551,7 +1734,7 @@ export class App {
       // Take the bar down before anything else prints, then pick up whatever
       // was typed while the model worked.
       endRateWait();
-      const { queued, draft } = bar.stop();
+      bar.stop();
       this.bar = null;
       // The uilib capture/blend gate comes after the bar is gone: its buttons
       // are plain transcript rows, and drawing them over a live footer is what
@@ -1562,24 +1745,6 @@ export class App {
         this.pendingUilibGate = null;
         await gate(this.lastAssistantText());
       }
-      // Esc means stop, including whatever was typed while waiting. Sending
-      // the queue anyway starts a new turn in the same breath, which reads as
-      // Esc having done nothing at all — the queued text is handed back to the
-      // editor instead, where it can be sent again on purpose.
-      const interrupted = Boolean(this.abort?.signal.aborted);
-      this.lastAborted = interrupted;
-      if (interrupted) {
-        const held = [...queued, draft].filter(Boolean).join("\n");
-        if (held) this.editor?.prefill(held);
-        if (queued.length) hint(tr("Queued messages were not sent.", "Сообщения из очереди не отправлены."));
-      } else {
-        this.pending.push(...queued);
-        if (draft) this.editor?.prefill(draft);
-      }
-      this.abort = null;
-      // Only "done" once nothing else is queued, or the pane would flash
-      // finished between two messages of the same batch.
-      if (!this.pending.length) await this.orca?.idle(this.session.id);
     }
   }
 

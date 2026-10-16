@@ -134,8 +134,8 @@ export async function mediaPool(kind: MediaKind, catalog: ModelInfo[]): Promise<
   if (providerServes("openrouter", kind)) {
     try {
       if (kind === "image") {
-        const { imageCapsLine } = await import("./imagegen.js");
-        for (const m of await fetchListing<any>("/images/models")) add(row("openrouter", m.id, kind, { label: m.name, created: m.created }), imageCapsLine(m));
+        const { imageCapsLine, fetchImageModels } = await import("./imagegen.js");
+        for (const m of await fetchImageModels()) add(row("openrouter", m.id, kind, { label: m.name, created: m.created }), imageCapsLine(m));
       } else if (kind === "video") {
         const { capsLine, priceLine } = await import("../agent/videomode.js");
         for (const m of await fetchListing<VideoModelInfo & { created?: number }>("/videos/models")) {

@@ -2,6 +2,7 @@
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
+import vm from "node:vm";
 import type { ToolDef } from "../types.js";
 import { extraIgnoresFrom, globToRegExp, looksBinary, rel, resolveInside, walk } from "./fsutil.js";
 
@@ -96,9 +97,12 @@ export const grepTool: ToolDef = {
       }
       if (looksBinary(buf)) return;
       const lines = buf.toString("utf8").split(/\r?\n/);
+      // V8's VM timeout also interrupts catastrophic regexp backtracking.
+      // The executed program is fixed; the user's pattern is data only.
+      const hits = vm.runInNewContext("const re = new RegExp(pattern, flags); const hits = []; for (let i = 0; i < lines.length; i++) { if (re.test(lines[i])) hits.push(i); if (hits.length >= max) break; } hits;",
+        { pattern: re.source, flags: re.flags, lines, max: limit * 30 }, { timeout: 100 }) as number[];
       let fileHeaderWritten = false;
-      for (let i = 0; i < lines.length; i++) {
-        if (!re.test(lines[i])) continue;
+      for (const i of hits) {
         total++;
         if (!fileHeaderWritten) {
           matchedFiles.push(rel(ctx.cwd, abs));
@@ -121,7 +125,7 @@ export const grepTool: ToolDef = {
     } catch {
       return { output: `Path not found: ${args.path}`, isError: true };
     }
-    if (st.isFile()) {
+    try { if (st.isFile()) {
       await scanFile(root, st.size);
     } else {
       // The walk is metadata-only and fast; content reads happen after it, so
@@ -139,6 +143,8 @@ export const grepTool: ToolDef = {
         if (total >= limit * 30 || ctx.signal.aborted) break;
         await scanFile(f.abs, f.size);
       }
+    } } catch (err) {
+      return { output: `Search stopped: ${(err as Error).message}. Simplify the regular expression or narrow the path.`, isError: true };
     }
 
     if (!total) return { output: `No matches: /${args.pattern}/` };
