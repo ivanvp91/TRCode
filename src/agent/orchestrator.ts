@@ -248,7 +248,7 @@ async function execute(app: App, state: OrchestrationState, progress: TaskProgre
       prompt: `Working directory: ${app.cwd}\n\nTask:\n${state.task}${state.context}${revision}`,
       messages,
       context: ctx, tools: app.toolList(), readOnly: true, skills: [], catalog: app.catalog,
-      usage: app.usage, maxSteps: cfg.maxSteps, ceiling: 8, effort: effortFor(app.session.model, app.effortOverride),
+      usage: app.usage.child("orchestrate"), maxSteps: cfg.maxSteps, ceiling: 8, effort: effortFor(app.session.model, app.effortOverride),
       activity: (text) => progress.activity(`planner · ${text}`),
       events: { ...events, onStep: () => save() },
     });
@@ -300,7 +300,7 @@ async function execute(app: App, state: OrchestrationState, progress: TaskProgre
       try {
         const res = await runWorker({
           model, prompt, messages, context: ctx, tools: app.toolList(), readOnly: !step.writes,
-          skills: app.activeSkills, catalog: app.catalog, usage: app.usage,
+          skills: app.activeSkills, catalog: app.catalog, usage: app.usage.child("orchestrate"),
           maxSteps: cfg.maxSteps, ceiling: 30, effort: effortFor(model, app.effortOverride),
           activity: (text) => progress.activity(`${step.id} · ${text}`),
           events: { ...events, onStep: () => save() },
@@ -342,7 +342,7 @@ async function execute(app: App, state: OrchestrationState, progress: TaskProgre
     const res = await runWorker({
       model: app.session.model, systemPrompt: SYNTH_PROMPT,
       prompt: `Task:\n${state.task}${state.context}\n\nStep results:\n${bundle}\n\nFailed or skipped steps (report as incomplete):\n${failures || "none"}`,
-      context: ctx, tools: [], readOnly: true, skills: [], catalog: app.catalog, usage: app.usage,
+      context: ctx, tools: [], readOnly: true, skills: [], catalog: app.catalog, usage: app.usage.child("orchestrate"),
       maxSteps: 1, ceiling: 1, effort: effortFor(app.session.model, app.effortOverride),
       events: { ...events, onText: (delta) => {
         events.onText?.(delta);

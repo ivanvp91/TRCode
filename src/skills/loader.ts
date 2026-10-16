@@ -122,6 +122,11 @@ Write WHEN to apply it ("when asked to review changes"), not what it is.
 every language you work in. A request that hits one loads this skill by itself,
 with no tool call. Leave it empty to let the model do the choosing, and add
 "auto: off" to keep this skill out of auto-selection entirely.
+
+Bundled files live next to this one and are read only when the body points at
+them: references/ — material read on demand; scripts/ — code to run rather
+than retype; assets/ — templates and files copied into the output. Name each
+one here, with when to open it. /skills check reports what is left to fill in.
 -->
 
 ## When to apply
@@ -173,12 +178,57 @@ export function discoverSkills(cwd: string): Skill[] {
   return [...byName.values()].sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** Text the starter template ships with; still present means never filled in. */
+const PLACEHOLDERS = [
+  "WHEN to apply this skill — one sentence",
+  "Describe the situation in a sentence or two.",
+  "First step — what exactly to check or gather.",
+  "List the mistakes people typically make on this task.",
+];
+
+/**
+ * What would keep a skill from working: the model picks a skill by its
+ * description and auto-selection by its triggers, so a vague, duplicated or
+ * unfilled one is a skill that never fires — or fires for the wrong task.
+ * Each entry is one problem, worded as what to fix.
+ */
+export function validateSkill(skill: Skill, all: Skill[] = []): string[] {
+  const out: string[] = [];
+  const raw = (() => {
+    try { return fs.readFileSync(path.join(skill.dir, "SKILL.md"), "utf8"); } catch { return ""; }
+  })();
+  if (skill.name.length > 64) out.push(`name is ${skill.name.length} characters — keep it under 64`);
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(skill.name)) out.push("name should be lowercase letters, digits and hyphens");
+  if (path.basename(skill.dir) !== skill.name) out.push(`name "${skill.name}" differs from its folder "${path.basename(skill.dir)}"`);
+  const d = skill.description;
+  if (d.length < 40) out.push("description is too short to choose by — say WHEN to apply it, in a full sentence");
+  if (d.length > 500) out.push(`description is ${d.length} characters — every request carries it; cut it under 500`);
+  const twin = all.find((s) => s !== skill && s.description.trim().toLowerCase() === d.trim().toLowerCase());
+  if (twin) out.push(`description is identical to "${twin.name}" — the model cannot tell them apart`);
+  for (const p of PLACEHOLDERS) if (raw.includes(p)) out.push(`template text left in: "${p}"`);
+  if (/<!--[\s\S]*The body of a skill is an instruction/.test(raw)) out.push("the template's guidance comment is still in the body — remove it");
+  const body = skill.body.replace(/<!--[\s\S]*?-->/g, "").trim();
+  if (body.split("\n").filter((l) => l.trim()).length < 5) out.push("the body is almost empty — write the procedure");
+  const lines = skill.body.split("\n").length;
+  if (lines > 500) out.push(`the body is ${lines} lines — it is loaded whole; move detail to references/`);
+  if (skill.auto && !skill.triggers.length) out.push("no triggers — it loads only when the model chooses it (add triggers, or auto: off to say that is intended)");
+  for (const r of skill.resources) {
+    const stem = r.replace(/\/$/, "");
+    if (!skill.body.includes(stem)) out.push(`bundled ${r} is never mentioned in the body — the model will not know to open it`);
+  }
+  return out;
+}
+
 /** The catalogue block appended to the system prompt. */
 export function skillsPromptSection(skills: Skill[]): string {
   if (!skills.length) return "";
   const rows = skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");
   return `<skills>
 Skills are collapsed instructions for specific tasks. If a task matches a skill's description, CALL the skill tool with its name BEFORE starting work: the skill holds a proven procedure that outranks your default approach.
+- The user names a skill → load it, no judgement call. Several match → load each.
+- A skill serves the request it was loaded for; do not carry it into later, unrelated requests.
+- Load and read a skill yourself — do not delegate its instructions to a subagent.
+- Open a skill's bundled files only when its instructions point you to them.
 
 ${rows}
 </skills>`;

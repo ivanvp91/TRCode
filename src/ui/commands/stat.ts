@@ -8,8 +8,8 @@ import { openModal, type ModalAction, type ModalResult, type PickerItem } from "
 import { choose } from "../choice.js";
 import { sessionsDir } from "../../config.js";
 import { providerLabel, providers, splitModelId, wireModelId } from "../../provider/registry.js";
-import { fmtTokens, fmtCost, dayKey } from "../../usage.js";
-import type { ModelUsage } from "../../usage.js";
+import { fmtTokens, fmtCost, dayKey, addDelegated } from "../../usage.js";
+import type { Delegated, ModelUsage } from "../../usage.js";
 import { t } from "../../i18n.js";
 import type { App } from "../repl.js";
 
@@ -68,9 +68,11 @@ export function periodSlice(u: ModelUsage, p: StatPeriod): ModelUsage | null {
   const cutoff = statDayCutoff(p);
   let requests = 0, input = 0, output = 0, cached = 0, reasoning = 0, costUsd = 0;
   let hit = false;
+  const delegated: Delegated = {};
   for (const [k, d] of Object.entries(u.daily)) {
     if (k < cutoff) continue;
     hit = true;
+    for (const [src, share] of Object.entries(d.delegated ?? {})) addDelegated(delegated, src, share);
     requests += d.requests;
     input += d.input;
     output += d.output;
@@ -79,7 +81,10 @@ export function periodSlice(u: ModelUsage, p: StatPeriod): ModelUsage | null {
     costUsd += d.costUsd;
   }
   if (!hit) return null;
-  return { model: u.model, requests, input, output, cached, reasoning, costUsd, priceUnknown: u.priceUnknown, lastUsed: u.lastUsed };
+  return {
+    model: u.model, requests, input, output, cached, reasoning, costUsd, priceUnknown: u.priceUnknown, lastUsed: u.lastUsed,
+    ...(Object.keys(delegated).length ? { delegated } : {}),
+  };
 }
 
 /** Every stored request row; the live session's rows replace what is on disk. */
@@ -133,6 +138,7 @@ export function foldUsage(rows: ModelUsage[]): Map<string, ModelUsage> {
     for (const k of ["requests", "input", "output", "cached", "reasoning", "costUsd"] as const) e[k] += u[k];
     e.priceUnknown = e.priceUnknown || u.priceUnknown;
     e.lastUsed = Math.max(e.lastUsed ?? 0, u.lastUsed ?? 0);
+    for (const [src, share] of Object.entries(u.delegated ?? {})) addDelegated((e.delegated ??= {}), src, share);
     m.set(u.model, e);
   }
   return m;
@@ -159,6 +165,19 @@ export function usageTotals(rows: Map<string, ModelUsage>): string {
     `${c.gray("↓")} ${fmtTokens(output)}   ` +
     `${c.gray(t("cost", "стоимость"))} ${c.bold(c.brightGreen(fmtCost(cost, unknown)))}`
   );
+}
+
+/**
+ * What helpers cost inside those totals — task, swarm, orchestrate, brain —
+ * or "" when nothing was delegated. A share of the line above, not extra.
+ */
+export function delegatedNote(rows: Map<string, ModelUsage>): string {
+  const all: Delegated = {};
+  for (const u of rows.values()) for (const [src, share] of Object.entries(u.delegated ?? {})) addDelegated(all, src, share);
+  const parts = Object.entries(all)
+    .sort((a, b) => b[1].costUsd - a[1].costUsd)
+    .map(([src, d]) => `${src} ${c.bold(fmtCost(d.costUsd))} ${c.gray(`(${d.requests} ${t("reqs", "запр.")}, ${fmtTokens(d.input + d.output)})`)}`);
+  return parts.length ? `${c.gray(t("of which helpers:", "из них помощники:"))} ${parts.join(c.gray(" · "))}` : "";
 }
 
 /** The table body: a section per provider, its models, then a subtotal row. */
@@ -287,7 +306,8 @@ export async function statModal(app: App): Promise<void> {
         ),
         notes: (tabKey) => {
           const rows = scope(foldFor(tabKey));
-          return rows.size ? [usageTotals(rows)] : [];
+          const helpers = delegatedNote(rows);
+          return rows.size ? [usageTotals(rows), ...(helpers ? [helpers] : [])] : [];
         },
         tabs: STAT_PERIODS.map((p) => ({ key: p.key, label: p.label() })),
         initialTab: period,

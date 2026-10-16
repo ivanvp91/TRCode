@@ -1,7 +1,8 @@
 /** Tool registry assembly. */
-import { editTool, lsTool, readTool, writeTool } from "./files.js";
+import { editTool, lsTool, multiEditTool, readTool, writeTool } from "./files.js";
 import { globTool, grepTool } from "./search.js";
 import { shellTool } from "./shell.js";
+import { shellIoTool } from "./procs.js";
 import { readImageTool } from "./image.js";
 import { prepareMediaTool } from "./mediaworkspace.js";
 import { makeGenerateVideoTool, makeResumeMediaTool, videoAvailable } from "./video.js";
@@ -42,10 +43,16 @@ export interface RegistryOptions {
   };
 }
 
-export function buildTools(opts: RegistryOptions): ToolDef[] {
-  if (opts.preset === "minimal") return [shellTool, editTool];
+function foregroundShell(): ToolDef {
+  const { background: _, ...properties } = shellTool.parameters.properties as Record<string, unknown>;
+  return { ...shellTool, parameters: { ...shellTool.parameters, properties } };
+}
 
-  const tools: ToolDef[] = [readTool, editTool, writeTool, lsTool, globTool, grepTool, shellTool, readImageTool, webSearchTool, fetchTool];
+export function buildTools(opts: RegistryOptions): ToolDef[] {
+  // Minimal has no shell_io, so nothing could talk to a background process.
+  if (opts.preset === "minimal") return [foregroundShell(), editTool];
+
+  const tools: ToolDef[] = [readTool, editTool, multiEditTool, writeTool, lsTool, globTool, grepTool, shellTool, shellIoTool, readImageTool, webSearchTool, fetchTool];
 
   // Media tools are offered only when the chosen model's host is connected:
   // otherwise they could only fail, and would cost a paragraph per request.

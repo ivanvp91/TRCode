@@ -75,6 +75,7 @@ const SUITES = [
   "toolpairs-test.mjs",
   "memory-test.mjs",
   "subagent-test.mjs",
+  "codex-features-test.mjs",
   "brain-test.mjs",
   "brain-ui-test.mjs",
   "swarm-test.mjs",

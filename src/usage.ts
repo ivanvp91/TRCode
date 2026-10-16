@@ -24,6 +24,23 @@ export interface ModelUsage {
   sessionFile?: string;
   unknownRequests?: number;
   mediaJobs?: Record<string, { cost?: number; at: number }>;
+  /** The part of this row that helpers made, by who launched them. */
+  delegated?: Delegated;
+}
+
+/**
+ * Spend made on the lead's behalf, keyed by source — task, swarm,
+ * orchestrate, brain. A share of the row it sits in, never added on top.
+ */
+export type Delegated = Record<string, { requests: number; input: number; output: number; costUsd: number }>;
+
+/** Adds one share into a Delegated map. */
+export function addDelegated(into: Delegated, source: string, d: { requests: number; input: number; output: number; costUsd: number }): void {
+  const e = (into[source] ??= { requests: 0, input: 0, output: 0, costUsd: 0 });
+  e.requests += d.requests;
+  e.input += d.input;
+  e.output += d.output;
+  e.costUsd += d.costUsd;
 }
 
 /** One day's share of a model's usage — what /stat periods filter on. */
@@ -34,6 +51,7 @@ export interface DayUsage {
   cached: number;
   reasoning: number;
   costUsd: number;
+  delegated?: Delegated;
 }
 
 export interface TurnTotals {
@@ -71,7 +89,21 @@ export class UsageTracker {
     priceUnknown: false,
   };
 
-  record(model: string, usage: Usage | undefined, catalog: ModelInfo[], at = Date.now()): void {
+  /** Set on a child(): every request is also recorded there, under `source`. */
+  private parent?: { tracker: UsageTracker; source: string };
+
+  /**
+   * A tracker for helpers launched by `source`. Its requests count here as
+   * they happen — the turn's bill stays live — and are marked delegated, so
+   * /stat can say what task, swarm or orchestrate cost.
+   */
+  child(source: string): UsageTracker {
+    const kid = new UsageTracker();
+    kid.parent = { tracker: this, source };
+    return kid;
+  }
+
+  record(model: string, usage: Usage | undefined, catalog: ModelInfo[], at = Date.now(), source?: string): void {
     if (!usage) return;
     const price = catalog.find((m) => m.id === model)?.pricing;
     const cached = usage.cached_tokens ?? 0;
@@ -117,21 +149,31 @@ export class UsageTracker {
     day.cached += cached;
     day.reasoning += usage.reasoning_tokens ?? 0;
     day.costUsd += cost;
+    if (source) {
+      const share = { requests: 1, input: usage.prompt_tokens, output: usage.completion_tokens, costUsd: cost };
+      addDelegated((entry.delegated ??= {}), source, share);
+      addDelegated((day.delegated ??= {}), source, share);
+    }
     this.byModel.set(model, entry);
 
-    this.lastTurn = {
-      input: usage.prompt_tokens,
-      output: usage.completion_tokens,
-      reasoning: usage.reasoning_tokens ?? 0,
-      costUsd: cost,
-      priceUnknown: unknown,
-    };
+    // A helper's request says nothing about the lead's own context size.
+    if (!source) {
+      this.lastTurn = {
+        input: usage.prompt_tokens,
+        output: usage.completion_tokens,
+        reasoning: usage.reasoning_tokens ?? 0,
+        costUsd: cost,
+        priceUnknown: unknown,
+      };
+    }
 
     this.turn.requests++;
     this.turn.input += usage.prompt_tokens;
     this.turn.cached += cached;
     this.turn.output += usage.completion_tokens;
     this.turn.reasoning += usage.reasoning_tokens ?? 0;
+
+    if (this.parent) this.parent.tracker.record(model, usage, catalog, at, source ?? this.parent.source);
   }
 
   /** One bill per durable media job; later provider cost reconciles it. */
@@ -193,6 +235,7 @@ export class UsageTracker {
       entry.priceUnknown = entry.priceUnknown || u.priceUnknown;
       entry.unknownRequests = (entry.unknownRequests ?? 0) + (u.unknownRequests ?? (u.priceUnknown ? 1 : 0));
       if (u.mediaJobs) entry.mediaJobs = { ...entry.mediaJobs, ...u.mediaJobs };
+      for (const [k, v] of Object.entries(u.delegated ?? {})) addDelegated((entry.delegated ??= {}), k, v);
       entry.lastUsed = Math.max(entry.lastUsed ?? 0, u.lastUsed ?? 0);
       if (u.daily) {
         const dst = (entry.daily ??= {});
@@ -204,6 +247,7 @@ export class UsageTracker {
           d.cached += v.cached;
           d.reasoning += v.reasoning ?? 0;
           d.costUsd += v.costUsd;
+          for (const [s, share] of Object.entries(v.delegated ?? {})) addDelegated((d.delegated ??= {}), s, share);
         }
       }
       this.byModel.set(u.model, entry);

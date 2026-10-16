@@ -4,6 +4,7 @@ import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
+import type { SubagentRole } from "./agent/roles.js";
 
 export const VERSION = "0.1.8";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
@@ -78,6 +79,11 @@ export interface Config {
    * launches to those models; session mode uses the lead's current model.
    */
   subagentModels: Record<string, string[]>;
+  /**
+   * Named presets for the task tool's `role`, on top of the built-in explore
+   * and review. null switches a built-in off.
+   */
+  subagentRoles: Record<string, SubagentRole | null>;
   /**
    * The panel /brain runs: model ids, across providers on purpose. Mixing
    * hosts is the point — two models from one vendor share their blind spots.
@@ -336,6 +342,7 @@ const DEFAULTS: Config = {
   smallModel: "moonshotai/kimi-k3-free",
   promptModels: {},
   subagentModels: {},
+  subagentRoles: {},
   subagentMode: {},
   subagentAuto: {},
   brainModels: [],
@@ -481,6 +488,7 @@ export function loadConfig(): Config {
     effortForm: { ...DEFAULTS.effortForm, ...(file.effortForm || {}) },
     promptModels: { ...DEFAULTS.promptModels, ...(file.promptModels || {}) },
     subagentModels: { ...DEFAULTS.subagentModels, ...(file.subagentModels || {}) },
+    subagentRoles: { ...DEFAULTS.subagentRoles, ...(file.subagentRoles || {}) },
     subagentMode: { ...DEFAULTS.subagentMode, ...(file.subagentMode || {}) },
     subagentAuto: { ...DEFAULTS.subagentAuto, ...(file.subagentAuto || {}) },
     modelPrompts: { ...DEFAULTS.modelPrompts, ...(file.modelPrompts || {}) },
@@ -540,6 +548,7 @@ export function saveConfig(patch: Partial<Config>, opts: { replace?: (keyof Conf
     effortForm: merge("effortForm", current.effortForm, patch.effortForm),
     promptModels: merge("promptModels", current.promptModels, patch.promptModels),
     subagentModels: merge("subagentModels", current.subagentModels, patch.subagentModels),
+    subagentRoles: merge("subagentRoles", current.subagentRoles, patch.subagentRoles),
     subagentMode: merge("subagentMode", current.subagentMode, patch.subagentMode),
     subagentAuto: merge("subagentAuto", current.subagentAuto, patch.subagentAuto),
     modelPrompts: merge("modelPrompts", current.modelPrompts, patch.modelPrompts),

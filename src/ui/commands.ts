@@ -35,7 +35,7 @@ import { GROUP_ORDER, groupLabel, effortHint, txt, type Command, parseTokens, cu
 import { goalCommand } from "./commands/goal.js";
 import { switchToProvider, refreshCatalog, setDefaultProvider, setProviderHost, logoutFromProvider, settingsModal, runUpdate, modelModal, providerModal, favModal } from "./commands/providers.js";
 import { brainPanel, brainNeedsPanel, brainPanelModal, brainModal, swarmPanelModal, swarmModal, addSubagentModel, setSubagentMode, setSubagentAuto, subagentsModal } from "./commands/agents.js";
-import { setSkillsEnabled, editSkill, skillGenPrompt, skillsModal } from "./commands/skills.js";
+import { setSkillsEnabled, editSkill, skillGenPrompt, skillsModal, checkSkills } from "./commands/skills.js";
 import { statModal } from "./commands/stat.js";
 import { uiLibraryModal, renderMatches, blendUiEntries, startBlendTurn, uilibCapturePrompt } from "./commands/uilib.js";
 import { openSession, browseSessions, eraseSessions, rewindTurn, forkTurn, compactNow, expandCollapsed, editTurn } from "./commands/sessions.js";
@@ -1145,7 +1145,7 @@ const COMMANDS: Command[] = [
   {
     name: "/skills",
     group: "other",
-    args: () => t("[on | off | new <name> [description] | gen <task> | edit <name> | auto [on|off] | global]", "[on | off | new <имя> [описание] | gen <задача> | edit <имя> | auto [on|off] | global]"),
+    args: () => t("[on | off | new <name> [description] | gen <task> | edit <name> | check [name] | auto [on|off] | global]", "[on | off | new <имя> [описание] | gen <задача> | edit <имя> | check [имя] | auto [on|off] | global]"),
     help: () => t("skills: turn on/off, list, create, edit", "навыки: включить/выключить, список, создание, правка"),
     async run(app, rest) {
       const parts = rest.trim().split(/\s+/).filter(Boolean);
@@ -1207,8 +1207,16 @@ const COMMANDS: Command[] = [
       if (sub === "gen") {
         const task = parts.slice(1).join(" ");
         if (!task) return error(t("Describe the task: /skills gen review pull requests", "Опишите задачу: /skills gen ревью пул-реквестов"));
+        const before = new Set(app.skills.map((s) => s.name));
         await app.turn(skillGenPrompt(task));
         app.rebuildTools();
+        for (const s of app.skills.filter((s) => !before.has(s.name))) checkSkills(app, s.name, true);
+        return;
+      }
+
+      if (sub === "check") {
+        app.rebuildTools();
+        checkSkills(app, parts[1]);
         return;
       }
 

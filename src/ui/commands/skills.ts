@@ -7,7 +7,7 @@ import { error, hint, info, line, success, truncate, warn } from "../render.js";
 import { openModal, type PickerItem } from "../picker.js";
 import { askLine } from "../prompt.js";
 import { loadConfig, saveConfig } from "../../config.js";
-import { createSkill } from "../../skills/loader.js";
+import { createSkill, validateSkill } from "../../skills/loader.js";
 import { t } from "../../i18n.js";
 import type { App } from "../repl.js";
 
@@ -74,10 +74,39 @@ export function skillGenPrompt(task: string): string {
     `A skill is a folder .trcode/skills/<name>/SKILL.md with frontmatter:\n` +
     `---\nname: <short-name>\ndescription: <WHEN to apply it, one sentence>\n` +
     `triggers: <comma-separated words a user would type for this, in every language they work in>\n---\n\n` +
+    `The description is what the model chooses by, and it is sent with every request: one sentence saying WHEN to apply ` +
+    `the skill ("when asked to …"), with the phrases a user would say, and what it is NOT for. ` +
+    `Name: lowercase letters, digits and hyphens, the same as the folder.\n` +
     `Study the repository first so the procedure rests on this project's real commands and files ` +
     `rather than generalities. The body is a concrete procedure, what not to do, and the answer format. ` +
-    `Keep it under 50 lines. Create the file with write.`
+    `Keep it under 50 lines. Detail that is only sometimes needed goes to references/<file>.md, code worth running ` +
+    `rather than retyping to scripts/, templates to assets/ — and the body names each file and when to open it. ` +
+    `Create the files with write.`
   );
+}
+
+/**
+ * /skills check: what would keep each skill from firing. Returns how many
+ * skills have problems, so a caller can stay quiet when there are none.
+ */
+export function checkSkills(app: App, name?: string, quietWhenClean = false): number {
+  const list = name ? app.skills.filter((s) => s.name === name) : app.skills;
+  if (name && !list.length) {
+    error(t(`Skill not found: ${name}`, `Навык не найден: ${name}`));
+    return 0;
+  }
+  let bad = 0;
+  for (const s of list) {
+    const problems = validateSkill(s, app.skills);
+    if (!problems.length) continue;
+    bad++;
+    warn(`${s.name} ${c.gray(`(${s.scope})`)}`);
+    for (const p of problems) hint(`  · ${p}`);
+  }
+  if (!bad && !quietWhenClean) {
+    success(t(`${list.length} skill(s) checked — nothing to fix.`, `Проверено навыков: ${list.length} — править нечего.`));
+  }
+  return bad;
 }
 
 export async function skillsModal(app: App): Promise<void> {

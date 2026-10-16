@@ -4,6 +4,7 @@ import { loadConfig } from "../config.js";
 import { fmtDuration } from "../ui/layout.js";
 import { recordChanges, watchTargets } from "./shellsnap.js";
 import { resolveInside } from "./fsutil.js";
+import { report, startProcess, START_WAIT_MS, waitForOutput } from "./procs.js";
 import type { ToolDef, ToolResult } from "../types.js";
 
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -85,7 +86,7 @@ const PS_UTF8 =
   "$OutputEncoding=[Console]::OutputEncoding;" +
   "$PSDefaultParameterValues['Get-Content:Encoding']='utf8';";
 
-function launcher(): { cmd: string; args: (script: string) => string[] } {
+export function shellLauncher(): { cmd: string; args: (script: string) => string[] } {
   const cfg = loadConfig();
   const mode = cfg.shell === "auto" ? (process.platform === "win32" ? "powershell" : "bash") : cfg.shell;
   switch (mode) {
@@ -148,7 +149,7 @@ export const shellTool: ToolDef = {
   description:
     "Runs a command in the system shell (PowerShell on Windows, bash elsewhere) " +
     "and returns stdout/stderr plus the exit code. It runs in the project directory. " +
-    "Interactive commands are forbidden: the session is non-interactive and they will hang. " +
+    "Interactive commands hang: run servers and prompting programs with background=true. " +
     "Use read/glob/grep to read and search files — cheaper and more reliable.",
   parameters: {
     type: "object",
@@ -164,6 +165,10 @@ export const shellTool: ToolDef = {
           "pass 600000 or more for one. Hard ceiling: 20 minutes.",
       },
       cwd: { type: "string", description: "Subdirectory to run in, relative to the project" },
+      background: {
+        type: "boolean",
+        description: "Return at once with a process id; drive it with shell_io. Not covered by /rewind.",
+      },
     },
     required: ["command"],
   },
@@ -188,8 +193,20 @@ export const shellTool: ToolDef = {
 
     // Read as "how long it may stay silent", not "how long it may run".
     const timeout = Math.min(Number(args.timeout_ms ?? DEFAULT_TIMEOUT_MS), HARD_LIMIT_MS);
-    const { cmd, args: mkArgs } = launcher();
+    const { cmd, args: mkArgs } = shellLauncher();
     const cwd = args.cwd ? resolveInside(ctx.cwd, String(args.cwd)) : ctx.cwd;
+
+    if (args.background) {
+      const p = startProcess(command, cwd);
+      if (typeof p === "string") return { output: p, isError: true };
+      await waitForOutput(p, START_WAIT_MS, ctx.signal);
+      const out = report(p);
+      return {
+        output: `${out}\n[background process ${p.id} — read it, type into it or stop it with shell_io process_id=${p.id}]`,
+        isError: /exited \(exit=(?!0\))/.test(out.split("\n")[0]),
+        display: displayOf(out, false),
+      };
+    }
 
     // What the command names, read before it runs: the only part of a shell
     // edit /rewind can put back. See tools/shellsnap.ts for what this misses.

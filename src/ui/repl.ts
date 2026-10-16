@@ -73,6 +73,7 @@ import { composePrompt, promptModelFor } from "../agent/promptwriter.js";
 import { runAgent, type AgentEvents } from "../agent/loop.js";
 import { delegationPreference } from "../agent/delegation.js";
 import { subagentModelsConfigured } from "../agent/worker.js";
+import { SubagentRegistry } from "../agent/subagent.js";
 import { buildTools, TodoStore } from "../tools/index.js";
 import { shellTool } from "../tools/shell.js";
 import { createSpillStore, type SpillStore } from "../tools/spill.js";
@@ -143,6 +144,8 @@ export class App {
     return this.cfg.codeMode === true;
   }
   todo = new TodoStore();
+  /** Finished task subagents that can take a follow-up; follows the session. */
+  readonly subagents = new SubagentRegistry();
   broker: PermissionBroker;
   usage: UsageTracker;
   readFiles = new Set<string>();
@@ -347,6 +350,9 @@ export class App {
 
   rebuildTools(): void {
     this.skills = discoverSkills(this.cwd);
+    // /new and /resume swap the session underneath: a parked helper's history
+    // belongs to the conversation it was launched from.
+    this.subagents.bind(this.session.id);
     // A skill's body lives in the history, so what counts as already loaded
     // follows the current session — /new and /resume swap it underneath. It
     // gets there two ways: injected by auto-selection, or returned by the tool.
@@ -389,6 +395,7 @@ export class App {
         // In a pipe there is no bar to preview into — print steps as before.
         activity: process.stdout.isTTY ? this.subagentActivity : undefined,
         authorize: () => this.authorizeSubagents(),
+        registry: this.subagents,
       },
     });
     // A model picker can run inside a task call. Update the active loop's
@@ -717,7 +724,7 @@ export class App {
         history: this.session.messages,
         catalog: this.catalog,
         effortFor: (m) => effortFor(m, this.effortOverride),
-        usage: this.usage,
+        usage: this.usage.child("brain"),
         signal: this.abort!.signal,
         events: {
           onStart: (model, round) => {

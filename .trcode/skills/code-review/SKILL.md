@@ -34,3 +34,6 @@ For each finding:
 - The suggested fix, if it is short.
 
 Sort by severity. If you found nothing, say so in one line — do not invent remarks to fill space.
+
+## 6. A large diff: delegate by area
+When the change spans several subsystems, split it: one `task` call per area with `role: "review"`, all in one turn, each brief naming its files and the base to diff against. The review role returns `[P0–P3] title — path:line` lines or `No findings.`; merge them, drop duplicates, verify every P0/P1 yourself (step 4) before reporting, and keep the format above.

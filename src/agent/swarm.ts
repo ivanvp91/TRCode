@@ -127,7 +127,7 @@ export async function runSwarm(app: App, task: string, given?: string[]): Promis
         const res = await runWorker({
           model, prompt: task + context + WORKER_SUFFIX, context: ctx,
           tools: app.toolList(), readOnly: true, skills: app.activeSkills, catalog: app.catalog,
-          usage: app.usage, maxSteps: cfg.maxSteps, ceiling: 25, effort: effortFor(model, app.effortOverride),
+          usage: app.usage.child("swarm"), maxSteps: cfg.maxSteps, ceiling: 25, effort: effortFor(model, app.effortOverride),
           activity: (text) => progress.activity(`[${index + 1}] ${model} · ${text}`), events: progress.events(),
         });
         const ok = !ctx.signal.aborted && res.stoppedBecause === "stop" && Boolean(res.finalText.trim());
@@ -167,7 +167,7 @@ export async function runSwarm(app: App, task: string, given?: string[]): Promis
         const res = await runWorker({
           model: synthModel, systemPrompt: SYNTH_PROMPT,
           prompt: `Task:\n${task}${context}\n\nModel answers:\n${bundle}\n\nIncomplete workers (report these):\n${failures || "none"}`,
-          context: ctx, tools: [], readOnly: true, skills: [], catalog: app.catalog, usage: app.usage,
+          context: ctx, tools: [], readOnly: true, skills: [], catalog: app.catalog, usage: app.usage.child("swarm"),
           maxSteps: 1, ceiling: 1, effort: effortFor(synthModel, app.effortOverride),
           events: { ...events, onText: (delta) => {
             events.onText?.(delta);

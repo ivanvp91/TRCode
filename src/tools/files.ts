@@ -1,5 +1,5 @@
 /**
- * File tools: read, write, edit, ls.
+ * File tools: read, write, edit, multi_edit, ls.
  *
  * Content I/O is async on purpose: on a cloud-synced directory (OneDrive) a
  * placeholder file hydrates on first read, and a synchronous read blocks the
@@ -188,32 +188,11 @@ export const editTool: ToolDef = {
     }
 
     const before = await fsp.readFile(abs, "utf8");
-    const oldStr = String(args.old_string ?? "");
-    const newStr = String(args.new_string ?? "");
-    if (oldStr === newStr) return { output: "old_string and new_string are identical — nothing to change.", isError: true };
-    if (!oldStr) return { output: "old_string is empty. Use write to create a file.", isError: true };
-
-    // Tolerate the model echoing back CRLF-normalised text.
-    const eol = detectLineEnding(before);
-    const needle = before.includes(oldStr) ? oldStr : oldStr.replace(/\r\n|\r|\n/g, eol);
-    const count = countOccurrences(before, needle);
-    if (count === 0) {
-      return {
-        output: `String not found in ${args.path}. Re-read the file — it may have changed, or the indentation differs.`,
-        isError: true,
-      };
+    const res = replaceOnce(before, detectLineEnding(before), String(args.old_string ?? ""), String(args.new_string ?? ""), Boolean(args.replace_all));
+    if ("error" in res) {
+      return { output: res.error.replace(/^String not found\./, `String not found in ${args.path}.`), isError: true };
     }
-    if (count > 1 && !args.replace_all) {
-      return {
-        output: `Found ${count} occurrences. Add context to make it unique, or pass replace_all=true.`,
-        isError: true,
-      };
-    }
-
-    const replacement = newStr.replace(/\r\n|\r|\n/g, eol);
-    const after = args.replace_all
-      ? before.split(needle).join(replacement)
-      : before.replace(needle, () => replacement);
+    const { after, count } = res;
 
     const preview = renderDiff(before, after, { path: args.path });
     const ok = await ctx.confirm(editTool, args, preview);
@@ -224,6 +203,105 @@ export const editTool: ToolDef = {
     catch (e) { return { output: (e as Error).message, isError: true }; }
     return {
       output: `Updated ${rel(ctx.cwd, abs)} (${count > 1 ? `${count} replacements` : "1 replacement"}).`,
+      display: seen ? undefined : preview,
+      displayKind: seen ? "text" : "diff",
+    };
+  },
+};
+
+/**
+ * One exact-string replacement in memory: the edit and multi_edit core. The
+ * error text is what the model reads, so it says how to make the next try
+ * land rather than only that this one missed.
+ */
+function replaceOnce(
+  text: string,
+  eol: string,
+  oldStr: string,
+  newStr: string,
+  replaceAll: boolean,
+): { after: string; count: number } | { error: string } {
+  if (oldStr === newStr) return { error: "old_string and new_string are identical — nothing to change." };
+  if (!oldStr) return { error: "old_string is empty. Use write to create a file." };
+  // Tolerate the model echoing back CRLF-normalised text.
+  const needle = text.includes(oldStr) ? oldStr : oldStr.replace(/\r\n|\r|\n/g, eol);
+  const count = countOccurrences(text, needle);
+  if (count === 0) return { error: "String not found. Re-read the file — it may have changed, or the indentation differs." };
+  if (count > 1 && !replaceAll) return { error: `Found ${count} occurrences. Add context to make it unique, or pass replace_all=true.` };
+  const replacement = newStr.replace(/\r\n|\r|\n/g, eol);
+  const after = replaceAll ? text.split(needle).join(replacement) : text.replace(needle, () => replacement);
+  return { after, count };
+}
+
+/**
+ * Several replacements in one file, one approval and one write. Applied in
+ * order to the text as the previous ones left it, and all or nothing: a miss
+ * in the fourth leaves the file as it was, so the model never has to work out
+ * which half of its change landed.
+ */
+export const multiEditTool: ToolDef = {
+  name: "multi_edit",
+  risk: "write",
+  description:
+    "Several edit replacements in one file, applied in order, all or nothing. " +
+    "Prefer it to repeated edit calls on the same file.",
+  parameters: {
+    type: "object",
+    properties: {
+      path: { type: "string" },
+      edits: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            old_string: { type: "string" },
+            new_string: { type: "string" },
+            replace_all: { type: "boolean" },
+          },
+          required: ["old_string", "new_string"],
+        },
+      },
+    },
+    required: ["path", "edits"],
+  },
+  summarize: (a) => `${String(a.path)} · ${Array.isArray(a.edits) ? a.edits.length : 0} edits`,
+  async run(args, ctx) {
+    ctx.signal.throwIfAborted();
+    if (typeof args.path !== "string" || !args.path.trim()) return { output: "path is required", isError: true };
+    const edits: any[] = Array.isArray(args.edits) ? args.edits : [];
+    if (!edits.length) return { output: "edits is empty — pass at least one {old_string, new_string}.", isError: true };
+    const abs = resolveInside(ctx.cwd, String(args.path));
+    if (!fs.existsSync(abs)) return { output: `File not found: ${args.path}`, isError: true };
+    if (!ctx.readFiles.has(abs)) {
+      return { output: `Read ${args.path} first with the read tool.`, isError: true };
+    }
+
+    const before = await fsp.readFile(abs, "utf8");
+    const eol = detectLineEnding(before);
+    let after = before;
+    let total = 0;
+    for (const [i, e] of edits.entries()) {
+      const res = replaceOnce(after, eol, String(e?.old_string ?? ""), String(e?.new_string ?? ""), Boolean(e?.replace_all));
+      if ("error" in res) {
+        return {
+          output: `Edit ${i + 1} of ${edits.length} failed in ${args.path}: ${res.error} Nothing was written — fix that edit and resend all of them.`,
+          isError: true,
+        };
+      }
+      after = res.after;
+      total += res.count;
+    }
+    if (after === before) return { output: "The edits cancel out — the file would not change.", isError: true };
+
+    const preview = renderDiff(before, after, { path: args.path });
+    const ok = await ctx.confirm(multiEditTool, args, preview);
+    const seen = ctx.previewShown?.(preview) ?? false;
+    if (!ok) return { output: "The user rejected the edit.", isError: true };
+
+    try { await commitFile(ctx, abs, before, after, "edit"); }
+    catch (e) { return { output: (e as Error).message, isError: true }; }
+    return {
+      output: `Updated ${rel(ctx.cwd, abs)} (${edits.length} edits, ${total} replacements).`,
       display: seen ? undefined : preview,
       displayKind: seen ? "text" : "diff",
     };
