@@ -54,8 +54,8 @@ Select a service with the arrow keys and press **Enter**. If it is not connected
 | TokenRouter | `tokenrouter` | API key |
 | Kimi | `kimi` | Kimi Code subscription or Moonshot API key |
 | Anthropic / Claude | `claude` | Anthropic API key |
-| OpenAI | `openai` | ChatGPT sign-in or OpenAI API key |
-| Google Gemini | `gemini` | Google AI Studio API key¹ |
+| OpenAI | `openai` | Continue with ChatGPT (eligible Plus/Pro plans) or OpenAI API key |
+| Google Gemini | `gemini` | Google AI Studio API key |
 | Meta / Muse | `meta` | Meta Model API key |
 | OpenRouter | `openrouter` | API key |
 | OpenCode Zen | `opencode` | API key |
@@ -64,7 +64,7 @@ Select a service with the arrow keys and press **Enter**. If it is not connected
 | xAI / Grok | `xai` | SuperGrok subscription or xAI API key |
 | Z.AI / GLM | `zai` | Platform or Coding Plan key; select the matching server |
 
-¹ Google account sign-in is also available, with a warning about its risks. See the [provider reference](docs/providers.md) for details.
+ChatGPT sign-in registers TRCode as its own app and asks permission to use your plan. Gemini connects through the public API; see the [provider reference](docs/providers.md) for setup details.
 
 For TokenRouter, run `/login tokenrouter` first to save your key, then select it in `/provider`.
 

@@ -7,9 +7,9 @@ import { loadConfig, saveConfig, configPath, rememberProjectState, VERSION, STAT
 import { latestRelease, isNewer, applyUpdate } from "../../update.js";
 import { fetchModels } from "../../provider/models.js";
 import { DEFAULT_PROVIDER, modeConfig, modeFor, providerById, providerLabel, providers, providerState, rememberBaseUrl, rememberProviderState, type ProviderDef } from "../../provider/registry.js";
-import { clearCredentials } from "../../provider/credentials.js";
+import { readCredentials } from "../../provider/credentials.js";
 import { LIGHT_BUDGET, MEDIUM_BUDGET } from "../../session/compact.js";
-import { chooseHost, loginProvider } from "../login.js";
+import { chooseHost, disconnectProvider, loginProvider } from "../login.js";
 import { t, count, t as tr } from "../../i18n.js";
 import type { App } from "../repl.js";
 import { escWatch } from "../turnbar.js";
@@ -31,7 +31,7 @@ export function providerItems(app: App): PickerItem[] {
     const n = providerModels(app, p.id).length;
     return {
       value: p.id,
-      label: p.label,
+      label: p.id === "openai" && mode === "oauth" && readCredentials(p.id)?.email ? `${p.label} · ${readCredentials(p.id)!.email}` : p.label,
       badge: p.id === cur ? t("current", "текущий") : undefined,
       hint: mode
         ? t(`${mode === "oauth" ? "subscription" : "API key"} · ${n} ${plural(n, "model", "models")}`, `${mode === "oauth" ? "подписка" : "ключ API"} · ${count(n, ["model", "models"], ["модель", "модели", "моделей"])}`)
@@ -144,7 +144,7 @@ export async function setProviderHost(app: App, def: ProviderDef, given?: string
 /** Drops a provider's credential, and the session's model with it if need be. */
 export async function logoutFromProvider(app: App, def: ProviderDef): Promise<void> {
   if (def.id === DEFAULT_PROVIDER) return error(t("Remove the TokenRouter key with: trc auth logout", "Ключ TokenRouter удаляется так: trc auth logout"));
-  if (!clearCredentials(def.id)) return warn(t(`${def.label} was not connected.`, `${def.label} не был подключён.`));
+  if (!(await disconnectProvider(def.id))) return warn(t(`${def.label} was not connected.`, `${def.label} не был подключён.`));
   await refreshCatalog(app, { quiet: true });
   success(t(`${def.label} disconnected.`, `${def.label} отключён.`));
   // The session was talking to it; leaving the model in place would only

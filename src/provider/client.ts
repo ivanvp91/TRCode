@@ -8,7 +8,6 @@ import {
   modeConfig,
   modeFor,
   protocolForModel,
-  providerProject,
   qualifyModelId,
   renewRejectedToken,
   resolveAuth,
@@ -17,7 +16,6 @@ import {
   type ResolvedAuth,
 } from "./registry.js";
 import { buildResponsesBody, parseResponsesResult, ResponsesStreamParser } from "./responses.js";
-import { buildGeminiBody, parseGeminiResult, GeminiStreamParser } from "./gemini.js";
 import { AnthropicStreamParser, buildAnthropicBody, parseAnthropicResult } from "./anthropic.js";
 import { DEFAULT_MAX_TOKENS, THINKING_BUDGET } from "./anthropic.js";
 import { normalizeToolSchema } from "./schema.js";
@@ -347,6 +345,7 @@ export class ApiError extends Error {
     message: string,
     readonly status: number,
     readonly body?: string,
+    readonly requestId?: string,
   ) {
     super(message);
     this.name = "ApiError";
@@ -656,6 +655,9 @@ async function postWithRetry(
     }
     if (res.ok) return res;
     const text = await res.text().catch(() => "");
+    if (text.includes('"subscription_sharing_usage_limit_exceeded"')) {
+      throw new ApiError("ChatGPT plan usage limit reached. Review TRCode's allowance at https://chatgpt.com/settings/usage", res.status, text, res.headers.get("x-request-id") ?? undefined);
+    }
     // A host can revoke an OAuth access token before its stated expiry — a
     // login on another device, a session cut server-side — and `isStale`
     // cannot see that. The refresh token usually still stands, so renew once
@@ -664,7 +666,7 @@ async function postWithRetry(
       authRenewed = true;
       if (await abortable(renewRejectedToken(splitModelId(model).providerId), signal)) continue;
     }
-    const err = new ApiError(describeStatus(res.status, text, model), res.status, text);
+    const err = new ApiError(describeStatus(res.status, text, model), res.status, text, res.headers.get("x-request-id") ?? undefined);
     if (!RETRYABLE.has(res.status)) throw err;
     const rateLimited = res.status === 429;
     if (rateLimited ? rateRetries >= RATE_LIMIT_RETRIES || rateWaited >= RATE_LIMIT_PATIENCE_MS : upstreamRetries >= maxUpstream) throw err;
@@ -816,7 +818,6 @@ async function postChat(req: ChatRequest, stream: boolean): Promise<Response> {
 }
 
 function pathFor(p: Protocol, stream = true): string {
-  if (p === "gemini") return stream ? ":streamGenerateContent?alt=sse" : ":generateContent";
   return p === "responses" ? "/responses" : p === "anthropic" ? "/messages" : "/chat/completions";
 }
 
@@ -844,16 +845,6 @@ function buildBodyFor(rawReq: ChatRequest, stream: boolean): Record<string, unkn
   const { providerId } = splitModelId(req.model);
   const mode = modeFor(providerId);
   const modeCfg = mode ? modeConfig(providerId, mode) : null;
-  if (protocol === "gemini") {
-    return buildGeminiBody({
-      model: wireModelId(req.model),
-      project: providerProject(providerId),
-      messages: req.messages,
-      tools: req.tools,
-      maxTokens: req.maxTokens ?? cfg.maxTokens,
-      temperature: temperatureFor(req.model, req.temperature, cfg.temperature),
-    });
-  }
   if (protocol === "responses") {
     const body = buildResponsesBody(
       {
@@ -869,6 +860,11 @@ function buildBodyFor(rawReq: ChatRequest, stream: boolean): Record<string, unkn
     if (modeCfg?.store !== undefined) body.store = modeCfg.store;
     if (modeCfg?.omitMaxTokens) delete body.max_output_tokens;
     if (modeCfg?.promptCacheKey) body.prompt_cache_key = conversationTag(rawReq);
+    if (providerId === "openai" && mode === "oauth") {
+      // The official ChatGPT plan route accepts local functions in namespaces.
+      if (Array.isArray(body.tools)) body.tools = [{ type: "namespace", name: "trcode", description: "TRCode local project tools", tools: body.tools }];
+      for (const item of body.input as any[]) if (item.type === "function_call") item.namespace = "trcode";
+    }
     return body;
   }
   if (protocol === "anthropic") {
@@ -1093,9 +1089,9 @@ export async function* streamChat(req: ChatRequest): AsyncGenerator<StreamEvent>
 
   const protocol = protocolForModel(req.model);
   const acc = new ToolCallAccumulator();
-  const responsesParser = protocol === "responses" ? new ResponsesStreamParser() : null;
+  const strictResponses = splitModelId(req.model).providerId === "openai" && modeFor("openai") === "oauth";
+  const responsesParser = protocol === "responses" ? new ResponsesStreamParser(strictResponses) : null;
   const anthropicParser = protocol === "anthropic" ? new AnthropicStreamParser() : null;
-  const geminiParser = protocol === "gemini" ? new GeminiStreamParser() : null;
   let finishReason = "";
   let usage: Usage | undefined;
   let buffer = "";
@@ -1121,6 +1117,14 @@ export async function* streamChat(req: ChatRequest): AsyncGenerator<StreamEvent>
         }
 
         if (responsesParser) {
+          if (json.type === "response.failed" || json.type === "error" || json.error) {
+            const failure = json.response?.error ?? json.error ?? json;
+            const code = String(failure.code ?? "response_failed");
+            const status = code === "subscription_sharing_usage_limit_exceeded" ? 429
+              : code.includes("unavailable") ? 503 : code.includes("not_eligible") || code.includes("not_authorized") ? 403 : 400;
+            const usageLink = code === "subscription_sharing_usage_limit_exceeded" ? " Review usage at https://chatgpt.com/settings/usage." : "";
+            throw new ApiError(`${code}: ${failure.message ?? "The Responses request failed."}${usageLink}`, status, JSON.stringify(json), res.headers.get("x-request-id") ?? undefined);
+          }
           for (const ev of responsesParser.handle(json)) yield ev;
           continue;
         }
@@ -1137,10 +1141,6 @@ export async function* streamChat(req: ChatRequest): AsyncGenerator<StreamEvent>
           // step is resent rather than reported as a refusal.
           if (/upstream idle timeout/i.test(detail)) throw new ApiError(`HTTP 500 — ${detail}`, 500, body);
           throw new ApiError(describeStatus(500, body), 500, body);
-        }
-        if (geminiParser) {
-          for (const ev of geminiParser.handle(json)) yield ev;
-          continue;
         }
         if (json.usage) usage = normalizeUsage(json.usage);
         const choice = json.choices?.[0];
@@ -1174,11 +1174,6 @@ export async function* streamChat(req: ChatRequest): AsyncGenerator<StreamEvent>
   }
   if (anthropicParser) {
     const r = anthropicParser.result();
-    yield { type: "done", toolCalls: r.toolCalls, usage: r.usage, finishReason: r.finishReason };
-    return;
-  }
-  if (geminiParser) {
-    const r = geminiParser.result();
     yield { type: "done", toolCalls: r.toolCalls, usage: r.usage, finishReason: r.finishReason };
     return;
   }
@@ -1275,7 +1270,6 @@ export async function complete(req: ChatRequest): Promise<CompletionResult> {
   const protocol = protocolForModel(req.model);
   if (protocol === "responses") return parseResponsesResult(json);
   if (protocol === "anthropic") return parseAnthropicResult(json);
-  if (protocol === "gemini") return parseGeminiResult(json);
   const choice = json.choices?.[0] ?? {};
   return {
     content: choice.message?.content ?? "",
@@ -1334,7 +1328,7 @@ export async function verifyProvider(providerId: string): Promise<ProviderCheck>
     const cfg = mode ? modeConfig(providerId, mode) : null;
     const catalog = cfg?.catalogPath ?? "models";
     const query = cfg?.catalog?.query ? `?${cfg.catalog.query}` : "";
-    const res = await fetch(`${auth.baseUrl}/${catalog}${query}`, { headers: auth.headers });
+    const res = await fetch(`${auth.baseUrl}/${catalog}${query}`, { headers: { "User-Agent": USER_AGENT, ...auth.headers }, signal: AbortSignal.timeout(15_000) });
     if (res.ok) {
       const body: any = await res.json().catch(() => ({}));
       const raw = Array.isArray(body?.data)
@@ -1345,7 +1339,7 @@ export async function verifyProvider(providerId: string): Promise<ProviderCheck>
       // Some hosts list internal models next to usable ones; the count here is
       // the same one /model shows, so the same rows are dropped.
       const list: any[] = cfg?.catalog?.list
-        ? raw.filter((row: any) => row?.visibility === undefined || row.visibility === "list")
+          ? raw.filter((row: any) => cfg.catalog?.visibleOnly ? row?.visibility === "list" : row?.visibility === undefined || row.visibility === "list")
         : raw;
       // A public listing answers the same to everyone: it has said nothing
       // about the credential, so the credential has to be asked elsewhere.

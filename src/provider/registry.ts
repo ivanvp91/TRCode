@@ -8,7 +8,8 @@
  * a provider only decides the base URL, the headers and, when the host has no
  * catalog to ask, the dialect.
  */
-import { loadConfig, saveConfig, DEFAULT_BASE_URL, type Effort } from "../config.js";
+import { loadConfig, saveConfig, DEFAULT_BASE_URL, VERSION, type Effort } from "../config.js";
+import { CHATGPT_OAUTH, chatgptPlanEnabled, isChatgptRegistration, refreshChatgpt } from "./chatgpt.js";
 import { isDrivable, protocolFor, protocolOfEndpoints, type Protocol } from "./protocol.js";
 import {
   deviceId,
@@ -19,7 +20,7 @@ import {
   type AuthMode,
   type Credentials,
 } from "./credentials.js";
-import { refreshToken, type FlowConfig, type WebFlowConfig } from "./oauth.js";
+import { refreshToken, type FlowConfig } from "./oauth.js";
 import type { ModelInfo, ModelPricing } from "../types.js";
 
 export const DEFAULT_PROVIDER = "tokenrouter";
@@ -102,7 +103,7 @@ export interface ProviderMode {
    * A catalog that is not the OpenAI shape: where the list sits in the body,
    * and a query string the endpoint insists on (a client_version, say).
    */
-  catalog?: { list?: string; query?: string };
+  catalog?: { list?: string; query?: string; visibleOnly?: boolean };
   /**
    * Per-model dialects, for a gateway that serves more than one and whose
    * catalog does not say which is which. Matched against the bare model name,
@@ -308,133 +309,20 @@ const META_PRICES: Record<string, ModelPricing> = {
   "muse-spark-1.2-contributor": { input: 0.1, output: 0.2, cachedInput: 0.002 },
 };
 
-/**
- * OpenAI's ChatGPT backend: a subscription, reached the way the vendor's own
- * CLI reaches it. The sign-in is OpenAI's own OAuth client, so the browser
- * flow is the only one it offers — no device grant — and the redirect comes
- * back to a fixed loopback port. The account the token acts for is not listed
- * anywhere: it is a claim inside the id_token, and it rides on every request
- * as ChatGPT-Account-Id.
- *
- * The backend is not api.openai.com: it serves only Responses, it refuses to
- * keep state (`store: false`), and it serves only its own line of models. The
- * identity headers below are the vendor CLI's own, which is what the backend
- * accepts in place of a key.
- */
-const CHATGPT_OAUTH: WebFlowConfig = {
-  kind: "web",
-  clientId: "app_EMoamEEZ73f0CkXaXp7hrann",
-  authorizeUrl: "https://auth.openai.com/oauth/authorize",
-  tokenUrl: "https://auth.openai.com/oauth/token",
-  redirectUri: "http://127.0.0.1:1455/auth/callback",
-  // The second port is on the same allow-list, for when 1455 is taken.
-  fallbackRedirectUris: ["http://127.0.0.1:1457/auth/callback"],
-  // The connector scopes are asked for as well, and the token is issued for
-  // exactly the set on the approval page.
-  scope: "openid profile email offline_access api.connectors.read api.connectors.invoke",
-  // Opaque on purpose: the backend checks these two words, not their meaning.
-  params: { id_token_add_organizations: "true", codex_cli_simplified_flow: "true", originator: "codex_cli_rs" },
-  // The code exchange is posted as a form and the refresh as JSON.
-  refreshEncoding: "json",
-  accountHeader: "ChatGPT-Account-Id",
-  accountClaim: { claim: "https://api.openai.com/auth", field: "chatgpt_account_id" },
-};
-
+/** ChatGPT plan usage through the public API under TRCode's own registration. */
 const CHATGPT_MODE: ProviderMode = {
-  // A wire path, not a name: the backend answers only here.
-  baseUrl: "https://chatgpt.com/backend-api/codex",
+  baseUrl: "https://api.openai.com/v1",
   protocol: "responses",
   listModels: true,
   catalogPath: "models",
-  catalog: { list: "models", query: "client_version=1.0.0" },
+  catalog: { list: "models", visibleOnly: true },
   seed: [],
-  headers: {
-    // Opaque identity values the backend requires (see above).
-    originator: "codex_cli_rs",
-    "OpenAI-Beta": "responses=experimental",
-    // The backend reads this while deciding whose plan the request spends, so
-    // it has to be the vendor CLI's version line, not ours. Override via
-    // config → providers.openai.headers when the gate moves.
-    "User-Agent": "codex_cli_rs/0.64.0",
-  },
-  // One conversation on one backend is what prompt_cache_key and the session
-  // headers are for; all of them carry the same derived tag.
-  sessionHeaders: ["session-id", "thread-id", "x-client-request-id"],
+  headers: { "User-Agent": `trcode/${VERSION}` },
   omitMaxTokens: true,
   store: false,
   promptCacheKey: true,
-  // "Stream must be set to true" — a non-streamed request is a 400.
   streamOnly: true,
 };
-
-/**
- * Google's installed-app OAuth client for Gemini CLI. The id and the secret ship
- * inside the CLI's own binary — for an installed app the secret is explicitly
- * not treated as one — and Code Assist only accepts tokens minted by this client.
- *
- * Google considers exactly this pattern a terms violation and has suspended
- * accounts for it since February 2026; the provider says so before opening the
- * browser, and the key path exists for anyone who does not want that risk.
- */
-const GEMINI_OAUTH: WebFlowConfig = {
-  kind: "web",
-  clientId: "681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com",
-  clientSecret: "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",
-  authorizeUrl: "https://accounts.google.com/o/oauth2/v2/auth",
-  tokenUrl: "https://oauth2.googleapis.com/token",
-  // An installed app may use any loopback port; the CLI binds a free one, and
-  // Google's allow-list follows the redirect supplied with the request.
-  redirectUri: "http://127.0.0.1:{port}/oauth2callback",
-  scope:
-    "https://www.googleapis.com/auth/cloud-platform " +
-    "https://www.googleapis.com/auth/userinfo.email " +
-    "https://www.googleapis.com/auth/userinfo.profile",
-  // Offline is what earns a refresh token; consent makes Google issue one again
-  // on a repeat login instead of silently answering without it.
-  params: { access_type: "offline", prompt: "consent" },
-  refreshEncoding: "form",
-};
-
-/**
- * The models Gemini CLI itself offers, carried because Code Assist has no
- * catalogue endpoint to ask. Windows are the published 1M of the Gemini line.
- */
-const GEMINI_CLI_MODELS: SeedModel[] = [
-  { id: "gemini-3.1-pro-preview", label: "Gemini 3.1 Pro (preview)", contextWindow: 1_048_576 },
-  { id: "gemini-3-pro-preview", label: "Gemini 3 Pro (preview)", contextWindow: 1_048_576 },
-  { id: "gemini-3.8-flash", label: "Gemini 3.8 Flash", contextWindow: 1_048_576 },
-  { id: "gemini-3.5-flash", label: "Gemini 3.5 Flash", contextWindow: 1_048_576 },
-  { id: "gemini-3.1-flash-lite", label: "Gemini 3.1 Flash-Lite", contextWindow: 1_048_576 },
-  { id: "gemini-2.5-pro", label: "Gemini 2.5 Pro", contextWindow: 1_048_576 },
-];
-
-const GEMINI_CODE_ASSIST: ProviderMode = {
-  baseUrl: "https://cloudcode-pa.googleapis.com/v1internal",
-  protocol: "gemini",
-  // No listing exists; the roster above is the catalogue.
-  listModels: false,
-  seed: GEMINI_CLI_MODELS,
-  // Code Assist reads this to tell its own client from anything else.
-  headers: { "User-Agent": "GeminiCLI/0.30.0 (trcode)" },
-};
-
-/** The project a Code Assist token acts for: pinned at login, or from the environment. */
-export function providerProject(providerId: string): string | undefined {
-  const pinned = loadConfig().providers?.[providerId]?.project?.trim();
-  if (pinned) return pinned;
-  if (providerId === "gemini") {
-    return process.env.GOOGLE_CLOUD_PROJECT?.trim() || process.env.GOOGLE_CLOUD_PROJECT_ID?.trim() || undefined;
-  }
-  return undefined;
-}
-
-/** Remembers the project discovered during a Code Assist login. */
-export function rememberProject(providerId: string, projectId: string): void {
-  const cfg = loadConfig();
-  saveConfig({
-    providers: { ...cfg.providers, [providerId]: { ...cfg.providers?.[providerId], project: projectId } },
-  });
-}
 
 const ZEN_MODE: ProviderMode = {
   baseUrl: "https://opencode.ai/zen/v1",
@@ -558,9 +446,7 @@ const PROVIDERS: ProviderDef[] = [
     label: "OpenAI",
     keyHint: "OpenAI API key (platform.openai.com/api-keys)",
     modes: {
-      // The subscription, against the ChatGPT backend. This is the only OpenAI
-      // token that spends a ChatGPT plan rather than a balance, and it is not
-      // the platform API: different host, different models, different shape.
+      // Official OAuth grant for ChatGPT plan usage on the public Responses API.
       oauth: CHATGPT_MODE,
       // The documented pay-per-token platform, key-gated and listing its models.
       apikey: {
@@ -571,10 +457,7 @@ const PROVIDERS: ProviderDef[] = [
       },
     },
     oauth: CHATGPT_OAUTH,
-    // No importFrom: the vendor CLI keeps a rotating refresh token in its own
-    // file under the home directory, and renewing it from here would invalidate
-    // the copy that CLI still holds — the user would find their session signed
-    // out. A subscription user signs in once more instead.
+    // Each ChatGPT account has its own TRCode registration and token set.
   },
   {
     id: "gemini",
@@ -582,13 +465,7 @@ const PROVIDERS: ProviderDef[] = [
     aka: ["google", "googleai", "google-ai", "gemini-api"],
     label: "Google Gemini",
     keyHint: "Google AI Studio key (aistudio.google.com/apikey)",
-    oauthWarning:
-      "Google treats third-party use of Gemini CLI's OAuth as a terms violation and has suspended paying accounts for it. " +
-      "The sign-in works, but the account is at risk — the API key is the supported path.",
     modes: {
-      // The account login: Gemini CLI's own OAuth client against Code Assist.
-      // Deliberately behind a warning; see GEMINI_OAUTH.
-      oauth: GEMINI_CODE_ASSIST,
       // Key path, and the one Google supports: the documented OpenAI-compatible
       // shim. Same models, same key, no account at risk. The listing is
       // key-gated and complete (ids, no windows), so nothing is pinned and a new
@@ -602,9 +479,6 @@ const PROVIDERS: ProviderDef[] = [
         seed: [],
       },
     },
-    oauth: GEMINI_OAUTH,
-    // `gemini` CLI's own login is the same login.
-    importFrom: ["~/.gemini/oauth_creds.json"],
   },
   {
     id: "meta",
@@ -905,7 +779,9 @@ export function rememberBaseUrl(providerId: string, baseUrl: string): void {
 /** Which mode a provider is currently configured for, if any. */
 export function modeFor(providerId: string): AuthMode | null {
   if (providerId === DEFAULT_PROVIDER) return loadConfig().apiKey ? "apikey" : null;
-  const mode = readCredentials(providerId)?.mode;
+  const creds = readCredentials(providerId);
+  if (providerId === "openai" && creds?.mode === "oauth" && !chatgptPlanEnabled(creds)) return null;
+  const mode = creds?.mode;
   return mode && providerById(providerId)?.modes[mode] ? mode : null;
 }
 
@@ -914,18 +790,36 @@ export function modeConfig(providerId: string, mode: AuthMode): ProviderMode | n
   const m = def?.modes[mode];
   if (!def || !m) return null;
   const over = overridesFor(providerId);
-  const baseUrl = (
+  let baseUrl = (
     providerId === DEFAULT_PROVIDER ? loadConfig().baseUrl : over.baseUrl ?? m.baseUrl
   ).replace(/\/+$/, "");
   const seed = over.models?.length ? over.models.map((id) => ({ id })) : m.seed;
-  return { ...m, baseUrl, seed, headers: { ...m.headers, ...over.headers } };
+  const headers = { ...m.headers, ...over.headers };
+  if (providerId === "openai") {
+    // Retire saved compatibility overrides from the old Codex backend path.
+    if (/^https:\/\/chatgpt\.com\/backend-api\/codex(?:\/|$)/i.test(baseUrl)) baseUrl = m.baseUrl;
+    for (const key of Object.keys(headers)) {
+      const name = key.toLowerCase();
+      if ((name === "user-agent" && /^codex_cli_rs\//i.test(headers[key]))
+        || (name === "originator" && headers[key] === "codex_cli_rs")
+        || (name === "openai-beta" && headers[key] === "responses=experimental")
+        || name === "chatgpt-account-id") delete headers[key];
+    }
+    if (mode === "oauth") headers["User-Agent"] = `trcode/${VERSION}`;
+  }
+  if (providerId === "gemini") {
+    if (/^https:\/\/cloudcode-pa\.googleapis\.com(?:\/|$)/i.test(baseUrl)) baseUrl = m.baseUrl;
+    for (const key of Object.keys(headers)) {
+      if (key.toLowerCase() === "user-agent" && /^GeminiCLI\//i.test(headers[key])) delete headers[key];
+    }
+  }
+  return { ...m, baseUrl, seed, headers };
 }
 
 const ENDPOINT_OF: Partial<Record<Protocol, string>> = {
   openai: "openai",
   responses: "openai-response",
   anthropic: "anthropic",
-  gemini: "gemini-codeassist",
 };
 
 /**
@@ -982,22 +876,27 @@ async function freshCredentials(def: ProviderDef, force = false): Promise<Creden
       `${def.label} does not support ${creds.mode} authentication. Run: trc auth login --provider ${def.id} --key`,
     );
   }
+  if (def.id === "openai" && creds.mode === "oauth") {
+    if (!isChatgptRegistration(creds)) throw new Error("Reconnect ChatGPT with TRCode's own registration: trc auth login --provider openai --oauth");
+    if (!chatgptPlanEnabled(creds)) throw new Error("ChatGPT plan usage is not enabled. Run: trc auth login --provider openai --oauth, or configure an API key with --key.");
+  }
   if (creds.mode !== "oauth" || (!force && !isStale(creds))) return creds;
   if (!def.oauth || !creds.refreshToken) {
     throw new Error(`The ${def.label} session expired. Run: trc auth login --provider ${def.id}`);
   }
 
-  const pending = refreshing.get(def.id);
+  const refreshId = `${def.id}:${creds.clientId ?? ""}`;
+  const pending = refreshing.get(refreshId);
   if (pending) return pending;
-  const job = refreshToken(def.oauth, creds)
-    .then((next) => writeCredentials(def.id, next))
+  const job = (def.id === "openai" ? refreshChatgpt(creds, force) : refreshToken(def.oauth, creds))
+    .then((next) => def.id === "openai" ? next : writeCredentials(def.id, next))
     .catch((err) => {
       throw new Error(
         `Could not refresh the ${def.label} token: ${(err as Error).message}. Run: trc auth login --provider ${def.id}`,
       );
     })
-    .finally(() => refreshing.delete(def.id));
-  refreshing.set(def.id, job);
+    .finally(() => refreshing.delete(refreshId));
+  refreshing.set(refreshId, job);
   return job;
 }
 
@@ -1036,6 +935,9 @@ export async function resolveAuth(providerId: string): Promise<ResolvedAuth> {
   const def = providerById(providerId);
   if (!def) throw new Error(`Unknown provider: ${providerId}`);
   const creds = await freshCredentials(def);
+  if (providerId === "openai" && creds.mode === "oauth" && !chatgptPlanEnabled(creds)) {
+    throw new Error("ChatGPT plan usage permission is no longer granted. Run: trc auth login --provider openai --oauth");
+  }
   const mode = modeConfig(providerId, creds.mode);
   if (!mode) throw new Error(`${def.label} does not support ${creds.mode} authentication`);
 

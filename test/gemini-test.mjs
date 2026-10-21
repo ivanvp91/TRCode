@@ -1,201 +1,93 @@
-/**
- * Gemini through Code Assist.
- *
- * The account path is not the public Gemini API: it is the host Gemini CLI
- * talks to, with its wrapper body ({model, project, request}) and its SSE frames
- * ({response: {candidates, usageMetadata}}). These tests pin the translation in
- * both directions, the streamed function calls, and the project discovery that
- * a fresh login needs before any request can be sent.
- */
-import { fileURLToPath } from "node:url";
-import http from "node:http";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
+/** Gemini uses the documented public API with an AI Studio key. */
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import http from 'node:http';
+import os from 'node:os';
+import path from 'node:path';
 
-const HERE = path.dirname(fileURLToPath(import.meta.url));
-const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "trc-gemini-"));
-process.env.TRCODE_HOME = HOME;
+const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), 'trcode-gemini-api-'));
+process.env.TRCODE_HOME = tempHome;
+delete process.env.TOKENROUTER_API_KEY;
+delete process.env.TR_API_KEY;
+delete process.env.TRCODE_MODEL;
+const { saveConfig } = await import('../dist/config.js');
+const registry = await import('../dist/provider/registry.js');
+const creds = await import('../dist/provider/credentials.js');
+const { loginProvider } = await import('../dist/ui/login.js');
+const client = await import('../dist/provider/client.js');
+for (const provider of registry.providers()) provider.importFrom = undefined;
+const def = registry.providerById('gemini');
+assert.equal(def.oauth, undefined);
+assert.equal(def.modes.oauth, undefined);
+assert.equal(def.importFrom, undefined);
+assert.equal(def.modes.apikey.baseUrl, 'https://generativelanguage.googleapis.com/v1beta/openai');
 
-let passed = 0;
-let failed = 0;
-const check = (name, cond, detail = "") => {
-  if (cond) {
-    passed++;
-    console.log("  ok   " + name);
-  } else {
-    failed++;
-    console.log("  FAIL " + name + (detail ? "\n       " + detail : ""));
+const calls = [];
+const server = http.createServer(async (req, res) => {
+  let text = '';
+  for await (const chunk of req) text += chunk;
+  const body = text ? JSON.parse(text) : undefined;
+  calls.push({ url: req.url, headers: req.headers, body });
+  if (req.headers.authorization !== 'Bearer ai-studio-key') { res.writeHead(401); return res.end('{"error":{"message":"Invalid API key"}}'); }
+  if (req.url === '/models') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ data: [{ id: 'gemini-3.8-flash', object: 'model', owned_by: 'google' }] }));
   }
-};
-
-// ── перевод истории в форму Gemini ─────────────────────────────────────────
-{
-  const { toGeminiContents, buildGeminiBody } = await import("../dist/provider/gemini.js");
-  const { systemInstruction, contents } = toGeminiContents([
-    { role: "system", content: "Ты агент." },
-    { role: "user", content: "Прочитай a.txt" },
-    { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: '{"path":"a.txt"}' } }] },
-    { role: "tool", tool_call_id: "c1", name: "read", content: "содержимое" },
-    { role: "user", content: "А теперь картинка", images: [{ mime: "image/png", data: "AAA" }] },
-  ]);
-
-  check("system уходит отдельным блоком", systemInstruction?.parts?.[0]?.text === "Ты агент.");
-  check(
-    "роли и порядок сохранены",
-    contents.map((c) => c.role).join(",") === "user,model,user",
-    contents.map((c) => c.role).join(","),
-  );
-  check("вызов инструмента стал functionCall", contents[1].parts[0].functionCall?.name === "read");
-  check("аргументы разобраны в объект", contents[1].parts[0].functionCall?.args?.path === "a.txt");
-  check("результат стал functionResponse", contents[2].parts[0].functionResponse?.name === "read");
-  check("и несёт output", contents[2].parts[0].functionResponse?.response?.output === "содержимое");
-  check(
-    "следующая реплика слилась в тот же ход",
-    contents[2].parts.some((p) => p.text === "А теперь картинка"),
-    JSON.stringify(contents[2].parts),
-  );
-  check("картинка стала inlineData", contents[2].parts.some((p) => p.inlineData?.mimeType === "image/png"));
-
-  const body = buildGeminiBody({
-    model: "gemini-3.1-pro-preview",
-    project: "proj-1",
-    messages: [{ role: "user", content: "привет" }],
-    tools: [{ name: "read", description: "read a file", parameters: { type: "object", properties: { path: { type: "string" } } } }],
-    maxTokens: 100,
-    temperature: 0.2,
-  });
-  check("обёртка Code Assist на месте", body.model === "gemini-3.1-pro-preview" && body.project === "proj-1" && Boolean(body.request));
-  check("tools стали functionDeclarations", body.request.tools?.[0]?.functionDeclarations?.[0]?.name === "read");
-  check("generationConfig собран", body.request.generationConfig?.maxOutputTokens === 100 && body.request.generationConfig?.temperature === 0.2);
-
-  // Gemini 3 refuses a replayed function call whose thought signature is gone.
-  const replay = buildGeminiBody({
-    model: "gemini-3.1-pro-preview",
-    messages: [
-      { role: "user", content: "прочитай" },
-      { role: "assistant", content: "", tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: '{"path":"a.txt"}' }, signature: "sig-1" }] },
-    ],
-  });
-  const replayedCall = replay.request.contents[1].parts[0];
-  check("подпись возвращается в историю", replayedCall.thoughtSignature === "sig-1", JSON.stringify(replayedCall));
-}
-
-// ── провод: SSE-кадры Code Assist через настоящий клиент ──────────────────
-{
-  const { saveConfig } = await import("../dist/config.js");
-  const creds = await import("../dist/provider/credentials.js");
-  const client = await import("../dist/provider/client.js");
-  const gemini = await import("../dist/provider/gemini.js");
-
-  const calls = [];
-  let hasProject = true;
-  const server = http.createServer((req, res) => {
-    let raw = "";
-    req.on("data", (d) => (raw += d));
-    req.on("end", () => {
-      const body = raw ? JSON.parse(raw) : undefined;
-      calls.push({ url: req.url, headers: req.headers, body });
-      const send = (json) => {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify(json));
-      };
-      if (req.url.startsWith("/v1internal:streamGenerateContent")) {
-        res.writeHead(200, { "content-type": "text/event-stream" });
-        res.write(`data: ${JSON.stringify({ response: { candidates: [{ content: { parts: [{ text: "При" }] } }] } })}\n\n`);
-        res.write(
-          `data: ${JSON.stringify({
-            response: {
-              candidates: [
-                { content: { parts: [{ functionCall: { name: "read", args: { path: "a.txt" } }, thoughtSignature: "sig-1" }] }, finishReason: "STOP" },
-              ],
-              usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 4, totalTokenCount: 14 },
-            },
-          })}\n\n`,
-        );
-        res.end();
-        return;
-      }
-      if (req.url.startsWith("/v1internal:generateContent")) {
-        send({
-          response: {
-            candidates: [{ content: { parts: [{ text: "ок" }] }, finishReason: "STOP" }],
-            usageMetadata: { promptTokenCount: 7, candidatesTokenCount: 2, totalTokenCount: 9 },
-          },
-        });
-        return;
-      }
-      if (req.url.startsWith("/v1internal:loadCodeAssist")) {
-        send(hasProject ? { currentTier: { id: "free" }, cloudaicompanionProject: "proj-a" } : { currentTier: { id: "free" } });
-        return;
-      }
-      if (req.url.startsWith("/v1internal:onboardUser")) {
-        send({ done: true, response: { cloudaicompanionProject: { id: "proj-b" } } });
-        return;
-      }
-      res.writeHead(404).end();
-    });
-  });
-  await new Promise((r) => server.listen(0, "127.0.0.1", r));
-  const base = `http://127.0.0.1:${server.address().port}/v1internal`;
-  saveConfig({ apiKey: "", providers: { gemini: { baseUrl: base, project: "proj-1" } } });
-  creds.writeCredentials("gemini", { mode: "oauth", accessToken: "tok-gem", expiresAt: Date.now() + 3600_000 });
-
-  try {
-    const res = await client.complete({
-      model: "gemini:gemini-3.1-pro-preview",
-      messages: [
-        { role: "system", content: "система" },
-        { role: "user", content: "привет" },
-      ],
-    });
-    check("нестримовый ответ разобран", res.content === "ок", JSON.stringify(res));
-    check("usage пришёл", res.usage?.prompt_tokens === 7 && res.usage?.total_tokens === 9, JSON.stringify(res.usage));
-    check("путь — :generateContent", calls[0].url === "/v1internal:generateContent", calls[0].url);
-    check("Bearer-токен ушёл", calls[0].headers.authorization === "Bearer tok-gem", calls[0].headers.authorization);
-    check("UA назван Gemini CLI", /^GeminiCLI\//.test(String(calls[0].headers["user-agent"])), calls[0].headers["user-agent"]);
-    check("проект попал в тело", calls[0].body.project === "proj-1", JSON.stringify(calls[0].body).slice(0, 120));
-    check("systemInstruction собрался", calls[0].body.request.systemInstruction?.parts?.[0]?.text === "система");
-
-    const events = [];
-    for await (const ev of client.streamChat({
-      model: "gemini:gemini-3.1-pro-preview",
-      messages: [{ role: "user", content: "привет" }],
-      tools: [{ name: "read", description: "read a file", parameters: { type: "object", properties: { path: { type: "string" } } } }],
-    })) {
-      events.push(ev);
+  if (req.url === '/chat/completions') {
+    if (body.stream) {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      res.write('data: ' + JSON.stringify({ choices: [{ delta: { content: 'Hello' } }] }) + '\n\n');
+      res.write('data: ' + JSON.stringify({ choices: [{ delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 4, completion_tokens: 1 } }) + '\n\n');
+      return res.end('data: [DONE]\n\n');
     }
-    const streamCall = calls.find((c) => c.url.startsWith("/v1internal:streamGenerateContent"));
-    check("стрим идёт на :streamGenerateContent", Boolean(streamCall), calls.map((c) => c.url).join(", "));
-    check("alt=sse запрошен", /alt=sse/.test(streamCall.url));
-    check("текст отдан дельтой", events.some((e) => e.type === "text" && e.text === "При"));
-    const done = events.find((e) => e.type === "done");
-    check("инструмент собран из functionCall", done?.toolCalls?.[0]?.function?.name === "read", JSON.stringify(done?.toolCalls));
-    check("аргументы — JSON-строка", done?.toolCalls?.[0]?.function?.arguments === '{"path":"a.txt"}');
-    check("finishReason — tool_calls", done?.finishReason === "tool_calls", done?.finishReason);
-    check("подпись вызова сохранена", done?.toolCalls?.[0]?.signature === "sig-1", JSON.stringify(done?.toolCalls));
-    check("usage из кадра", done?.usage?.total_tokens === 14, JSON.stringify(done?.usage));
-
-    // ── проект: готовый из loadCodeAssist ───────────────────────────────────
-    const found = await gemini.discoverProject("tok-gem", { baseUrl: base });
-    check("проект берётся из loadCodeAssist", found.projectId === "proj-a" && found.tier === "free", JSON.stringify(found));
-
-    hasProject = false;
-    const onboarded = await gemini.discoverProject("tok-gem", { baseUrl: base });
-    check("без проекта аккаунт онбордится", onboarded.projectId === "proj-b", JSON.stringify(onboarded));
-  } finally {
-    creds.clearCredentials("gemini");
-    await new Promise((r) => server.close(r));
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ choices: [{ message: { content: 'Hello' }, finish_reason: 'stop' }], usage: { prompt_tokens: 4, completion_tokens: 1 } }));
   }
-}
-
+  res.writeHead(404).end();
+});
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 try {
-  fs.rmSync(HOME, { recursive: true, force: true });
-} catch {
-  /* Windows may hold the directory briefly */
-}
+  const base = `http://127.0.0.1:${server.address().port}`;
+  saveConfig({ apiKey: '', providers: { gemini: { baseUrl: base } } });
+  const login = await loginProvider(def, { key: 'ai-studio-key', exclusive: async () => { throw new Error('Unexpected browser-login selection'); } });
+  assert.equal(login.connected, true);
+  assert.equal(login.usable, true);
+  assert.equal(creds.readCredentials('gemini').mode, 'apikey');
+  assert.equal(registry.modeFor('gemini'), 'apikey');
+  const request = { model: 'gemini:gemini-3.8-flash', messages: [{ role: 'user', content: 'Hello' }] };
+  assert.equal((await client.complete(request)).content, 'Hello');
+  const events = [];
+  for await (const event of client.streamChat(request)) events.push(event);
+  assert.equal(events.filter(e => e.type === 'text').map(e => e.text).join(''), 'Hello');
+  assert.equal(events.at(-1).type, 'done');
+  assert.ok(calls.every(call => /^trcode\//.test(call.headers['user-agent'])));
+  assert.ok(calls.every(call => call.url === '/models' || call.url === '/chat/completions'));
+  assert.ok(calls.filter(call => call.body).every(call => Array.isArray(call.body.messages) && call.body.project === undefined && call.body.request === undefined));
+  console.log('PASS Gemini key login, model catalog, completions and streaming use public API shapes');
 
-console.log(`\n${passed}/${passed + failed} passed`);
-// Not process.exit(): the fetch agent keeps sockets briefly, and tearing the
-// loop down under it trips a libuv assertion on Windows. The code is the verdict.
-process.exitCode = failed ? 1 : 0;
+  saveConfig({ providers: { gemini: { baseUrl: 'https://cloudcode-pa.googleapis.com/v1internal', headers: { 'User-Agent': 'GeminiCLI/old' } } } });
+  const migrated = await registry.resolveAuth('gemini');
+  assert.equal(migrated.baseUrl, def.modes.apikey.baseUrl);
+  assert.equal(migrated.headers['User-Agent'], undefined);
+  console.log('PASS retired Code Assist endpoint and client impersonation overrides are ignored');
+
+  const realFetch = globalThis.fetch;
+  let network = 0;
+  globalThis.fetch = async () => { network++; throw new Error('Legacy Gemini OAuth must not access the network'); };
+  try {
+    for (const expiresAt of [Date.now() + 3600_000, Date.now() - 3600_000]) {
+      creds.writeCredentials('gemini', { mode: 'oauth', accessToken: 'old-cli-token', refreshToken: 'old-cli-refresh', expiresAt });
+      assert.equal(registry.modeFor('gemini'), null);
+      await assert.rejects(registry.resolveAuth('gemini'), /auth login --provider gemini --key/);
+      assert.equal(await registry.renewRejectedToken('gemini'), false);
+    }
+    assert.equal((await loginProvider(def, { mode: 'oauth' })).connected, false);
+    assert.equal(network, 0);
+  } finally { globalThis.fetch = realFetch; }
+  console.log('PASS legacy CLI sessions and explicit OAuth login are rejected without network access');
+} finally {
+  server.closeAllConnections();
+  await new Promise(resolve => server.close(resolve));
+  fs.rmSync(tempHome, { recursive: true, force: true });
+}
+console.log('Gemini public API checks passed.');

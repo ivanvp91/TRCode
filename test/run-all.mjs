@@ -59,6 +59,7 @@ const PORT = process.env.MOCK_PORT ? Number(process.env.MOCK_PORT) : await freeP
 const SUITES = [
   "protocol-test.mjs",
   "provider-test.mjs",
+  "chatgpt-test.mjs",
   "gemini-test.mjs",
   "mode-test.mjs",
   "lang-test.mjs",

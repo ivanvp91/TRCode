@@ -9,11 +9,11 @@
 import { spawn } from "node:child_process";
 import { saveConfig } from "../config.js";
 import { verifyProvider } from "../provider/client.js";
-import { clearCredentials, importVendorCredentials, readCredentials, writeCredentials, type Credentials } from "../provider/credentials.js";
+import { clearCredentials, importVendorCredentials, readCredentials, savedChatgptProfiles, writeCredentials, type Credentials } from "../provider/credentials.js";
+import { chatgptPlanEnabled, loginChatgpt, logoutChatgpt, publicChatgptLoginUrl } from "../provider/chatgpt.js";
 import { fetchModels } from "../provider/models.js";
 import { pollForToken, requestDeviceCode, webLogin, type DeviceFlowConfig, type WebFlowConfig } from "../provider/oauth.js";
-import { modeConfig, providerProject, qualifyModelId, rememberBaseUrl, rememberProject, type ProviderDef } from "../provider/registry.js";
-import { discoverProject } from "../provider/gemini.js";
+import { modeConfig, qualifyModelId, rememberBaseUrl, type ProviderDef } from "../provider/registry.js";
 import { c } from "./ansi.js";
 import { choose } from "./choice.js";
 import { askLine } from "./prompt.js";
@@ -54,7 +54,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
   const canOAuth = Boolean(def.oauth && def.modes.oauth);
   const canKey = Boolean(def.modes.apikey);
 
-  let mode = opts.mode;
+  let mode = opts.mode ?? (opts.key ? "apikey" : undefined);
   if (!mode) {
     if (canOAuth && canKey) {
       line();
@@ -64,7 +64,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
       mode = await exclusive<"oauth" | "apikey">(() =>
         choose<"oauth" | "apikey">(
           [
-            { value: "oauth" as const, label: t("Subscription", "Подписка"), key: "s" },
+            { value: "oauth" as const, label: def.id === "openai" ? "Continue with ChatGPT" : t("Subscription", "Подписка"), key: "s" },
             { value: "apikey" as const, label: t("API key", "Ключ API"), key: "a" },
           ],
           { fallback: "oauth" },
@@ -128,17 +128,20 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
       writeCredentials(def.id, inherited);
       info(t(`Reusing the ${def.label} CLI session from ${inherited.source}.`, `Переиспользую сессию ${def.label} CLI из ${inherited.source}.`));
     } else {
-      if (!(await oauthLogin(def))) return FAILED;
+      if (!(await oauthLogin(def, exclusive))) return FAILED;
     }
-    // Code Assist refuses a request that names no project. The token alone does
-    // not say which one it acts for, so it is resolved here, once, and pinned.
-    if (mode === "oauth" && def.id === "gemini") await settleGeminiProject(def);
+  }
+
+  if (def.id === "openai" && mode === "oauth" && !chatgptPlanEnabled(readCredentials("openai"))) {
+    warn(t("Signed in to ChatGPT, but permission to use your plan was not granted.", "Вход в ChatGPT выполнен, но разрешение использовать подписку не выдано."));
+    hint(t("Run /login openai to enable plan usage, or connect an API key with trc auth login --provider openai --key.", "Наберите /login openai, чтобы разрешить использование подписки, или подключите API-ключ: trc auth login --provider openai --key."));
+    return { connected: true, usable: false };
   }
 
   const check = await verifyProvider(def.id);  if (!check.ok) {
     // A rejected token is worth deleting; a lapsed plan is not — the login
     // itself worked, and asking the user to repeat it would fix nothing.
-    if (check.status === 401 || check.status === 403) {
+    if ((check.status === 401 || check.status === 403) && !(def.id === "openai" && mode === "oauth")) {
       clearCredentials(def.id);
       error(t(`${def.label} rejected the credential: ${check.detail}`, `${def.label} отклонил учётные данные: ${check.detail}`));
       // A key is issued for one of this vendor's products and refused by the
@@ -204,63 +207,28 @@ export async function chooseHost(
   return typed === null ? null : typed.trim() === current ? "" : typed.trim();
 }
 
-/**
- * The Code Assist project the token will act for.
- *
- * Paid accounts have one; a free account is onboarded to its default tier by the
- * same two calls Gemini CLI makes on first run, which can take a few seconds. A
- * failure is not a failed login — the tokens are saved, and the user can pin a
- * project (GOOGLE_CLOUD_PROJECT or config → providers.gemini.project) later.
- */
-async function settleGeminiProject(def: ProviderDef): Promise<void> {
-  const known = providerProject(def.id);
-  if (known) {
-    info(t(`Code Assist project: ${known}`, `Проект Code Assist: ${known}`));
-    return;
-  }
-  const creds = readCredentials(def.id);
-  if (!creds) return;
-  const sp = new Spinner(t("looking up the Code Assist project", "ищу проект Code Assist"), { escape: true });
-  sp.start();
-  const ac = new AbortController();
-  const releaseEsc = escWatch(() => ac.abort());
-  try {
-    const { projectId, tier } = await discoverProject(creds.accessToken, {
-      baseUrl: modeConfig(def.id, "oauth")?.baseUrl,
-      signal: ac.signal,
-      onWait: (attempt) =>
-        sp.setLabel(
-          t(
-            `onboarding the Code Assist project (check ${attempt})`,
-            `онбординг проекта Code Assist (проверка ${attempt})`,
-          ),
-        ),
-    });
-    if (projectId) {
-      rememberProject(def.id, projectId);
-      info(t(`Code Assist project: ${projectId}${tier ? ` (${tier})` : ""}`, `Проект Code Assist: ${projectId}${tier ? ` (${tier})` : ""}`));
-    } else {
-      warn(t("Code Assist returned no project for this account.", "Code Assist не вернул проект для этого аккаунта."));
-      hint(t("Set GOOGLE_CLOUD_PROJECT, or config → providers.gemini.project.", "Задайте GOOGLE_CLOUD_PROJECT или config → providers.gemini.project."));
-    }
-  } catch (err) {
-    if (ac.signal.aborted) {
-      // The tokens are already written; the project is the only thing skipped,
-      // and it can be pinned later.
-      hint(t("Project lookup cancelled. Set GOOGLE_CLOUD_PROJECT to use the tokens.", "Поиск проекта отменён. Задайте GOOGLE_CLOUD_PROJECT, чтобы использовать токены."));
-    } else {
-      warn(t(`Could not resolve the Code Assist project: ${(err as Error).message}`, `Не удалось получить проект Code Assist: ${(err as Error).message}`));
-      hint(t("The tokens are saved. Set GOOGLE_CLOUD_PROJECT to use them.", "Токены сохранены. Задайте GOOGLE_CLOUD_PROJECT, чтобы их использовать."));
-    }
-  } finally {
-    releaseEsc();
-    sp.stop();
-  }
-}
-
-async function oauthLogin(def: ProviderDef): Promise<boolean> {
+async function oauthLogin(def: ProviderDef, exclusive: <T>(fn: () => Promise<T>) => Promise<T>): Promise<boolean> {
   const cfg = def.oauth!;
-  const creds = cfg.kind === "web" ? await webLoginFlow(def, cfg) : await deviceLoginFlow(def, cfg);
+  let profile: Credentials | undefined;
+  if (def.id === "openai") {
+    const profiles = savedChatgptProfiles();
+    if (profiles.length) {
+      const activeId = readCredentials("openai")?.clientId;
+      if (!process.stdin.isTTY) profile = profiles.find((p) => p.clientId === activeId) ?? (profiles.length === 1 ? profiles[0] : undefined);
+      else {
+        const selected = await exclusive(() => pick({
+          title: "Continue with ChatGPT",
+          items: [
+            ...profiles.map((p) => ({ value: p.clientId!, label: p.email ?? "ChatGPT account", hint: `${p.clientId} · ${p.accessToken ? "saved" : "signed out"}`, badge: p.clientId === activeId ? t("current", "текущий") : undefined })),
+            { value: "__new", label: t("Add another ChatGPT account or workspace", "Добавить другой аккаунт ChatGPT или рабочее пространство") },
+          ],
+        }));
+        if (selected === null) return false;
+        profile = profiles.find((p) => p.clientId === selected);
+      }
+    }
+  }
+  const creds = cfg.kind === "web" ? await webLoginFlow(def, cfg, profile) : await deviceLoginFlow(def, cfg);
   if (!creds) return false;
   writeCredentials(def.id, creds);
   return true;
@@ -270,7 +238,7 @@ async function oauthLogin(def: ProviderDef): Promise<boolean> {
  * The browser flow: the listener is already up when the URL is printed, so the
  * redirect cannot arrive before there is something to receive it.
  */
-async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig): Promise<Credentials | null> {
+async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig, profile?: Credentials): Promise<Credentials | null> {
   // In a holder: the spinner is created inside the onUrl callback, and a local
   // the compiler never sees assigned would narrow to never in the finally.
   const waiting: { spinner: Spinner | null } = { spinner: null };
@@ -279,11 +247,13 @@ async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig): Promise<Crede
   const ac = new AbortController();
   const releaseEsc = escWatch(() => ac.abort());
   try {
-    const creds = await webLogin(cfg, {
+    const options = {
       signal: ac.signal,
-      onUrl: (url) => {
+      onUrl: (url: string) => {
         line();
-        padded(t(`Open ${c.brightCyan(url)}`, `Откройте ${c.brightCyan(url)}`));
+        if (def.id === "openai") padded(c.bold("Continue with ChatGPT"));
+        const visibleUrl = def.id === "openai" ? publicChatgptLoginUrl(url) : url;
+        padded(t(`Open ${c.brightCyan(visibleUrl)}`, `Откройте ${c.brightCyan(visibleUrl)}`));
         hint(
           t(
             "approve it in the browser — this window finishes the sign-in by itself",
@@ -295,7 +265,10 @@ async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig): Promise<Crede
         waiting.spinner = new Spinner(t("waiting for approval", "жду подтверждения"), { escape: true });
         waiting.spinner.start();
       },
-    });
+    };
+    const creds = def.id === "openai"
+      ? await loginChatgpt({ ...options, profile, enablePlan: Boolean(profile && !profile.scopes?.includes("chatgpt.tokens.use.direct")) })
+      : await webLogin(cfg, options);
     return creds;
   } catch (err) {
     if ((err as { code?: string }).code === "cancelled") {
@@ -318,6 +291,16 @@ async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig): Promise<Crede
     releaseEsc();
     waiting.spinner?.stop();
   }
+}
+
+export async function disconnectProvider(providerId: string): Promise<boolean> {
+  if (providerId !== "openai") return clearCredentials(providerId);
+  const result = await logoutChatgpt();
+  if (!result.revoked) warn(t(
+    "Signed out locally. Remote revocation was not confirmed; disconnect TRCode in ChatGPT Settings → Security and login → Sign in with ChatGPT.",
+    "Локальный выход выполнен. Отзыв доступа на сервере не подтверждён; отключите TRCode в настройках ChatGPT → Security and login → Sign in with ChatGPT.",
+  ));
+  return result.disconnected;
 }
 
 async function deviceLoginFlow(def: ProviderDef, cfg: DeviceFlowConfig): Promise<Credentials | null> {

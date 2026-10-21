@@ -18,7 +18,7 @@ import { fetchModels, groupByModality, groupByVendor, resolveModelId, usableMode
 import { fmtTokens } from "./usage.js";
 import { verifyKey, verifyProvider } from "./provider/client.js";
 import { askSecret } from "./ui/secret.js";
-import { loginProvider } from "./ui/login.js";
+import { disconnectProvider, loginProvider } from "./ui/login.js";
 import { Session } from "./session/session.js";
 import {
   DEFAULT_PROVIDER,
@@ -30,7 +30,8 @@ import {
   providers,
   splitModelId,
 } from "./provider/registry.js";
-import { clearCredentials, importVendorCredentials, readCredentials } from "./provider/credentials.js";
+import { importVendorCredentials, readCredentials } from "./provider/credentials.js";
+import { isChatgptRegistration } from "./provider/chatgpt.js";
 import { latestRelease, isNewer, applyUpdate, refreshCache } from "./update.js";
 import { sweepMediaTmp } from "./tools/mediaworkspace.js";
 
@@ -177,6 +178,11 @@ async function cmdAuthStatus(): Promise<number> {
   for (const def of providers()) {
     const mode = modeFor(def.id);
     if (!mode) {
+      const signedIn = def.id === "openai" ? readCredentials(def.id) : null;
+      if (isChatgptRegistration(signedIn)) {
+        line(`  ${c.bold(def.label.padEnd(width))} ${c.yellow("signed in; ChatGPT plan usage is not enabled")} ${signedIn?.email ?? ""}`);
+        continue;
+      }
       const inherited = def.importFrom ? importVendorCredentials(def.importFrom) : null;
       line(
         `  ${c.bold(def.label.padEnd(width))} ${c.gray("not connected")}` +
@@ -204,7 +210,7 @@ function describeCredential(providerId: string): string {
   const expiry = creds.expiresAt
     ? `expires ${new Date(creds.expiresAt).toLocaleString()}${creds.refreshToken ? ", auto-renewed" : ""}`
     : "does not expire";
-  return `${maskKey(creds.accessToken)} · ${expiry}${creds.source ? ` · from ${creds.source}` : ""}`;
+  return `${maskKey(creds.accessToken)} · ${expiry}${creds.email ? ` · ${creds.email}` : ""}${creds.source ? ` · from ${creds.source}` : ""}`;
 }
 
 async function cmdAuth(rest: string[]): Promise<number> {
@@ -313,7 +319,7 @@ async function cmdAuth(rest: string[]): Promise<number> {
       success("Key removed from the config.");
       return 0;
     }
-    if (!clearCredentials(def.id)) {
+    if (!(await disconnectProvider(def.id))) {
       warn(`${def.label} was not connected.`);
       return 0;
     }

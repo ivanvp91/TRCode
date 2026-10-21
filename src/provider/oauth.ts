@@ -99,7 +99,7 @@ export class OAuthError extends Error {
   }
 }
 
-async function postForm(
+export async function postForm(
   url: string,
   params: Record<string, string>,
   headers: Record<string, string> = {},
@@ -118,6 +118,7 @@ async function postForm(
       method: "POST",
       headers: { "Content-Type": attempt.contentType, Accept: "application/json", ...headers },
       body: attempt.body,
+      signal: AbortSignal.timeout(20_000),
     });
     const text = await res.text();
     let json: any;
@@ -281,7 +282,7 @@ export interface WebLoginOptions {
 export async function webLogin(cfg: WebFlowConfig, opts: WebLoginOptions = {}): Promise<Credentials> {
   const pkce = makePkce();
   // The host allow-lists these ports, and its own CLI may hold the first one.
-  let listener: { code: Promise<string>; close: () => void; redirectUri: string } | null = null;
+  let listener: Awaited<ReturnType<typeof callbackServer>> | null = null;
   let lastError: unknown;
   for (const uri of [cfg.redirectUri, ...(cfg.fallbackRedirectUris ?? [])]) {
     try {
@@ -294,8 +295,8 @@ export async function webLogin(cfg: WebFlowConfig, opts: WebLoginOptions = {}): 
   if (!listener) throw lastError;
   try {
     opts.onUrl?.(authorizeUrl(cfg, pkce, listener.redirectUri));
-    const code = await withDeadline(listener.code, opts.signal, cfg.loginTimeoutMs ?? 5 * 60_000);
-    return await exchangeCode(cfg, code, pkce.verifier, listener.redirectUri);
+    const callback = await withDeadline(listener.code, opts.signal, cfg.loginTimeoutMs ?? 5 * 60_000);
+    return await exchangeCode(cfg, callback.code, pkce.verifier, listener.redirectUri);
   } finally {
     listener.close();
   }
@@ -352,10 +353,10 @@ export function jwtClaims(token: string | undefined): any {
  * its path — a stray request from a browser prefetch gets a 404 and no verdict —
  * and settles on the first callback that carries a code or an error.
  */
-function callbackServer(
+export function callbackServer(
   redirectUri: string,
   state: string,
-): Promise<{ code: Promise<string>; close: () => void; redirectUri: string }> {
+): Promise<{ code: Promise<{ code: string; clientId?: string }>; close: () => void; redirectUri: string }> {
   // A host whose allow-list takes any loopback port (Google's installed-app
   // clients) states the redirect as a template; the port is chosen by binding
   // to 0, and the real one is what goes into the authorize URL.
@@ -365,9 +366,9 @@ function callbackServer(
   const host = target.hostname || "127.0.0.1";
   const path = target.pathname || "/";
 
-  let settle!: (err: Error | null, code?: string) => void;
-  const code = new Promise<string>((resolve, reject) => {
-    settle = (err, value) => (err ? reject(err) : resolve(String(value)));
+  let settle!: (err: Error | null, code?: string, clientId?: string) => void;
+  const code = new Promise<{ code: string; clientId?: string }>((resolve, reject) => {
+    settle = (err, value, clientId) => (err ? reject(err) : resolve({ code: String(value), clientId }));
   });
   // Closing a login that never finished must not surface as an unhandled rejection.
   code.catch(() => {});
@@ -388,10 +389,10 @@ function callbackServer(
       .end(resultPage(ok, failure));
     if (answered) return;
     answered = true;
-    if (failure) settle(new OAuthError(got.searchParams.get("error_description") ?? failure, failure));
-    else if (seen !== state) settle(new OAuthError("The approval came back for another login attempt", "state_mismatch"));
+    if (seen !== state) settle(new OAuthError("The approval came back for another login attempt", "state_mismatch"));
+    else if (failure) settle(new OAuthError(got.searchParams.get("error_description") ?? failure, failure));
     else if (!returned) settle(new OAuthError("The approval carried no code", "bad_response"));
-    else settle(null, returned);
+    else settle(null, returned, got.searchParams.get("client_id") ?? undefined);
   });
 
   return new Promise((resolve, reject) => {
@@ -437,7 +438,7 @@ function escapeHtml(s: string): string {
 }
 
 /** Rejects with the timeout's own error once the deadline passes. */
-function withDeadline<T>(p: Promise<T>, signal: AbortSignal | undefined, timeoutMs: number): Promise<T> {
+export function withDeadline<T>(p: Promise<T>, signal: AbortSignal | undefined, timeoutMs: number): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     let timer: NodeJS.Timeout;
     const finish = (fn: () => void) => {

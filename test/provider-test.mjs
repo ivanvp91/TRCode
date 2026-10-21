@@ -1128,264 +1128,44 @@ creds.writeCredentials("kimi", { mode: "apikey", accessToken: "sk-platform-key" 
 ok("api-ключ не «обновляется»", (await registry.renewRejectedToken("kimi")) === false);
 ok("tokenrouter без oauth — false", (await registry.renewRejectedToken("tokenrouter")) === false);
 
-// ── Gemini: ключ через шим и аккаунт через Code Assist ─────────────────────
+// ── Google Gemini: public API keys only ──────────────────────────────────
 {
   const def = registry.providerById("gemini");
-  ok("Gemini есть в реестре", Boolean(def));
-  ok("google — его второе имя", registry.providerById("google")?.id === "gemini");
-  ok(
-    "база ключа — OpenAI-совместимый шим",
-    def.modes.apikey?.baseUrl === "https://generativelanguage.googleapis.com/v1beta/openai",
-    def.modes.apikey?.baseUrl,
-  );
-  ok("диалект ключа — chat completions", def.modes.apikey?.protocol === "openai");
-  ok("каталог ключа спрашивается у хоста", def.modes.apikey?.listModels === true);
-
-  // Аккаунт: OAuth клиента Gemini CLI, тот же host, что у самого CLI.
-  ok("аккаунт идёт в Code Assist", def.modes.oauth?.baseUrl === "https://cloudcode-pa.googleapis.com/v1internal", def.modes.oauth?.baseUrl);
-  ok("диалект аккаунта — gemini", def.modes.oauth?.protocol === "gemini");
-  ok("вход — браузерный PKCE", def.oauth?.kind === "web" && def.oauth?.clientId.startsWith("681255809395-"));
-  ok("redirect на свободный loopback-порт", def.oauth?.redirectUri === "http://127.0.0.1:{port}/oauth2callback", def.oauth?.redirectUri);
-  ok("scope — cloud-platform", /cloud-platform/.test(def.oauth?.scope ?? "") && /offline/.test(def.oauth?.params?.access_type ?? ""));
-  ok("предупреждение об ToS есть", /terms violation|terms/i.test(def.oauthWarning ?? ""), def.oauthWarning);
-  ok("ростер Code Assist непустой", (def.modes.oauth?.seed ?? []).some((m) => m.id.includes("gemini-3")));
-  ok("каталог Code Assist не запрашивается", def.modes.oauth?.listModels === false);
-
-  creds.writeCredentials("gemini", { mode: "apikey", accessToken: "AIza-test" });
-  const gem = await registry.resolveAuth("gemini");
-  ok("ключ уходит Bearer", gem.headers.Authorization === "Bearer AIza-test");
-  ok("диалект ключевой модели — openai", registry.protocolForModel("gemini:gemini-3.8-flash") === "openai");
-
-  creds.writeCredentials("gemini", { mode: "oauth", accessToken: "tok-gem", expiresAt: Date.now() + 3600_000 });
-  ok("диалект аккаунтной модели — gemini", registry.protocolForModel("gemini:gemini-3.1-pro-preview") === "gemini");
-  const ga = await registry.resolveAuth("gemini");
-  ok("аккаунт уходит Bearer", ga.headers.Authorization === "Bearer tok-gem");
-  ok("UA называет Gemini CLI", /GeminiCLI\//.test(ga.headers["User-Agent"] ?? ""), ga.headers["User-Agent"]);
+  ok("Gemini uses API keys only", def.modes.oauth === undefined && def.oauth === undefined);
+  ok("Gemini does not import vendor sessions", def.importFrom === undefined);
+  ok("Gemini uses the public compatibility endpoint", def.modes.apikey.baseUrl === "https://generativelanguage.googleapis.com/v1beta/openai");
+  creds.writeCredentials("gemini", { mode: "oauth", accessToken: "legacy-gemini", refreshToken: "legacy-refresh", expiresAt: Date.now() - 1 });
+  ok("Legacy Gemini sessions are disconnected", registry.modeFor("gemini") === null);
+  let error = "";
+  try { await registry.resolveAuth("gemini"); } catch (err) { error = err.message; }
+  ok("Legacy Gemini login asks for an API key", error.includes("auth login --provider gemini --key"), error);
+  ok("Gemini never refreshes vendor OAuth", (await registry.renewRejectedToken("gemini")) === false);
+  creds.writeCredentials("gemini", { mode: "apikey", accessToken: "gemini-api-key" });
+  const auth = await registry.resolveAuth("gemini");
+  ok("Gemini key is sent as Bearer", auth.headers.Authorization === "Bearer gemini-api-key");
+  ok("Gemini does not impersonate Gemini CLI", auth.headers["User-Agent"] === undefined);
+  ok("Gemini uses chat completions", registry.protocolForModel("gemini:gemini-3.8-flash") === "openai");
   creds.clearCredentials("gemini");
 }
 
-// ── Meta: опубликованный ростер знает и Wonder, и Spark 1.3 ───────────────
-{
-  creds.writeCredentials("meta", { mode: "apikey", accessToken: "meta-test" });
-  const ids = registry.seedModels("meta", "apikey").map((m) => m.id);
-  ok("Muse Wonder в опубликованном списке", ids.includes("meta:muse-wonder-1.0"), ids.join(", "));
-  ok("Muse Spark 1.3 в списке", ids.includes("meta:muse-spark-1.3"), ids.join(", "));
-  ok("Muse Wonder идёт на Responses", registry.protocolForModel("meta:muse-wonder-1.0") === "responses");
-  ok("Muse Spark 1.3 идёт на Responses", registry.protocolForModel("meta:muse-spark-1.3") === "responses");
-  creds.clearCredentials("meta");
-}
-
-// ── OpenAI: ключ на платформе и подписка ChatGPT ──────────────────────────
+// ── OpenAI: public API and its own ChatGPT client registration ────────────
 {
   const def = registry.providerById("openai");
-  ok("OpenAI есть в реестре", Boolean(def));
-  ok("chatgpt — его второе имя", registry.providerById("chatgpt")?.id === "openai");
-  ok("ключ идёт на платформу", def.modes.apikey?.baseUrl === "https://api.openai.com/v1");
-  ok("подписка — на бэкенд ChatGPT", def.modes.oauth?.baseUrl === "https://chatgpt.com/backend-api/codex");
-  ok("вход браузерный, PKCE", def.oauth?.kind === "web" && /^app_/.test(def.oauth?.clientId ?? ""));
-  ok("callback на порту из allow-list", def.oauth?.redirectUri === "http://127.0.0.1:1455/auth/callback", def.oauth?.redirectUri);
-  ok("и запасной порт из того же списка", def.oauth?.fallbackRedirectUris?.[0] === "http://127.0.0.1:1457/auth/callback");
-  ok("аккаунт носится заголовком", def.oauth?.accountHeader === "ChatGPT-Account-Id");
-  ok("бэкенд отвечает только стримом", def.modes.oauth?.streamOnly === true);
-  ok("каталог просит client_version", def.modes.oauth?.catalog?.query === "client_version=1.0.0");
-
-  creds.writeCredentials("openai", {
-    mode: "oauth",
-    accessToken: "chatgpt-access",
-    refreshToken: "chatgpt-refresh",
-    orgId: "acc_123",
-    expiresAt: Date.now() + 3600_000,
-  });
-  const a = await registry.resolveAuth("openai");
-  ok(
-    "клиент называет себя так, как требует бэкенд",
-    a.headers.originator === "codex_cli_rs" && /^codex_cli_rs\//.test(a.headers["User-Agent"] ?? ""),
-    `${a.headers.originator} / ${a.headers["User-Agent"]}`,
-  );
-  ok("бета Responses запрошена", a.headers["OpenAI-Beta"] === "responses=experimental");
-  ok("аккаунт из токена — в заголовке", a.headers["ChatGPT-Account-Id"] === "acc_123");
-  ok("разговор едет под своим именем", def.modes.oauth?.sessionHeaders?.[0] === "session-id", String(def.modes.oauth?.sessionHeaders));
+  ok("OpenAI and ChatGPT share one provider", registry.providerById("chatgpt")?.id === "openai");
+  ok("Both OpenAI modes use the public API", def.modes.apikey.baseUrl === "https://api.openai.com/v1" && def.modes.oauth.baseUrl === "https://api.openai.com/v1");
+  ok("ChatGPT registers the actual app", def.oauth.clientId === "dynamic_agent_client");
+  ok("ChatGPT uses a free loopback port", def.oauth.redirectUri === "http://127.0.0.1:{port}/auth/callback");
+  ok("ChatGPT requests direct plan permission", def.oauth.scope.includes("chatgpt.tokens.use.direct"));
+  creds.writeCredentials("openai", { mode: "oauth", accessToken: "legacy-codex", refreshToken: "legacy-refresh", expiresAt: Date.now() - 1 });
+  ok("Legacy Codex tokens are disconnected", registry.modeFor("openai") === null);
+  let error = "";
+  try { await registry.resolveAuth("openai"); } catch (err) { error = err.message; }
+  ok("Legacy Codex tokens require TRCode sign-in", error.includes("TRCode's own registration"), error);
+  creds.writeCredentials("openai", { mode: "apikey", accessToken: "openai-api-key" });
+  const auth = await registry.resolveAuth("openai");
+  ok("OpenAI API key still works", auth.headers.Authorization === "Bearer openai-api-key");
+  ok("OpenAI API key uses Responses", registry.protocolForModel("openai:gpt-6.1-sol") === "responses");
   creds.clearCredentials("openai");
-}
-
-// ── браузерный OAuth: PKCE, loopback-callback, аккаунт из JWT ─────────────
-{
-  const seen = [];
-  const host = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (d) => (body += d));
-    req.on("end", () => {
-      if (!req.url.startsWith("/token")) {
-        res.writeHead(404).end();
-        return;
-      }
-      const asJson = String(req.headers["content-type"] ?? "").includes("json");
-      const params = asJson ? JSON.parse(body || "{}") : Object.fromEntries(new URLSearchParams(body));
-      seen.push({ path: req.url, contentType: String(req.headers["content-type"]), params });
-      res.writeHead(200, { "Content-Type": "application/json" });
-      if (params.grant_type === "refresh_token") {
-        return res.end(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 900 }));
-      }
-      const claims = Buffer.from(
-        JSON.stringify({
-          "https://api.openai.com/auth": { chatgpt_account_id: "acc_jwt", chatgpt_plan_type: "plus" },
-          exp: Math.floor(Date.now() / 1000) + 3600,
-        }),
-      ).toString("base64url");
-      res.end(JSON.stringify({ access_token: "at-1", refresh_token: "rt-1", id_token: `x.${claims}.y` }));
-    });
-  });
-  await new Promise((r) => host.listen(0, "127.0.0.1", r));
-  const base = `http://127.0.0.1:${host.address().port}`;
-
-  // Два порта: основной занимает «чужой login», запасной отдаётся нам —
-  // 1457 страхует занятый 1455.
-  const freePort = async () => {
-    const s = http.createServer(() => {});
-    await new Promise((r) => s.listen(0, "127.0.0.1", r));
-    const p = s.address().port;
-    await new Promise((r) => s.close(r));
-    return p;
-  };
-  const callbackPort = await freePort();
-  const altPort = await freePort();
-
-  const cfg = {
-    // Настоящая конфигурация подписки, только хосты подменены: проверяются и её
-    // client_id, scope, параметры страницы и JSON на refresh.
-    ...registry.providerById("openai").oauth,
-    authorizeUrl: `${base}/authorize`,
-    tokenUrl: `${base}/token`,
-    redirectUri: `http://127.0.0.1:${callbackPort}/auth/callback`,
-    fallbackRedirectUris: [`http://127.0.0.1:${altPort}/auth/callback`],
-  };
-  const altUri = cfg.fallbackRedirectUris[0];
-
-  const squatter = http.createServer(() => {});
-  await new Promise((r) => squatter.listen(callbackPort, "127.0.0.1", r));
-
-  let page = "";
-  const login = oauth.webLogin(cfg, {
-    onUrl: (url) => {
-      page = url;
-      const state = new URL(url).searchParams.get("state");
-      // «Браузер»: человек подтверждает, хост редиректит на наш порт.
-      setTimeout(() => {
-        fetch(`${altUri}?code=code-1&state=${state}`).catch(() => {});
-      }, 10);
-    },
-  });
-  const got = await login;
-
-  const authorize = new URL(page);
-  ok("страница ведёт на authorize хоста", authorize.pathname === "/authorize");
-  ok("PKCE объявлен как S256", authorize.searchParams.get("code_challenge_method") === "S256");
-  ok("challenge непустой", (authorize.searchParams.get("code_challenge") ?? "").length > 20);
-  ok("занятый порт обойдён запасным", authorize.searchParams.get("redirect_uri") === altUri, authorize.searchParams.get("redirect_uri"));
-  ok(
-    "scope с коннекторами",
-    authorize.searchParams.get("scope") === "openid profile email offline_access api.connectors.read api.connectors.invoke",
-    authorize.searchParams.get("scope"),
-  );
-  ok("client_id — тот же, что у вендорного CLI", authorize.searchParams.get("client_id") === "app_EMoamEEZ73f0CkXaXp7hrann");
-  ok("упрощённый вход запрошен", authorize.searchParams.get("codex_cli_simplified_flow") === "true");
-  ok("токен получен", got.accessToken === "at-1" && got.refreshToken === "rt-1");
-  ok("аккаунт вычитан из id_token", got.orgId === "acc_jwt", String(got.orgId));
-  ok("план попал в имя аккаунта", got.orgName === "plus", String(got.orgName));
-  ok("срок взят из JWT exp", typeof got.expiresAt === "number" && got.expiresAt > Date.now() + 3_500_000);
-  const exchange = seen[0];
-  ok("обмен кода — формой", exchange.contentType.includes("x-www-form-urlencoded"), exchange.contentType);
-  ok("grant_type authorization_code", exchange.params.grant_type === "authorization_code");
-  ok("verifier доехал", (exchange.params.code_verifier ?? "").length > 20);
-  ok("redirect_uri в обмене тот же", exchange.params.redirect_uri === altUri, exchange.params.redirect_uri);
-
-  const refreshed = await oauth.refreshToken(cfg, got);
-  ok("refresh уходит JSON-ом", seen[1].contentType.includes("json"), seen[1].contentType);
-  ok("grant_type refresh_token", seen[1].params.grant_type === "refresh_token");
-  ok("scope на refresh не переспрашивается", seen[1].params.scope === undefined, String(seen[1].params.scope));
-  ok("новый access сохранён", refreshed.accessToken === "at-2" && refreshed.refreshToken === "rt-2");
-  ok("аккаунт пережил refresh", refreshed.orgId === "acc_jwt" && refreshed.orgName === "plus");
-
-  // Оба порта заняты (второй вход или чужой CLI) — это отказ на старте, а
-  // не пятиминутное ожидание.
-  const second = http.createServer(() => {});
-  await new Promise((r) => second.listen(altPort, "127.0.0.1", r));
-  let busy = "";
-  try {
-    await oauth.webLogin(cfg, {});
-  } catch (err) {
-    busy = err.code;
-  } finally {
-    squatter.close();
-    second.close();
-    host.close();
-  }
-  ok("занятые порты — внятная ошибка", busy === "listen_failed", busy);
-}
-
-// ── провод подписки: заголовки, store:false, только стрим ────────────────
-{
-  const calls = [];
-  const api = http.createServer((req, res) => {
-    let body = "";
-    req.on("data", (d) => (body += d));
-    req.on("end", () => {
-      calls.push({ url: req.url, headers: req.headers, body: JSON.parse(body || "{}") });
-      res.writeHead(200, { "Content-Type": "text/event-stream" });
-      const ev = (o) => res.write(`event: ${o.type}\ndata: ${JSON.stringify(o)}\n\n`);
-      ev({ type: "response.output_text.delta", delta: "готово" });
-      ev({
-        type: "response.completed",
-        response: { status: "completed", usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } },
-      });
-      res.end();
-    });
-  });
-  await new Promise((r) => api.listen(0, "127.0.0.1", r));
-  const savedKey = loadConfig().apiKey;
-
-  creds.writeCredentials("openai", {
-    mode: "oauth",
-    accessToken: "at-wire",
-    refreshToken: "rt-wire",
-    orgId: "acc_wire",
-    expiresAt: Date.now() + 3600_000,
-  });
-  saveConfig({ apiKey: "", providers: { openai: { baseUrl: `http://127.0.0.1:${api.address().port}` } } });
-
-  const client = await import("../dist/provider/client.js");
-  // complete() — нестримовый вход, но хост нестримовых не принимает.
-  const res = await client.complete({
-    model: "openai:gpt-5.3-codex",
-    conversationId: "sess-chatgpt",
-    messages: [
-      { role: "system", content: "системный промпт" },
-      { role: "user", content: "привет" },
-    ],
-  });
-
-  ok("ответ собран из стрима", res.content === "готово", res.content);
-  const call = calls[0];
-  ok("путь — /responses", call.url === "/responses", call.url);
-  ok("стрим включён", call.body.stream === true);
-  ok("store выключен", call.body.store === false);
-  ok("max_output_tokens не отправляется", !("max_output_tokens" in call.body), JSON.stringify(call.body));
-  ok("параллельные вызовы разрешены", call.body.parallel_tool_calls === true);
-  ok(
-    "prompt_cache_key = все три session-заголовка",
-    typeof call.body.prompt_cache_key === "string" &&
-      call.body.prompt_cache_key === call.headers["session-id"] &&
-      call.body.prompt_cache_key === call.headers["thread-id"] &&
-      call.body.prompt_cache_key === call.headers["x-client-request-id"],
-    `${call.body.prompt_cache_key} / ${call.headers["session-id"]} / ${call.headers["thread-id"]}`,
-  );
-  ok("аккаунт в заголовке", call.headers["chatgpt-account-id"] === "acc_wire", String(call.headers["chatgpt-account-id"]));
-  ok("UA подменён на клиентский", String(call.headers["user-agent"]).startsWith("codex_cli_rs/"), String(call.headers["user-agent"]));
-  ok("системный промпт ушёл в instructions", call.body.instructions === "системный промпт");
-
-  api.close();
-  creds.clearCredentials("openai");
-  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
 }
 
 // ── 503 «Endpoint is unavailable» переживается сам ─────────────────────────

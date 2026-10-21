@@ -38,7 +38,7 @@ trc auth login --provider openrouter    # OpenRouter key (sk-or-…)
 trc auth login --provider opencode      # Zen API key; /login zen works too
 trc auth login --provider opencode-go   # Go subscription API key; /login go works too
 trc auth login --provider openai        # ChatGPT subscription or an API key
-trc auth login --provider gemini        # Google AI Studio key, or the account login (risky)
+trc auth login --provider gemini        # Google AI Studio API key
 trc auth login --provider alibabacloud  # QwenCloud key; asks which host it is for
 trc auth login --provider xai           # SuperGrok subscription or a console.x.ai key
 trc auth login --provider meta          # Meta Model API key (Muse); /login muse works too
@@ -60,16 +60,57 @@ automatically from then on. A host with no device grant (OpenAI's ChatGPT sign-i
 authorization code + PKCE instead: the CLI listens on a loopback port, opens the page,
 and finishes the login when the browser redirects back — so that browser has to run on
 the same machine. If the vendor's own CLI is already logged in on this
-machine, that session is picked up instead of asking you to authorize twice — pass
-`--fresh` to force a new authorization. OpenAI is the exception: the subscription
-server rotates the refresh token on every use, so sharing its file would sign the
-vendor CLI out — the browser sign-in keeps its own.
+machine, supported providers may reuse that session — pass `--fresh` to force a new
+authorization. ChatGPT uses its own TRCode registration and never imports Codex tokens.
 
-Two of these logins wear the vendor's own client. Gemini's account path is Gemini CLI's
-OAuth client against Code Assist, and Meta's reuses the session `muse login` left behind.
-Both vendors scope those credentials to their own CLI, and Google has suspended accounts
-for exactly this since February 2026 — the CLI prints that warning before opening the
-browser. Their API-key paths are the supported ones.
+Meta may reuse the credential left by `muse login`, with a warning about subscription
+restrictions. Its supported third-party path is a pay-as-you-go API key.
+
+### OpenAI / ChatGPT
+
+Choose **Continue with ChatGPT** or run `trc auth login --provider openai --oauth`.
+Eligible Plus and Pro users can authorize TRCode to use their plan. The browser registers
+TRCode under its own name and asks for plan-usage permission. Signing in without that
+permission saves the account but does not enable model requests.
+
+On later logins, choose a saved account or add a different account/workspace. Each
+registration keeps its own tokens and model catalog. Returning sign-in reuses the issued
+client ID and this installation's host ID. The account appears in `/provider` and
+`trc auth status`.
+
+Requests use `https://api.openai.com/v1/responses` with streaming and `store: false`.
+TRCode verifies the signed ID token, keeps credentials in protected profile files under
+`~/.trcode/auth/openai-profiles/`, and serializes token renewal across processes.
+The active `auth/openai.json` contains a profile reference. No Codex client ID, identity
+headers or private ChatGPT backend endpoints are used.
+
+Use `trc auth logout --provider openai` to revoke the selected renewable session and
+clear its local tokens. Its registration and the installation's host ID are retained
+for a later sign-in. If remote revocation cannot be confirmed, TRCode says so.
+Review plan usage and app limits in [ChatGPT Settings → Usage](https://chatgpt.com/settings/usage).
+An API key remains a separate, usage-billed option: `trc auth login --provider openai --key`.
+
+Existing logins made with the old Codex-compatible flow require a new TRCode sign-in.
+See [OpenAI's official integration guide](https://developers.openai.com/siwc/token-sharing-open-source/sign-in).
+
+### Google Gemini
+
+Create a Gemini API key in [Google AI Studio](https://aistudio.google.com/apikey), then run:
+
+```sh
+trc auth login --provider gemini
+trc -m gemini
+```
+
+TRCode uses Google's documented [OpenAI-compatible Gemini API](https://ai.google.dev/gemini-api/docs/openai).
+It does not import Gemini CLI sessions, register as Gemini CLI, or call Code Assist.
+Legacy Google-account logins require reconnection with an API key. Google's
+[Gemini CLI terms](https://geminicli.com/docs/resources/tos-privacy/) prohibit direct
+third-party use of the services behind Gemini CLI through its OAuth credentials.
+
+Google also documents [Gemini API OAuth](https://ai.google.dev/gemini-api/docs/oauth)
+with an application's own Google Cloud project and OAuth registration. That is separate
+from Gemini CLI subscription access; TRCode currently supports the API-key path.
 
 Models from a direct provider carry its name as a prefix and group under it in `/model`:
 

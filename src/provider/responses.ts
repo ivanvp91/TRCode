@@ -117,6 +117,9 @@ export class ResponsesStreamParser {
   private calls = new Map<string, CallSlot>();
   private finish = "";
   private usage: Usage | undefined;
+  private completed = false;
+
+  constructor(private readonly requireCompleted = false) {}
 
   handle(json: any): StreamEvent[] {
     const out: StreamEvent[] = [];
@@ -149,12 +152,14 @@ export class ResponsesStreamParser {
       const r = json.response ?? {};
       if (r.usage) this.usage = normalizeUsage(r.usage);
       this.finish = r.status === "incomplete" ? "length" : type === "response.failed" ? "error" : "stop";
+      this.completed = type === "response.completed" && (!r.status || r.status === "completed");
     }
 
     return out;
   }
 
   result(): { toolCalls: ToolCall[]; usage?: Usage; finishReason: string } {
+    if (this.requireCompleted && !this.completed) throw new Error("ChatGPT response did not complete: the stream ended without response.completed.");
     const toolCalls: ToolCall[] = [...this.calls.values()]
       .filter((s) => s.name)
       .map((s, i) => ({

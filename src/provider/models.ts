@@ -8,7 +8,9 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { configDir, ensureDir, loadConfig, type Effort } from "../config.js";
+import crypto from "node:crypto";
+import { readCredentials } from "./credentials.js";
+import { configDir, ensureDir, loadConfig, VERSION, type Effort } from "../config.js";
 import { protocolOf, registerProtocols } from "./protocol.js";
 import {
   configuredProviders,
@@ -323,8 +325,15 @@ function readCacheFile(): CacheFile {
   return cacheMemo;
 }
 
+function cacheKey(providerId: string): string {
+  if (providerId !== "openai") return providerId;
+  const creds = readCredentials(providerId);
+  const account = creds?.clientId ?? crypto.createHash("sha256").update(creds?.accessToken ?? "").digest("hex").slice(0, 16);
+  return `${providerId}:${creds?.mode ?? "none"}:${account}`;
+}
+
 function readCache(providerId: string, baseUrl: string, opts: { stale?: boolean } = {}): ModelInfo[] | null {
-  const entry = readCacheFile()[providerId];
+  const entry = readCacheFile()[cacheKey(providerId)];
   if (!entry || entry.baseUrl !== baseUrl) return null;
   if (!opts.stale && Date.now() - entry.fetchedAt > CACHE_TTL_MS) return null;
   return entry.models?.length ? entry.models : null;
@@ -332,7 +341,7 @@ function readCache(providerId: string, baseUrl: string, opts: { stale?: boolean 
 
 /** True while a provider's last refusal is recent enough to trust. */
 function recentlyFailed(providerId: string, baseUrl: string): boolean {
-  const entry = readCacheFile()[providerId];
+  const entry = readCacheFile()[cacheKey(providerId)];
   if (!entry || entry.baseUrl !== baseUrl || !entry.failedAt) return false;
   return Date.now() - entry.failedAt < FAIL_TTL_MS;
 }
@@ -340,8 +349,9 @@ function recentlyFailed(providerId: string, baseUrl: string): boolean {
 function writeCacheEntry(providerId: string, baseUrl: string, patch: Partial<CacheShape>): void {
   try {
     const all = readCacheFile();
-    const prev = all[providerId]?.baseUrl === baseUrl ? all[providerId] : undefined;
-    all[providerId] = { fetchedAt: 0, models: [], ...prev, baseUrl, ...patch };
+    const key = cacheKey(providerId);
+    const prev = all[key]?.baseUrl === baseUrl ? all[key] : undefined;
+    all[key] = { fetchedAt: 0, models: [], ...prev, baseUrl, ...patch };
     cacheMemo = all;
     fs.writeFileSync(cacheFile(), JSON.stringify(all, null, 2));
   } catch {
@@ -583,7 +593,7 @@ async function fetchProviderModels(
     const catalog = modeCfg.catalogPath ?? "models";
     const query = modeCfg.catalog?.query ? `?${modeCfg.catalog.query}` : "";
     const signal = opts.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS);
-    const res = await fetch(`${auth.baseUrl}/${catalog}${query}`, { headers: auth.headers, signal });
+    const res = await fetch(`${auth.baseUrl}/${catalog}${query}`, { headers: { "User-Agent": `trcode/${VERSION}`, ...auth.headers }, signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body: any = await res.json();
     // Most hosts answer { data: [...] }; a few have a shape of their own, which
@@ -593,7 +603,7 @@ async function fetchProviderModels(
       ? body
       : (body?.data ?? (modeCfg.catalog?.list ? body?.[modeCfg.catalog.list] : undefined) ?? []);
     const visible = modeCfg.catalog?.list
-      ? list.filter((raw) => raw?.visibility === undefined || raw.visibility === "list")
+      ? list.filter((raw) => modeCfg.catalog?.visibleOnly ? raw?.visibility === "list" : raw?.visibility === undefined || raw.visibility === "list")
       : list;
     const models = visible
       .map(normalize)
