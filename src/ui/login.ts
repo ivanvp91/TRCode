@@ -11,7 +11,7 @@ import { saveConfig } from "../config.js";
 import { verifyProvider } from "../provider/client.js";
 import { clearCredentials, importVendorCredentials, readCredentials, writeCredentials, type Credentials } from "../provider/credentials.js";
 import { fetchModels } from "../provider/models.js";
-import { listOrgs, pollForToken, requestDeviceCode, webLogin, type DeviceFlowConfig, type Org, type WebFlowConfig } from "../provider/oauth.js";
+import { pollForToken, requestDeviceCode, webLogin, type DeviceFlowConfig, type WebFlowConfig } from "../provider/oauth.js";
 import { modeConfig, providerProject, qualifyModelId, rememberBaseUrl, rememberProject, type ProviderDef } from "../provider/registry.js";
 import { discoverProject } from "../provider/gemini.js";
 import { c } from "./ansi.js";
@@ -128,7 +128,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
       writeCredentials(def.id, inherited);
       info(t(`Reusing the ${def.label} CLI session from ${inherited.source}.`, `Переиспользую сессию ${def.label} CLI из ${inherited.source}.`));
     } else {
-      if (!(await oauthLogin(def, exclusive))) return FAILED;
+      if (!(await oauthLogin(def))) return FAILED;
     }
     // Code Assist refuses a request that names no project. The token alone does
     // not say which one it acts for, so it is resolved here, once, and pinned.
@@ -258,8 +258,9 @@ async function settleGeminiProject(def: ProviderDef): Promise<void> {
   }
 }
 
-async function oauthLogin(def: ProviderDef, exclusive: <T>(fn: () => Promise<T>) => Promise<T>): Promise<boolean> {  const cfg = def.oauth!;
-  const creds = cfg.kind === "web" ? await webLoginFlow(def, cfg) : await deviceLoginFlow(def, cfg, exclusive);
+async function oauthLogin(def: ProviderDef): Promise<boolean> {
+  const cfg = def.oauth!;
+  const creds = cfg.kind === "web" ? await webLoginFlow(def, cfg) : await deviceLoginFlow(def, cfg);
   if (!creds) return false;
   writeCredentials(def.id, creds);
   return true;
@@ -319,11 +320,7 @@ async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig): Promise<Crede
   }
 }
 
-async function deviceLoginFlow(
-  def: ProviderDef,
-  cfg: DeviceFlowConfig,
-  exclusive: <T>(fn: () => Promise<T>) => Promise<T>,
-): Promise<Credentials | null> {
+async function deviceLoginFlow(def: ProviderDef, cfg: DeviceFlowConfig): Promise<Credentials | null> {
   let code;
   try {
     code = await requestDeviceCode(cfg);
@@ -360,53 +357,7 @@ async function deviceLoginFlow(
   }
   sp.stop();
   releaseEsc();
-  if (cfg.orgs) {
-    const org = await chooseOrg(def, cfg, creds.accessToken, creds.orgId, exclusive);
-    if (org === null) return null;
-    if (org) Object.assign(creds, { orgId: org.id, orgName: org.name });
-  }
   return creds;
-}
-
-/**
- * The workspace a token will act for, on hosts that refuse one naming none.
- * One the approval page already scoped the token to is kept; a single one is
- * taken without asking; several are a question. Returns undefined when the
- * list could not be read — the host then decides — and null when the user
- * backed out.
- */
-async function chooseOrg(
-  def: ProviderDef,
-  cfg: DeviceFlowConfig,
-  token: string,
-  scoped: string | undefined,
-  exclusive: <T>(fn: () => Promise<T>) => Promise<T>,
-): Promise<Org | undefined | null> {
-  let orgs: Org[];
-  try {
-    orgs = await listOrgs(cfg, token);
-  } catch (err) {
-    warn(t(`Could not list ${def.label} workspaces: ${(err as Error).message}`, `Не удалось получить рабочие пространства ${def.label}: ${(err as Error).message}`));
-    return scoped ? { id: scoped, name: scoped } : undefined;
-  }
-  const hit = scoped && orgs.find((o) => o.id === scoped);
-  if (scoped) return hit || { id: scoped, name: scoped };
-  if (!orgs.length) {
-    warn(t(`The ${def.label} account has no workspace — create one at opencode.ai.`, `В аккаунте ${def.label} нет рабочего пространства — создайте его на opencode.ai.`));
-    return undefined;
-  }
-  if (orgs.length === 1 || !process.stdin.isTTY) {
-    info(t(`Workspace: ${orgs[0].name}`, `Рабочее пространство: ${orgs[0].name}`));
-    return orgs[0];
-  }
-  const picked = await exclusive(() =>
-    pick({
-      title: t(`${def.label} — workspace`, `${def.label} — рабочее пространство`),
-      items: orgs.map((o) => ({ value: o.id, label: o.name, hint: o.id })),
-      initial: orgs[0].id,
-    }),
-  );
-  return picked === null ? null : orgs.find((o) => o.id === picked) ?? null;
 }
 
 /** Names the models that just became available, and an alias to reach them. */

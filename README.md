@@ -58,8 +58,8 @@ Select a service with the arrow keys and press **Enter**. If it is not connected
 | Google Gemini | `gemini` | Google AI Studio API key¹ |
 | Meta / Muse | `meta` | Meta Model API key |
 | OpenRouter | `openrouter` | API key |
-| OpenCode Zen | `opencode` | Account sign-in or API key |
-| OpenCode Go | `opencode-go` | Account sign-in or a key for your Go subscription |
+| OpenCode Zen | `opencode` | API key |
+| OpenCode Go | `opencode-go` | API key for your Go subscription |
 | Alibaba Cloud / Qwen | `alibabacloud` | API key; select the matching server |
 | xAI / Grok | `xai` | SuperGrok subscription or xAI API key |
 | Z.AI / GLM | `zai` | Platform or Coding Plan key; select the matching server |

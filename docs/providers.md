@@ -35,8 +35,8 @@ trc auth login                          # connects the provider in use
 trc auth login --provider kimi          # asks: subscription or API key
 trc auth login --provider claude        # Anthropic console key
 trc auth login --provider openrouter    # OpenRouter key (sk-or-…)
-trc auth login --provider opencode      # account sign-in or Zen key; /login zen works too
-trc auth login --provider opencode-go   # account sign-in or Go key; /login go works too
+trc auth login --provider opencode      # Zen API key; /login zen works too
+trc auth login --provider opencode-go   # Go subscription API key; /login go works too
 trc auth login --provider openai        # ChatGPT subscription or an API key
 trc auth login --provider gemini        # Google AI Studio key, or the account login (risky)
 trc auth login --provider alibabacloud  # QwenCloud key; asks which host it is for
@@ -151,6 +151,11 @@ OpenCode Zen is the gateway behind the `opencode` agent, and a third router: one
 a curated list — the Claude, GPT, Gemini, Grok, Kimi, GLM, MiniMax, DeepSeek and Qwen
 lines, plus a handful of free ones. It answers to `zen` as well, so `/login zen` and
 `-m zen:kimi-k3` reach the same key and the same list.
+
+Zen and Go connect through API keys only. TRCode identifies itself with its own
+`trcode/<version>` User-Agent and sends `x-opencode-session` for conversation routing.
+If you previously signed in through the website, reconnect with
+`trc auth login --provider opencode --key` or `trc auth login --provider opencode-go --key`.
 
 Unlike the other routers it does **not** flatten everything into `/chat/completions`.
 Each model is served on the dialect its own vendor speaks, under one base URL: GPT, Grok

@@ -29,6 +29,38 @@ const creds = await import("../dist/provider/credentials.js");
 const oauth = await import("../dist/provider/oauth.js");
 const imp_models = () => import("../dist/provider/models.js");
 
+// Removed browser credentials must never be sent or refreshed as API keys.
+async function rejectLegacyOpenCodeLogin(def) {
+  const realFetch = globalThis.fetch;
+  let requests = 0;
+  globalThis.fetch = async () => {
+    requests++;
+    throw new Error("Unexpected network request for removed OAuth login");
+  };
+  try {
+    for (const expiresAt of [Date.now() + 3600_000, Date.now() - 3600_000]) {
+      creds.writeCredentials(def.id, { mode: "oauth", accessToken: "old-console-token", refreshToken: "old-refresh", expiresAt });
+      ok(`${def.id}: старая OAuth-сессия не подключена`, registry.modeFor(def.id) === null);
+      ok(`${def.id}: нет в подключённых провайдерах`, !registry.configuredProviders().some((p) => p.id === def.id));
+      let message = "";
+      try {
+        await registry.resolveAuth(def.id);
+      } catch (err) {
+        message = err.message;
+      }
+      ok(`${def.id}: предлагается вход по ключу`, message.includes(`trc auth login --provider ${def.id} --key`), message);
+      ok(`${def.id}: OAuth не обновляется`, (await registry.renewRejectedToken(def.id)) === false);
+    }
+    const { loginProvider } = await import("../dist/ui/login.js");
+    const login = await loginProvider(def, { mode: "oauth" });
+    ok(`${def.id}: явный OAuth-вход отклонён`, login.connected === false);
+    ok(`${def.id}: ни одного сетевого запроса`, requests === 0, String(requests));
+  } finally {
+    globalThis.fetch = realFetch;
+    creds.clearCredentials(def.id);
+  }
+}
+
 // ── model id routing ──────────────────────────────────────────────────────
 ok("id без префикса → TokenRouter", registry.splitModelId("moonshotai/kimi-k3").providerId === "tokenrouter");
 ok("id с префиксом → провайдер", registry.splitModelId("kimi:kimi-for-coding").providerId === "kimi");
@@ -426,21 +458,8 @@ ok("отсутствующий файл не роняет импорт", creds.i
   const def = registry.providerById("opencode");
   ok("Zen есть в реестре", Boolean(def));
   ok("шлюз откликается на своё второе имя", registry.providerById("zen")?.id === "opencode");
-  // Вход через аккаунт OpenCode Console — тот же device flow, что у самого
-  // opencode, и токен идёт на тот же хост, где стоял бы ключ.
-  ok("есть вход через аккаунт", def.oauth?.clientId === "opencode-cli");
-  ok("device flow на Console", def.oauth?.deviceAuthUrl === "https://opencode.ai/console/auth/device/code");
-  ok("OAuth-режим смотрит на тот же хост", def.modes.oauth?.baseUrl === def.modes.apikey?.baseUrl);
-  creds.writeCredentials("opencode", { mode: "oauth", accessToken: "console-access", refreshToken: "r", expiresAt: Date.now() + 3600_000 });
-  const viaAccount = await registry.resolveAuth("opencode");
-  ok("токен аккаунта — на zen/v1", viaAccount.baseUrl === "https://opencode.ai/zen/v1", viaAccount.baseUrl);
-  ok("и в обоих заголовках, как ключ", viaAccount.headers.Authorization === "Bearer console-access" && viaAccount.headers["x-api-key"] === "console-access");
-  ok("x-opencode-session и в OAuth-режиме", viaAccount.sessionHeader === "x-opencode-session");
-  // Токен без рабочего пространства Zen отвергает: «Workspace selection is
-  // required». Выбранное при входе едет в x-org-id, как у самого opencode.
-  ok("без workspace x-org-id не выдумывается", viaAccount.headers["x-org-id"] === undefined);
-  creds.writeCredentials("opencode", { mode: "oauth", accessToken: "console-access", orgId: "wrk_1", expiresAt: Date.now() + 3600_000 });
-  ok("workspace едет в x-org-id", (await registry.resolveAuth("opencode")).headers["x-org-id"] === "wrk_1");
+  ok("Zen подключается только по ключу", def.modes.oauth === undefined && def.oauth === undefined);
+  await rejectLegacyOpenCodeLogin(def);
   creds.writeCredentials("opencode", { mode: "apikey", accessToken: "sk-zen-key", orgId: "wrk_1" });
   ok("ключу workspace не нужен", (await registry.resolveAuth("opencode")).headers["x-org-id"] === undefined);
 
@@ -533,11 +552,10 @@ ok("отсутствующий файл не роняет импорт", creds.i
   // бы звать по сети, а этот набор офлайновый.
   creds.clearCredentials("kimi");
   const savedKey = loadConfig().apiKey;
-  // Заголовки провайдера идут последними и в проверке ключа: хост, который
-  // узнаёт клиента по своему User-Agent, иначе откажет пробе на чужом основании.
+  // OpenCode receives TRCode's own identity on verification requests too.
   saveConfig({
     apiKey: "",
-    providers: { opencode: { baseUrl: `http://127.0.0.1:${zen.address().port}`, headers: { "User-Agent": "test-agent/1.0" } } },
+    providers: { opencode: { baseUrl: `http://127.0.0.1:${zen.address().port}` } },
   });
 
   const models = await imp_models();
@@ -566,7 +584,7 @@ ok("отсутствующий файл не роняет импорт", creds.i
   const good = await client.verifyProvider("opencode");
   ok("верный ключ принят", good.ok === true, good.detail);
   ok("проверка ушла на эндпоинт первой модели", probes[0] === "/responses", probes.join());
-  ok("и несёт User-Agent провайдера, а не общий", sentHeaders[0]?.ua === "test-agent/1.0", JSON.stringify(sentHeaders[0]));
+  ok("и называет себя TRCode", /^trcode\/\d/.test(sentHeaders[0]?.ua ?? ""), JSON.stringify(sentHeaders[0]));
   ok("и сессионный заголовок", Boolean(sentHeaders[0]?.session), JSON.stringify(sentHeaders[0]));
   // Free-тир Zen читает сам id: не свой формат `ses_<12 hex><14 base62>` —
   // и отказ, каким бы ни был ключ и тело.
@@ -575,6 +593,14 @@ ok("отсутствующий файл не роняет импорт", creds.i
     /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(String(sentHeaders[0]?.session)),
     String(sentHeaders[0]?.session),
   );
+
+  const { loginProvider } = await import("../dist/ui/login.js");
+  const keyLogin = await loginProvider(registry.providerById("opencode"), {
+    key: "sk-zen-key",
+    exclusive: async () => { throw new Error("API-key login must not ask for an OAuth mode"); },
+  });
+  ok("Zen по умолчанию входит по ключу без выбора OAuth", keyLogin.connected && keyLogin.usable);
+  ok("после входа сохранён режим API-ключа", creds.readCredentials("opencode")?.mode === "apikey");
 
   creds.writeCredentials("opencode", { mode: "apikey", accessToken: "sk-wrong" });
   const bad = await client.verifyProvider("opencode");
@@ -599,15 +625,8 @@ ok("отсутствующий файл не роняет импорт", creds.i
   ok("свой префикс пути", auth.baseUrl === "https://opencode.ai/zen/go/v1", auth.baseUrl);
   ok("оба заголовка и здесь", auth.headers.Authorization === "Bearer sk-go-key" && auth.headers["x-api-key"] === "sk-go-key");
 
-  // Подписка Go — тоже аккаунт Console: тот же вход, свой хост и своя таблица
-  // диалектов. Учётка своя на файл: Console ротирует refresh-токен, и общий
-  // на двоих сломался бы у второго после первого же обновления.
-  ok("у Go тот же вход через аккаунт", def.oauth?.clientId === "opencode-cli" && def.oauth === registry.providerById("opencode").oauth);
-  creds.writeCredentials("opencode-go", { mode: "oauth", accessToken: "console-access", refreshToken: "r", expiresAt: Date.now() + 3600_000 });
-  const goAccount = await registry.resolveAuth("opencode-go");
-  ok("токен аккаунта — на zen/go/v1", goAccount.baseUrl === "https://opencode.ai/zen/go/v1", goAccount.baseUrl);
-  ok("в обоих заголовках", goAccount.headers.Authorization === "Bearer console-access" && goAccount.headers["x-api-key"] === "console-access");
-  ok("диалекты Go и под OAuth", registry.protocolForModel("opencode-go:qwen3.8-max") === "anthropic");
+  ok("Go подключается только по ключу", def.modes.oauth === undefined && def.oauth === undefined);
+  await rejectLegacyOpenCodeLogin(def);
   creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
 
   const go = (m) => registry.protocolForModel(`opencode-go:${m}`);
@@ -1021,8 +1040,7 @@ ok("тело формой, как в RFC 8628", seen[0].contentType === "applica
 ok("client_id отправлен", seen[0].params.client_id === "test-client");
 ok("заголовки флоу дошли", seen[0].ua === "kimi-code/test");
 
-// OpenCode Console отдаёт ссылки путями ("/console/device?..."), а не URL —
-// открыть такое в браузере нельзя, пока не приложен хост, выдавший код.
+// Relative device-flow links are resolved against the issuing host.
 {
   const realFetch = globalThis.fetch;
   globalThis.fetch = async () =>
@@ -1030,8 +1048,8 @@ ok("заголовки флоу дошли", seen[0].ua === "kimi-code/test");
       JSON.stringify({
         device_code: "d",
         user_code: "TRKG-HPRJ",
-        verification_uri: "/console/device",
-        verification_uri_complete: "/console/device?user_code=TRKG-HPRJ&client_id=opencode-cli",
+        verification_uri: "/device",
+        verification_uri_complete: "/device?user_code=TRKG-HPRJ&client_id=test-client",
         expires_in: 600,
         interval: 5,
       }),
@@ -1041,44 +1059,15 @@ ok("заголовки флоу дошли", seen[0].ua === "kimi-code/test");
     let sent = "";
     const fetchRel = globalThis.fetch;
     globalThis.fetch = async (url, init) => ((sent = String(init?.body ?? "")), fetchRel(url, init));
-    const rel = await oauth.requestDeviceCode(registry.providerById("opencode").oauth);
+    const rel = await oauth.requestDeviceCode({ ...flow, deviceAuthUrl: "https://example.test/auth/device", params: { extra: "value" } });
     globalThis.fetch = fetchRel;
-    ok("просим токен с workspace", new URLSearchParams(sent).get("supports_org_scope") === "true", sent);
-    ok("относительная ссылка достроена до хоста", rel.verificationUri === "https://opencode.ai/console/device", rel.verificationUri);
+    ok("дополнительные параметры переданы", new URLSearchParams(sent).get("extra") === "value", sent);
+    ok("относительная ссылка достроена до хоста", rel.verificationUri === "https://example.test/device", rel.verificationUri);
     ok(
       "и предзаполненная тоже",
-      rel.verificationUriComplete === "https://opencode.ai/console/device?user_code=TRKG-HPRJ&client_id=opencode-cli",
+      rel.verificationUriComplete === "https://example.test/device?user_code=TRKG-HPRJ&client_id=test-client",
       rel.verificationUriComplete,
     );
-  } finally {
-    globalThis.fetch = realFetch;
-  }
-
-  // Список пространств — по имени, как выбирает сам opencode; токен — Bearer.
-  let orgAuth = "";
-  globalThis.fetch = async (url, init) => {
-    orgAuth = init?.headers?.Authorization ?? "";
-    return new Response(JSON.stringify([{ id: "wrk_b", name: "Beta" }, { id: "wrk_a", name: "Alpha" }]), { status: 200 });
-  };
-  try {
-    const orgs = await oauth.listOrgs(registry.providerById("opencode-go").oauth, "tok");
-    ok("пространства по алфавиту", orgs.map((o) => o.id).join() === "wrk_a,wrk_b", orgs.map((o) => o.id).join());
-    ok("список просится с токеном", orgAuth === "Bearer tok", orgAuth);
-  } finally {
-    globalThis.fetch = realFetch;
-  }
-
-  // Обновление токена не теряет выбранное пространство.
-  globalThis.fetch = async () => new Response(JSON.stringify({ access_token: "next", refresh_token: "r2", expires_in: 600 }), { status: 200 });
-  try {
-    const next = await oauth.refreshToken(registry.providerById("opencode").oauth, {
-      mode: "oauth",
-      accessToken: "old",
-      refreshToken: "r1",
-      orgId: "wrk_a",
-      orgName: "Alpha",
-    });
-    ok("workspace пережил refresh", next.orgId === "wrk_a" && next.orgName === "Alpha" && next.refreshToken === "r2");
   } finally {
     globalThis.fetch = realFetch;
   }

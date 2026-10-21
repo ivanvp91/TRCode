@@ -436,26 +436,6 @@ export function rememberProject(providerId: string, projectId: string): void {
   });
 }
 
-/**
- * An OpenCode Console account, signed in the way opencode's own CLI does it:
- * a device flow under the client id it registers for itself. The access token
- * then stands where a key would, on Zen and on Go alike — the account decides
- * what is billed, the host only which catalogue. Its verification links come
- * back relative to the Console.
- *
- * Which account, though, is a workspace: a token that names none is refused
- * with "Workspace selection is required". The approval page can scope the
- * token to one when asked (`supports_org_scope`); otherwise one is picked from
- * the account's list at login. Either way it rides as x-org-id, as in opencode.
- */
-const CONSOLE_OAUTH: FlowConfig = {
-  clientId: "opencode-cli",
-  deviceAuthUrl: "https://opencode.ai/console/auth/device/code",
-  tokenUrl: "https://opencode.ai/console/auth/device/token",
-  params: { supports_org_scope: "true" },
-  orgs: { url: "https://opencode.ai/console/api/orgs", header: "x-org-id" },
-};
-
 const ZEN_MODE: ProviderMode = {
   baseUrl: "https://opencode.ai/zen/v1",
   // The fallback for anything ZEN_ENDPOINTS does not name: the curated
@@ -694,10 +674,8 @@ const PROVIDERS: ProviderDef[] = [
     label: "OpenCode Zen",
     keyHint: "OpenCode Zen key (opencode.ai/auth)",
     modes: {
-      oauth: ZEN_MODE,
       apikey: ZEN_MODE,
     },
-    oauth: CONSOLE_OAUTH,
   },
   {
     id: "opencode-go",
@@ -709,12 +687,9 @@ const PROVIDERS: ProviderDef[] = [
       // console as Zen, refused by the other's endpoint. Hence a provider
       // rather than a second mode: one credential per file, and both can be
       // connected at once. `kimi-k3` exists on both, so failover between them
-      // is what the model prefix is for. The Console sign-in reaches it too,
-      // as it does Zen: the plan is the account's, not the key's.
-      oauth: GO_MODE,
+      // is what the model prefix is for. Both providers use API keys only.
       apikey: GO_MODE,
     },
-    oauth: CONSOLE_OAUTH,
   },
   {
     id: "alibabacloud",
@@ -930,7 +905,8 @@ export function rememberBaseUrl(providerId: string, baseUrl: string): void {
 /** Which mode a provider is currently configured for, if any. */
 export function modeFor(providerId: string): AuthMode | null {
   if (providerId === DEFAULT_PROVIDER) return loadConfig().apiKey ? "apikey" : null;
-  return readCredentials(providerId)?.mode ?? null;
+  const mode = readCredentials(providerId)?.mode;
+  return mode && providerById(providerId)?.modes[mode] ? mode : null;
 }
 
 export function modeConfig(providerId: string, mode: AuthMode): ProviderMode | null {
@@ -1000,6 +976,11 @@ async function freshCredentials(def: ProviderDef, force = false): Promise<Creden
     const imported = def.importFrom ? importVendorCredentials(def.importFrom) : null;
     if (!imported) throw new Error(`${def.label} is not connected. Run: trc auth login --provider ${def.id}`);
     creds = writeCredentials(def.id, imported);
+  }
+  if (!def.modes[creds.mode]) {
+    throw new Error(
+      `${def.label} does not support ${creds.mode} authentication. Run: trc auth login --provider ${def.id} --key`,
+    );
   }
   if (creds.mode !== "oauth" || (!force && !isStale(creds))) return creds;
   if (!def.oauth || !creds.refreshToken) {
@@ -1077,7 +1058,7 @@ export async function resolveAuth(providerId: string): Promise<ResolvedAuth> {
 function accountHeaders(def: ProviderDef, creds: Credentials): Record<string, string> {
   if (creds.mode !== "oauth" || !creds.orgId || !def.oauth) return {};
   if (def.oauth.kind === "web") return def.oauth.accountHeader ? { [def.oauth.accountHeader]: creds.orgId } : {};
-  return def.oauth.orgs ? { [def.oauth.orgs.header]: creds.orgId } : {};
+  return {};
 }
 
 function authHeaders(kind: ProviderMode["authHeader"], token: string): Record<string, string> {

@@ -32,17 +32,6 @@ export interface DeviceFlowConfig {
   headers?: Record<string, string>;
   /** Extra fields for the device-code request, beyond client_id and scope. */
   params?: Record<string, string>;
-  /**
-   * For a host whose account holds several workspaces and which serves a
-   * request only once one is named: where the account's workspaces are listed,
-   * and the header that names the chosen one on every request.
-   */
-  orgs?: { url: string; header: string };
-}
-
-export interface Org {
-  id: string;
-  name: string;
 }
 
 export interface WebFlowConfig {
@@ -204,21 +193,6 @@ function toCredentials(json: any, source: string): Credentials {
     orgId: json.org_id ?? undefined,
     source,
   };
-}
-
-/** The workspaces a token can act for, alphabetical — the order the host's own client picks from. */
-export async function listOrgs(cfg: DeviceFlowConfig, accessToken: string): Promise<Org[]> {
-  if (!cfg.orgs) return [];
-  const res = await fetch(cfg.orgs.url, {
-    headers: { Accept: "application/json", Authorization: `Bearer ${accessToken}`, ...cfg.headers },
-  });
-  if (!res.ok) throw new OAuthError(`HTTP ${res.status} from ${cfg.orgs.url}`, "http_error");
-  const json = (await res.json()) as unknown;
-  const list = Array.isArray(json) ? json : [];
-  return list
-    .filter((o): o is Org => typeof o?.id === "string")
-    .map((o) => ({ id: o.id, name: typeof o.name === "string" ? o.name : o.id }))
-    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
 }
 
 /**
