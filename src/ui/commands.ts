@@ -27,13 +27,13 @@ import { runOrchestration, orchestrationStatus } from "../agent/orchestrator.js"
 import { createSkill } from "../skills/loader.js";
 import { memoryPath, memoryCount } from "../tools/memory.js";
 import { resetPromptSnapshots } from "../agent/prompt.js";
-import { connectMcpServers, mcpClients, stopMcpServers } from "../mcp/client.js";
+import { connectMcpServers, mcpClients, mcpServerConfigs, restartMcpServer, stopMcpServers } from "../mcp/client.js";
 import { t, count } from "../i18n.js";
 import { deleteEntry } from "../ui-library/store.js";
 import type { App } from "./repl.js";
 import { GROUP_ORDER, groupLabel, effortHint, txt, type Command, parseTokens, currentProviderId, setModel, warnIfIncompatible } from "./commands/shared.js";
 import { goalCommand } from "./commands/goal.js";
-import { switchToProvider, refreshCatalog, setDefaultProvider, setProviderHost, logoutFromProvider, settingsModal, runUpdate, modelModal, providerModal, favModal } from "./commands/providers.js";
+import { switchToProvider, refreshCatalog, setDefaultProvider, setProviderHost, logoutFromProvider, settingsModal, runUpdate, modelModal, providerModal, favModal, setAutoCompact } from "./commands/providers.js";
 import { brainPanel, brainNeedsPanel, brainPanelModal, brainModal, swarmPanelModal, swarmModal, addSubagentModel, setSubagentMode, setSubagentAuto, subagentsModal } from "./commands/agents.js";
 import { setSkillsEnabled, editSkill, skillGenPrompt, skillsModal, checkSkills } from "./commands/skills.js";
 import { statModal } from "./commands/stat.js";
@@ -368,9 +368,11 @@ const COMMANDS: Command[] = [
   {
     name: "/compact",
     group: "main",
-    args: () => t("[what to focus on]", "[на чём сфокусироваться]"),
-    help: () => t("compact the history into a digest", "сжать историю в конспект"),
+    args: () => t("[what to focus on | auto on|off]", "[на чём сфокусироваться | auto on|off]"),
+    help: () => t("compact the history into a digest, or switch auto-compaction", "сжать историю в конспект или включить/выключить автосжатие"),
     async run(app, rest) {
+      const arg = rest.trim();
+      if (/^auto(\s|$)/i.test(arg)) return setAutoCompact(app, arg.slice(4).trim());
       await compactNow(app, rest);
     },
   },
@@ -850,10 +852,14 @@ const COMMANDS: Command[] = [
   {
     name: "/mcp",
     group: "session",
-    args: () => "[reload]",
-    help: () => t("MCP servers: status and tools", "MCP-серверы: статус и инструменты"),
+    args: () => "[reload | restart <id> | stop | logs <id>]",
+    help: () => t("MCP servers: status, tools, resources", "MCP-серверы: статус, инструменты, ресурсы"),
     async run(app, rest) {
-      if (rest.trim().toLowerCase() === "reload") {
+      const parts = rest.trim().split(/\s+/).filter(Boolean);
+      const cmd = (parts[0] ?? "").toLowerCase();
+      const target = parts[1];
+
+      if (cmd === "reload") {
         stopMcpServers();
         connectMcpServers(app.cwd, (client) => {
           app.rebuildTools();
@@ -862,6 +868,38 @@ const COMMANDS: Command[] = [
         });
         app.rebuildTools();
         return info(t("Reconnecting MCP servers…", "Переподключаю MCP-серверы…"));
+      }
+
+      if (cmd === "stop") {
+        stopMcpServers();
+        app.rebuildTools();
+        return info(t("MCP servers stopped.", "MCP-серверы остановлены."));
+      }
+
+      if (cmd === "restart") {
+        if (!target) return warn(t("Usage: /mcp restart <id>", "Использование: /mcp restart <id>"));
+        const client = await restartMcpServer(target);
+        app.rebuildTools();
+        if (!client) return warn(t(`No MCP server "${target}".`, `Нет MCP-сервера "${target}".`));
+        if (client.state === "ready") {
+          return info(t(`MCP ${client.id}: restarted, ${client.tools.length} tools.`, `MCP ${client.id}: перезапущен, инструментов: ${client.tools.length}.`));
+        }
+        return warn(t(`MCP ${client.id} failed: ${client.detail}`, `MCP ${client.id} не подключился: ${client.detail}`));
+      }
+
+      if (cmd === "logs") {
+        const picked = target ? mcpClients().filter((cl) => cl.id === target) : mcpClients();
+        if (!picked.length) return warn(t(`No MCP server "${target}".`, `Нет MCP-сервера "${target}".`));
+        line();
+        rule(c.brightCyan(" mcp logs "));
+        for (const cl of picked) {
+          padded(c.bold(cl.id));
+          const tail = cl.logTail(30);
+          if (!tail.length) padded(c.dim(t("  (nothing logged)", "  (ничего не писал)")));
+          for (const entry of tail) padded(c.dim("  " + truncate(entry, contentWidth() - 4)));
+        }
+        line();
+        return;
       }
 
       const clients = mcpClients();
@@ -878,6 +916,9 @@ const COMMANDS: Command[] = [
         return;
       }
 
+      const configs = mcpServerConfigs(app.cwd);
+      const disabled = Object.entries(configs).filter(([id, cfg]) => cfg?.enabled === false && !clients.some((cl) => cl.id === id));
+
       line();
       rule(c.brightCyan(" mcp "));
       for (const cl of clients) {
@@ -887,25 +928,40 @@ const COMMANDS: Command[] = [
             : cl.state === "starting"
               ? c.yellow("starting")
               : c.red(cl.state);
-        const extra =
-          cl.state === "ready"
-            ? c.gray(` · ${count(cl.tools.length, ["tool", "tools"], ["инструмент", "инструмента", "инструментов"])}${cl.detail ? ` · ${cl.detail}` : ""}`)
-            : c.gray(cl.detail ? ` · ${truncate(cl.detail, 80)}` : "");
-        padded(`${cl.id.padEnd(20)} ${state}${extra}`);
+        const bits: string[] = [];
+        if (cl.state === "ready") {
+          bits.push(count(cl.tools.length, ["tool", "tools"], ["инструмент", "инструмента", "инструментов"]));
+          if (cl.supportsResources) {
+            bits.push(count(cl.resources.length, ["resource", "resources"], ["ресурс", "ресурса", "ресурсов"]));
+          }
+          if (cl.protocolVersion) bits.push(cl.protocolVersion);
+          if (cl.cfg.required) bits.push("required");
+          if (cl.detail && cl.detail !== cl.id) bits.push(cl.detail);
+        } else if (cl.detail) {
+          bits.push(truncate(cl.detail, 80));
+        }
+        padded(`${cl.id.padEnd(20)} ${state}${bits.length ? c.gray(" · " + bits.join(" · ")) : ""}`);
         if (cl.state === "ready" && cl.tools.length) {
           const names = cl.tools.map((t2) => t2.name);
           padded(c.dim("  " + truncate(names.join(", "), contentWidth() - 4)));
         }
+        if (cl.state === "ready" && cl.resourceTemplates.length) {
+          padded(c.dim("  " + t("templates: ", "шаблоны: ") + truncate(cl.resourceTemplates.map((r) => r.uriTemplate).join(", "), contentWidth() - 16)));
+        }
+      }
+      for (const [id, cfg] of disabled) {
+        padded(`${id.padEnd(20)} ${c.gray(t("disabled", "выключен"))}${cfg.required ? c.gray(" · required") : ""}`);
       }
       const total = clients.reduce((n, cl) => n + (cl.state === "ready" ? cl.tools.length : 0), 0);
       if (total > 20) {
         hint(
           t(
-            `${total} tool schemas ride along in every request. Trim a server with "tools": ["name", …] in its config.`,
-            `Схемы всех ${total} инструментов едут в каждом запросе. Урежьте сервер через "tools": ["имя", …] в его конфиге.`,
+            `${total} tool schemas ride along in every request. Trim a server with "tools": ["name", …] or raise "toolInputSchemaMaxBytes" in its config.`,
+            `Схемы всех ${total} инструментов едут в каждом запросе. Урежьте сервер через "tools": ["имя", …] или "toolInputSchemaMaxBytes" в его конфиге.`,
           ),
         );
       }
+      hint(t("restart <id> · stop · logs <id> · reload", "restart <id> · stop · logs <id> · reload"));
       line();
     },
   },

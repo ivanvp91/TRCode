@@ -508,7 +508,8 @@ export async function compactNow(app: App, instructions: string, showDigest = tr
     if (!res.summary) return info(t("Nothing to compact.", "Сжимать нечего."));
     const after = contextPressure(app.session, app.catalog);
     success(
-      `Compacted ${res.droppedMessages} messages into a digest. ` +
+      `Compacted ${res.droppedMessages} messages into a summary; ` +
+        `${res.retainedUserMessages} recent user messages kept verbatim. ` +
         `Context ${Math.round(before.ratio * 100)}% → ${Math.round(after.ratio * 100)}% ` +
         `(~${fmtTokens(before.used)} → ~${fmtTokens(after.used)} tokens).`,
     );

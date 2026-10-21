@@ -77,7 +77,7 @@ import { SubagentRegistry } from "../agent/subagent.js";
 import { buildTools, TodoStore } from "../tools/index.js";
 import { shellTool } from "../tools/shell.js";
 import { createSpillStore, type SpillStore } from "../tools/spill.js";
-import { connectMcpServers, mcpPendingCount, mcpSettled } from "../mcp/client.js";
+import { connectMcpServers, mcpPendingCount, mcpSettled, onMcpCatalogChange } from "../mcp/client.js";
 import { discoverSkills, type Skill } from "../skills/loader.js";
 import { pickSkill, skillInjection, skillInterjector } from "../skills/match.js";
 import { Session } from "../session/session.js";
@@ -93,7 +93,7 @@ import {
   type Goal,
 } from "../session/goal.js";
 import { loadInputHistory, saveInputHistory, dropSessionHistory } from "../session/history.js";
-import { compactSession, contextPressure, shouldAutoCompact } from "../session/compact.js";
+import { autoCompactLevel, compactSession, contextPressure, lightCompact } from "../session/compact.js";
 import { markTurn, pruneOrphanStores, recordWrite } from "../session/checkpoint.js";
 import { UsageTracker, estimateTokens, fmtTokens } from "../usage.js";
 import type { Message, ModelInfo, ToolCall, ToolContext, ToolDef } from "../types.js";
@@ -170,6 +170,8 @@ export class App {
   loadedSkills = new Set<string>();
 
   private abort: AbortController | null = null;
+  /** Mid-turn compactions run in this turn; capped so a failed one cannot repeat per step. */
+  private midTurnCompactions = 0;
   private subagentDecision: Promise<boolean> | null = null;
   private subagentDecisionProvider = "";
   private explicitSubagents = false;
@@ -196,6 +198,8 @@ export class App {
   private cacheMissNudged = new Set<string>();
   /** Lines from background work (MCP connects), held while the editor draws. */
   private heldNotices: { kind: "info" | "warn"; text: string }[] = [];
+  /** Drops the MCP catalog-change listener when a new session pins another cwd. */
+  private mcpCatalogOff: (() => void) | null = null;
   /** The empty-UI-library notice is said once per session, not per request. */
   private uilibNoticeShown = false;
   /**
@@ -294,9 +298,26 @@ export class App {
       this.rebuildTools();
       if (client.state === "ready") {
         this.notice("info", tr(`MCP ${client.id}: ${client.tools.length} tools connected.`, `MCP ${client.id}: подключено инструментов: ${client.tools.length}.`));
+      } else if (client.cfg.required) {
+        this.notice("warn", tr(`MCP ${client.id} (required) failed: ${client.detail}`, `MCP ${client.id} (обязательный) не подключился: ${client.detail}`));
       } else {
         this.notice("warn", tr(`MCP ${client.id} failed: ${client.detail}`, `MCP ${client.id} не подключился: ${client.detail}`));
       }
+    });
+    // A server may add or drop tools while the session runs
+    // (`notifications/tools/list_changed`). Joining the registry late rewrites
+    // the request prefix, but that is the server's call — the alternative is a
+    // tool the model can see in `/mcp` and cannot call.
+    this.mcpCatalogOff?.();
+    this.mcpCatalogOff = onMcpCatalogChange((client) => {
+      this.rebuildTools();
+      this.notice(
+        "info",
+        tr(
+          `MCP ${client.id}: catalog changed — ${client.tools.length} tools.`,
+          `MCP ${client.id}: каталог изменился — инструментов: ${client.tools.length}.`,
+        ),
+      );
     });
     // The release check rides along in the background: at most one GET every
     // six hours, and when it finds something the header is reprinted with a
@@ -816,6 +837,7 @@ export class App {
       provider: providerLabel(splitModelId(this.session.model).providerId),
       model: this.session.model,
       effort: this.effort(),
+      effortIgnored: modelRejectsEffort(this.session.model),
       cwdLabel: this.cwd,
       sessionId: this.session.id,
       version: c.yellow(badge.text),
@@ -1080,15 +1102,16 @@ export class App {
   /**
    * Prints a restored conversation. Without this a resumed session looks empty
    * and indistinguishable from a lost one, even though the history is loaded.
+   *
+   * The whole session is replayed through the renderers the live transcript
+   * used — prompts, answers and the tool calls with their output previews. A
+   * replay built from a different, cut-down set
+   * of pieces is what made a resumed session read as a pile of fragments: a
+   * wall of `tool({json})` lines with the calls' output and the answers' tails
+   * missing.
    */
-  replayHistory(maxTurns = 4): void {
+  replayHistory(): void {
     const msgs = this.session.messages;
-    const userIdx: number[] = [];
-    msgs.forEach((m, i) => {
-      if (m.role === "user" && !m.meta?.hidden && !m.meta?.skill) userIdx.push(i);
-    });
-    const from = userIdx.length > maxTurns ? userIdx[userIdx.length - maxTurns] : 0;
-    const skipped = userIdx.filter((i) => i < from).length;
     const { used, window } = contextPressure(this.session, this.catalog);
     const w = contentWidth();
 
@@ -1103,33 +1126,14 @@ export class App {
             : ""),
       ),
     );
-    // A bare "N prompts folded away" left the session unnavigable: one line
-    // per earlier prompt is a table of contents, not a wall of text.
-    if (skipped) {
-      line();
-      padded(c.gray(tr("Earlier in this session:", "Ранее в сессии:")));
-      const folded = userIdx.filter((i) => i < from);
-      const MAX_TOC = 30;
-      if (folded.length > MAX_TOC) {
-        padded(c.gray(`  … ${tr(`${folded.length - MAX_TOC} older prompts skipped`, `пропущено более ранних: ${folded.length - MAX_TOC}`)}`));
-      }
-      for (const i of folded.slice(-MAX_TOC)) {
-        const m = msgs[i];
-        const text = String(m.content ?? "");
-        const label = /^<compacted-context>/.test(text)
-          ? tr("(compacted context)", "(сжатый контекст)")
-          : text.replace(/\s+/g, " ").trim();
-        const ago = m.meta?.ts ? c.gray(` · ${fmtAgo(m.meta.ts)}`) : "";
-        padded(c.gray("  ✦ ") + c.dim(truncate(label, Math.max(20, w - 16))) + ago);
-      }
-    }
 
-    // The last answer is the one being continued from, so it is shown whole;
-    // earlier ones are capped only to keep the scrollback usable.
-    const lastAnswer = msgs.reduce((at, m, i) => (m.role === "assistant" && m.content ? i : at), -1);
+    // A result is stored as its own message, but it belongs under the call that
+    // produced it: the call is what makes the output mean anything.
+    const results = new Map<string, Message>();
+    for (const m of msgs) if (m.role === "tool" && m.tool_call_id) results.set(m.tool_call_id, m);
+    const shown = new Set<Message>();
 
-    for (const [at, m] of msgs.slice(from).entries()) {
-      const idx = from + at;
+    for (const m of msgs) {
       if (m.meta?.hidden) continue;
       // An auto-loaded skill is a procedure for the model, not conversation.
       if (m.meta?.skill) {
@@ -1139,70 +1143,90 @@ export class App {
 
       if (m.role === "user") {
         const text = String(m.content ?? "");
-        line();
         const digest = text.match(/^<compacted-context>\n?([\s\S]*?)\n?<\/compacted-context>$/);
         if (digest) {
           // The digest is the whole earlier history — show it as a labelled
           // block, not as a user prompt with XML tags around it.
+          line();
           padded(c.brightBlue("▍") + " " + c.bold(c.brightBlue(tr("compacted context", "сжатый контекст"))));
           const body = digest[1].replace(/^The earlier part of this session[^\n]*\n+/, "");
-          for (const l of renderMarkdownBlock(body, { width: w - 2, maxLines: 12, dim: true })) {
-            padded(c.gray("▍ ") + l);
+          const rows = renderMarkdownBlock(body, { width: w - 2, dim: true });
+          // A digest of a long session is a couple of screens on its own; the
+          // opening of it says what the session was about, the rest is ctrl+o.
+          const keep = 20;
+          for (const l of rows.slice(0, keep)) padded(c.gray("▍ ") + l);
+          if (rows.length > keep) {
+            rememberCollapsed(body);
+            padded(
+              c.gray("▍ ") +
+                c.gray(
+                  tr(
+                    `… ${rows.length - keep} more lines · ctrl+o to see all of it`,
+                    `… ещё строк: ${rows.length - keep} · ctrl+o — показать целиком`,
+                  ),
+                ),
+            );
           }
           continue;
         }
-        // Same rule as the live echo: five lines and a handle. A replayed
-        // session that opens with a pasted log buries the conversation it is
-        // supposed to be reminding you of.
-        const rows = renderMarkdownBlock(text, { width: w - 2 });
-        const cut = rows.length > 7;
-        for (const [i, l] of (cut ? rows.slice(0, 5) : rows).entries()) {
-          padded((i === 0 ? c.brightYellow("✦ ") : "  ") + c.bold(l));
-        }
-        if (cut) {
-          rememberCollapsed(text);
-          padded(
-            "  " +
-              c.gray(
-                tr(
-                  `… ${rows.length - 5} more lines · ctrl+o to see all of it`,
-                  `… ещё строк: ${rows.length - 5} · ctrl+o — показать целиком`,
-                ),
-              ),
-          );
-        }
+        // Exactly what the live echo printed, handle and all.
+        userEcho(text);
         continue;
       }
 
       if (m.role === "assistant") {
-        if (m.content) {
-          line();
-          padded(c.brightMagenta("●") + " " + c.dim(m.meta?.model ?? this.session.model));
+        if (m.content && String(m.content).trim()) {
+          ensureBlank();
+          assistantPrefix(m.meta?.model ?? this.session.model);
           // Same styling as a live answer — a replay that dims everything
           // reads as if the formatting had been thrown away.
-          for (const l of renderMarkdownBlock(String(m.content), {
-            width: w,
-            maxLines: idx === lastAnswer ? 200 : 24,
-          })) {
-            padded(l);
-          }
+          for (const l of renderMarkdownBlock(String(m.content), { width: w })) padded(l);
         }
         const calls = m.tool_calls ?? [];
         if (calls.length) ensureBlank();
-        for (const tc of calls.slice(0, 3)) {
-          padded("  " + c.brightCyan("⏺ ") + c.dim(tc.function.name) + c.gray(`(${truncate(tc.function.arguments, 54)})`));
-        }
-        if (calls.length > 3) {
-          padded("    " + c.gray(`… ${calls.length - 3} more tool ${plural(calls.length - 3, "call", "calls")}`));
+        for (const tc of calls) {
+          toolStart(tc.function.name, this.callSummary(tc));
+          const res = results.get(tc.id);
+          if (!res || shown.has(res)) continue;
+          shown.add(res);
+          toolDone(null, this.toolResultText(res));
         }
         continue;
       }
-      // Tool results are noise in a replay; the call above already says enough.
+
+      // A result whose call is gone — an older fork boundary, say — still has
+      // its text, and a preview is better than silence.
+      if (m.role === "tool" && !shown.has(m)) toolDone(null, this.toolResultText(m));
     }
 
     line();
     rule(c.gray(" continuing "));
     line();
+  }
+
+  /** The summary the live call line shows, rebuilt from the arguments on disk. */
+  private callSummary(tc: ToolCall): string {
+    let args: Record<string, unknown> = {};
+    try {
+      const parsed = JSON.parse(tc.function.arguments || "{}");
+      if (parsed && typeof parsed === "object") args = parsed as Record<string, unknown>;
+    } catch {
+      return tc.function.arguments;
+    }
+    const summary = this.tools.find((t) => t.name === tc.function.name)?.summarize?.(args);
+    if (summary) return summary;
+    // A tool that is no longer registered (a dropped MCP server, say) still
+    // needs a readable target. Numbers are never it: `Read(80)` says nothing.
+    for (const key of ["path", "command", "pattern", "query", "url", "uri", "name", "prompt", "description", "text"]) {
+      const v = args[key];
+      if (typeof v === "string" && v.trim()) return v;
+    }
+    const first = Object.values(args).find((v) => typeof v === "string" && v.trim());
+    return first === undefined ? "" : String(first);
+  }
+
+  private toolResultText(m: Message): string {
+    return String(m.content ?? "").trim() || tr("done", "готово");
   }
 
   // ── cancellation ──────────────────────────────────────────────────────────
@@ -1546,6 +1570,10 @@ export class App {
     }
 
     try {
+      // One turn may compact between tool rounds at most twice: a compaction
+      // that did not bring the history under the threshold must not turn into a
+      // compaction on every single step of the turn.
+      this.midTurnCompactions = 0;
       const result = await this.runWithFailover({
         model: this.session.model,
         // activeSkills, not skills: the catalogue tells the model to call the
@@ -1565,6 +1593,7 @@ export class App {
         effort: this.effort(),
         toolConcurrency: this.cfg.toolConcurrency,
         interject: this.stepSkills(),
+        midTurnCompact: () => this.compactMidTurn(),
         projection: { cwd: this.cwd, sessionId: this.session.id },
         conversationId: this.session.id,
         // A silent stream is a question, not a verdict: the user can see the
@@ -1600,10 +1629,13 @@ export class App {
           if (!ratedThisTurn.has(model)) {
             ratedThisTurn.add(model);
             spinner.stop();
+            // The host's sentence usually ends in a full stop of its own, and
+            // ours used to add a second one ("Endpoint is unavailable..").
+            const why = (said || tr("rate limit", "лимит запросов")).replace(/[.\s]+$/, "");
             warn(
               tr(
-                `${name}: the host refused with 429 — ${said || "rate limit"}. Waiting ~${fmtDuration(waitMs)} before retrying.`,
-                `${name}: хост ответил 429 — ${said || "лимит запросов"}. Жду ~${fmtDuration(waitMs)} и повторяю.`,
+                `${name}: the host refused with 429 — ${why}. Waiting ~${fmtDuration(waitMs)} before retrying.`,
+                `${name}: хост ответил 429 — ${why}. Жду ~${fmtDuration(waitMs)} и повторяю.`,
               ),
             );
           }
@@ -1621,7 +1653,32 @@ export class App {
           rateTicker.unref?.();
           spinner.start();
         },
+        // A host that is simply down (503 "Endpoint is unavailable", a proxy
+        // restarting) gets the same request resent on a fixed pause, several
+        // times. Said in the transcript: ten silent seconds look like a hang,
+        // and the user's next move would be Esc or retyping the prompt.
+        onRetryWait: (waitMs, attempt, of, said) => {
+          spinner.stop();
+          const why = (said || tr("transient upstream failure", "временный сбой у хоста")).replace(/[.\s]+$/, "");
+          warn(
+            tr(
+              `Host unavailable — ${why}. Sending the same request again in ${fmtDuration(waitMs)} (${attempt}/${of}). Esc cancels.`,
+              `Хост недоступен — ${why}. Отправлю тот же запрос снова через ${fmtDuration(waitMs)} (${attempt}/${of}). Esc отменяет.`,
+            ),
+          );
+          spinner.setLabel(
+            tr(`retrying ${attempt}/${of} in ${fmtDuration(waitMs)}`, `повтор ${attempt}/${of} через ${fmtDuration(waitMs)}`),
+          );
+          spinner.start();
+        },
         events: {
+          onCompacted: () => {
+            bar.setLabel("thinking");
+          },
+          onCompactFailed: (reason) => {
+            warn(tr(`Could not compact mid-turn: ${reason}`, `Не удалось сжать контекст по ходу дела: ${reason}`));
+            bar.setLabel("thinking");
+          },
           onStep: (step) => {
             endRateWait();
             if (step > 0) spinner.setLabel("continuing");
@@ -1847,25 +1904,60 @@ export class App {
     );
   }
 
-  private async maybeAutoCompact(): Promise<void> {
-    if (!shouldAutoCompact(this.session, this.catalog)) return;
+  private async maybeAutoCompact(): Promise<boolean> {
+    const level = autoCompactLevel(this.session, this.catalog);
+    if (!level) return false;
     const { used, ratio } = contextPressure(this.session, this.catalog);
+    // A quarter of the window is far too early to rewrite the conversation:
+    // the light pass only shortens what has already been read.
+    if (level === "light") {
+      const before = used;
+      const light = lightCompact(this.session);
+      if (!light.trimmedMessages) return false;
+      const after = contextPressure(this.session, this.catalog).used;
+      info(
+        tr(
+          `History at ${Math.round(ratio * 100)}% of the window — trimmed ${light.trimmedMessages} old tool results and thinking blocks (~${fmtTokens(before)} → ~${fmtTokens(after)} tokens).`,
+          `История занимает ${Math.round(ratio * 100)}% окна — сократил старые результаты инструментов и размышления (${light.trimmedMessages}), ~${fmtTokens(before)} → ~${fmtTokens(after)} токенов.`,
+        ),
+      );
+      return false;
+    }
     info(tr(`History reached ~${fmtTokens(used)} tokens (${Math.round(ratio * 100)}% of the window) — compacting…`, `История доросла до ~${fmtTokens(used)} токенов (${Math.round(ratio * 100)}% окна) — сжимаю…`));
     // The turn bar is already up (raised before this ran), so the label lands
     // on it and the input frame stays on screen for the whole compaction.
     const bar = this.bar;
     bar?.setLabel(tr("compacting context", "сжимаю контекст"));
     try {
-      const res = await compactSession(this.session, { catalog: this.catalog, signal: this.abort?.signal });
-      if (res.summary) info(tr(`Compacted ${res.droppedMessages} messages, ${res.keptMessages} left.`, `Сжато ${nOf(res.droppedMessages, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}, осталось ${res.keptMessages}.`));
+      const res = await compactSession(this.session, { catalog: this.catalog, signal: this.abort?.signal, level });
+      if (!res.summary) return false;
+      info(tr(`Compacted ${res.droppedMessages} messages, ${res.keptMessages} left.`, `Сжато ${nOf(res.droppedMessages, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}, осталось ${res.keptMessages}.`));
+      return true;
     } catch (err) {
       // The caller reports an interruption; here it is not a failure.
       if ((err as Error)?.name !== "AbortError") {
         warn(tr(`Could not compact the context: ${(err as Error).message}`, `Не удалось сжать контекст: ${(err as Error).message}`));
       }
+      return false;
     } finally {
       bar?.setLabel("thinking");
     }
+  }
+
+  /**
+   * The mid-turn checkpoint the agent loop asks at every tool boundary: a turn
+   * that reads a hundred files does not overflow between prompts, it overflows
+   * inside one, after a tool round.
+   */
+  private async compactMidTurn(): Promise<boolean> {
+    if (this.midTurnCompactions >= 2) return false;
+    // The light trim costs nothing and is not a compaction: it does not count
+    // against the two-per-turn ceiling, and it reports nothing when it had
+    // nothing to shorten (which is every round after the first).
+    const level = autoCompactLevel(this.session, this.catalog);
+    if (!level) return false;
+    if (level !== "light") this.midTurnCompactions++;
+    return this.maybeAutoCompact();
   }
 
   /** Per-turn footer. Context share and session total live under the input. */

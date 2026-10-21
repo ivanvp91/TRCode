@@ -21,6 +21,13 @@ export interface SessionMeta {
   tokens?: number;
   /** How many times this session has already been compacted. */
   compactions?: number;
+  /**
+   * Auto-compaction attempts in the current cycle — the ladder's beacons. A
+   * full compaction starts a new cycle and resets them; without the caps a
+   * history that hovers at a threshold would be trimmed every turn instead of
+   * ever reaching the next rung.
+   */
+  autoCompacts?: { light?: number; medium?: number };
   /** The persistent goal (/goal), if one was ever set. */
   goal?: Goal;
 }
@@ -48,6 +55,11 @@ export class Session {
   usage: UsageTracker;
   /** Set once /compact or auto-compact has run, for the status line. */
   compactions = 0;
+  /**
+   * Attempts per level since the last full compaction. The ladder reads these
+   * to stop repeating a rung that has had its chances (see compact.ts).
+   */
+  autoCompacts: { light: number; medium: number } = { light: 0, medium: 0 };
   /** The persistent goal (/goal); null when none was set. */
   goal: Goal | null = null;
   orchestration: OrchestrationState | null = null;
@@ -105,6 +117,7 @@ export class Session {
         messageCount: this.messages.length,
         tokens: historyTokens(this.messages),
         compactions: this.compactions,
+        autoCompacts: { ...this.autoCompacts },
         goal: this.goal ?? undefined,
       },
       messages: this.messages,
@@ -148,6 +161,10 @@ export class Session {
       s.messages = data.messages ?? [];
       s.usage = UsageTracker.fromJSON(data.usage);
       s.compactions = data.meta.compactions ?? 0;
+      s.autoCompacts = {
+        light: data.meta.autoCompacts?.light ?? 0,
+        medium: data.meta.autoCompacts?.medium ?? 0,
+      };
       s.goal = data.meta.goal ?? null;
       s.orchestration = data.orchestration ?? null;
       if (s.orchestration?.status === "running") {
@@ -254,6 +271,9 @@ export class Session {
       createdAt: Date.now(),
     });
     forked.messages = messages.map((m) => structuredClone(m));
+    // The fork carries the same history, so it is at the same rung of the
+    // ladder: the attempts made so far still apply.
+    forked.autoCompacts = { ...source.autoCompacts };
     return forked;
   }
 }

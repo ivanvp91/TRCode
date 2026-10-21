@@ -8,6 +8,7 @@ import {
   modeConfig,
   modeFor,
   protocolForModel,
+  providerProject,
   qualifyModelId,
   renewRejectedToken,
   resolveAuth,
@@ -16,6 +17,7 @@ import {
   type ResolvedAuth,
 } from "./registry.js";
 import { buildResponsesBody, parseResponsesResult, ResponsesStreamParser } from "./responses.js";
+import { buildGeminiBody, parseGeminiResult, GeminiStreamParser } from "./gemini.js";
 import { AnthropicStreamParser, buildAnthropicBody, parseAnthropicResult } from "./anthropic.js";
 import { DEFAULT_MAX_TOKENS, THINKING_BUDGET } from "./anthropic.js";
 import { normalizeToolSchema } from "./schema.js";
@@ -44,6 +46,12 @@ export interface ChatRequest {
    * or a compaction runs on the small one, and a subagent on its own.
    */
   onRateWait?: (waitMs: number, model: string, said: string) => void;
+  /**
+   * A transient upstream failure (503/502/504/500) is being waited out. Told
+   * apart from onRateWait because nothing was refused: the host is unwell, not
+   * metering, and the wait is our own fixed pause rather than its window.
+   */
+  onRetryWait?: (waitMs: number, attempt: number, of: number, said: string) => void;
   /**
    * Which conversation this request belongs to, for hosts that route and cache
    * per conversation (ProviderMode.sessionHeader). The session id is what the
@@ -95,6 +103,44 @@ function conversationTag(req: ChatRequest): string {
     tags.set(key, tag);
   }
   return tag;
+}
+
+/**
+ * OpenCode's own session ids: `ses_`, then the creation time in hex, then 14
+ * base62 characters of entropy. Its free tier reads the header and refuses
+ * anything else with FreeTierError — a bare hash, a UUID and an absent header
+ * all fail — so the derived tag is dressed in that shape before it goes out.
+ *
+ * Cached per tag: the host wants one conversation on one backend, and a fresh
+ * timestamp per request would scatter a conversation meant to stay put.
+ */
+const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const sessionIds = new Map<string, string>();
+function opencodeSessionId(tag: string): string {
+  let id = sessionIds.get(tag);
+  if (!id) {
+    const time = Date.now().toString(16).padStart(12, "0").slice(-12);
+    const digest = crypto.createHash("sha256").update(tag).digest();
+    let rest = "";
+    for (let i = 0; i < 14; i++) rest += B62[digest[i] % 62];
+    id = `ses_${time}${rest}`;
+    if (sessionIds.size > 256) sessionIds.clear();
+    sessionIds.set(tag, id);
+  }
+  return id;
+}
+
+/** The session header value in the shape the host asked for. */
+function sessionIdFor(auth: ResolvedAuth, tag: string): string {
+  return auth.sessionFormat === "opencode" ? opencodeSessionId(tag) : tag;
+}
+
+/** Every name a host wants the conversation id under, with the same value. */
+function sessionHeaderValues(auth: ResolvedAuth, tag: string | undefined): Record<string, string> {
+  const names = auth.sessionHeaders ?? (auth.sessionHeader ? [auth.sessionHeader] : []);
+  if (!names.length || !tag) return {};
+  const value = sessionIdFor(auth, tag);
+  return Object.fromEntries(names.map((name) => [name, value]));
 }
 
 /**
@@ -180,6 +226,28 @@ function isCacheComplaint(err: ApiError): boolean {
 const imageRejected = new Set<string>();
 
 /**
+ * Models whose host takes pixels in user turns but not in tool results. The
+ * gRPC-backed gateways put it as "tool message content part 1 is not text; only
+ * text parts are supported on the gRPC path": the tool message is where
+ * read_image's screenshot lands, so the refusal never touches a screenshot the
+ * user pasted themselves. The pixels are not dropped for such a host — they
+ * move to a user turn right after the result (see hoistToolImages), because a
+ * model that cannot see the screenshot it just read is no better off than one
+ * that never got it.
+ */
+const imageToolRejected = new Set<string>();
+
+/**
+ * Models that answered "The `reasoning_content` in the thinking mode must be
+ * passed back to the API" — DeepSeek behind its gateways. The field is sent for
+ * assistant turns that called tools whenever the turn streamed thinking; a turn
+ * that did not (a session from before the field existed, a model switched
+ * mid-turn, a pair synthesized by repair) still has to carry it, and an empty
+ * string is what the API accepts. Learned once per model per process.
+ */
+const reasoningBackNeeded = new Set<string>();
+
+/**
  * True once the host has refused image content for this model. The stripping
  * happens a layer down and is invisible from above — which is exactly how a
  * turn ends up re-reading the same screenshot forever: the tool says the
@@ -194,6 +262,20 @@ function hasImages(messages: Message[]): boolean {
   return messages.some((m) => m.images?.length && !m.meta?.hidden);
 }
 
+function hasToolImages(messages: Message[]): boolean {
+  return messages.some((m) => m.role === "tool" && m.images?.length && !m.meta?.hidden);
+}
+
+/**
+ * True when the refusal is about tool results only. Such a host still takes a
+ * pasted screenshot, so stripping every image would cost the user their own
+ * input to fix a problem that sits in the tool message.
+ */
+function isToolImageComplaint(err: ApiError): boolean {
+  const body = err.body ?? err.message;
+  return err.status === 400 && /tool\b[^.]{0,32}(message|result|response)/i.test(body) && /not text|only text|text parts?/i.test(body);
+}
+
 function isImageComplaint(err: ApiError): boolean {
   const body = err.body ?? err.message;
   // A router refuses one step earlier and under another status: it has no
@@ -202,7 +284,8 @@ function isImageComplaint(err: ApiError): boolean {
   // wording keeps a plain missing-model 404 whose id happens to read "image"
   // (qwen-image-plus) out of the multimodal path.
   if (err.status === 404) return /no endpoints?\b|support[^.]{0,24}image|image[^.]{0,24}(input|support)/i.test(body);
-  if (err.status === 400) return /image_url|input_image|image\b|multimodal|content type|content_type/i.test(body);
+  if (err.status === 400)
+    return /image_url|input_image|image\b|multimodal|content type|content_type|not text|only text|text parts?/i.test(body);
   // A schema-validating gateway refuses the array form under 422 before it
   // gets to the word "image": a tool message in OpenAI's own multimodal shape
   // carries content as parts, and its schema wants a string. Content is only
@@ -314,7 +397,52 @@ export function repairToolPairs(messages: Message[]): Message[] {
   return out;
 }
 
-function wireMessages(messages: Message[]): unknown[] {
+/**
+ * Moves images out of tool results into a user turn that follows them.
+ *
+ * A gateway that carries tool messages over a text-only path refuses any part
+ * that is not text ("tool message content part 1 is not text; only text parts
+ * are supported on the gRPC path") while taking a pasted screenshot in a user
+ * turn without complaint. Dropping the pixels there answers the error and
+ * loses the picture the tool was called for, which is how a turn ends up
+ * "not recognising the screenshot". The images travel one message later
+ * instead, captioned with the tool that produced them so the model knows whose
+ * output it is looking at.
+ */
+export function hoistToolImages(messages: Message[]): Message[] {
+  const out: Message[] = [];
+  let run: { images: NonNullable<Message["images"]>; name?: string } | null = null;
+  const flush = () => {
+    if (!run?.images.length) {
+      run = null;
+      return;
+    }
+    const from = run.name ? `Output of ${run.name}` : "A tool result";
+    out.push({
+      role: "user",
+      content:
+        `${from}: ${run.images.length === 1 ? "image" : `${run.images.length} images`} attached below. ` +
+        "The tool message itself is text only on this host, so the pictures arrive here.",
+      images: run.images,
+    });
+    run = null;
+  };
+  for (const m of messages) {
+    if (m.role === "tool" && m.images?.length) {
+      if (!run) run = { images: [], name: m.name };
+      for (const img of m.images) run.images.push(img);
+      out.push({ ...m, images: undefined });
+      continue;
+    }
+    // Anything that is not a tool result ends the round the images belong to.
+    if (m.role !== "tool") flush();
+    out.push(m);
+  }
+  flush();
+  return out;
+}
+
+function wireMessages(messages: Message[], opts: { reasoningBack?: boolean } = {}): unknown[] {
   return messages
     .filter((m) => !m.meta?.hidden)
     .map((m) => {
@@ -331,6 +459,16 @@ function wireMessages(messages: Message[]): unknown[] {
       // "name" is not supported by this endpoint) instead of ignoring it.
       if (m.tool_calls?.length) out.tool_calls = m.tool_calls;
       if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
+      // DeepSeek's thinking mode refuses a later step that does not carry back
+      // what the assistant thought when it asked for tools: "The reasoning_content
+      // in the thinking mode must be passed back to the API". Only assistant
+      // turns carry it, and the real thinking is sent when this turn streamed
+      // some; when it did not and the host has already complained, an empty
+      // string keeps the turn alive — the API takes it.
+      if (m.role === "assistant" && m.tool_calls?.length) {
+        if (m.reasoning) out.reasoning_content = m.reasoning;
+        else if (opts.reasoningBack) out.reasoning_content = "";
+      }
       // An assistant turn that only calls tools must send content:null, not "".
       if (m.role === "assistant" && m.tool_calls?.length && !m.content) out.content = null;
       return out;
@@ -363,6 +501,13 @@ function applyEffort(body: Record<string, unknown>, model: string, effort: Effor
  * dropping the parameter and asking again would have worked.
  */
 function isEffortComplaint(body: string): boolean {
+  // The passback refusal of DeepSeek's thinking mode names reasoning_content
+  // and is answered by sending the field back (see reasoningBackNeeded). Read
+  // as an effort complaint it writes "this model takes no reasoning parameter"
+  // into the config for good, and the budget is then dropped in silence on
+  // every later turn — so it is never an effort complaint, whatever else it
+  // says.
+  if (/reasoning_content/i.test(body)) return false;
   return /reasoning|effort|thinking|adaptive|budget/i.test(body);
 }
 
@@ -370,7 +515,7 @@ function buildBody(req: ChatRequest, stream: boolean): Record<string, unknown> {
   const cfg = loadConfig();
   const body: Record<string, unknown> = {
     model: wireModelId(req.model),
-    messages: wireMessages(req.messages),
+    messages: wireMessages(req.messages, { reasoningBack: reasoningBackNeeded.has(req.model) }),
     stream,
   };
   applyEffort(body, req.model, req.effort);
@@ -422,7 +567,7 @@ async function post(model: string, path: string, body: unknown, signal?: AbortSi
       // Provider headers last: a host that gates on its own User-Agent must be
       // able to replace ours, not merely add to it.
       ...auth.headers,
-      ...(auth.sessionHeader && tag ? { [auth.sessionHeader]: tag } : {}),
+      ...sessionHeaderValues(auth, tag),
     },
     body: JSON.stringify(body),
     signal,
@@ -469,6 +614,9 @@ const RATE_LIMIT_FALLBACK_MS = 20_000;
 /** Window edges are fuzzy; land just past one rather than on it. */
 const RATE_LIMIT_MARGIN_MS = 2_000;
 const TRANSIENT_RETRIES = 3;
+/** Defaults for the upstream policy; config overrides them (upstreamRetries, upstreamRetryDelayMs). */
+const UPSTREAM_RETRIES = 10;
+const UPSTREAM_RETRY_DELAY_MS = 10_000;
 
 /** "Maximum 1 requests within 1 minutes" → 60 000, when the host spells it out. */
 function windowFromMessage(body: string): number | undefined {
@@ -485,10 +633,15 @@ async function postWithRetry(
   signal?: AbortSignal,
   onRateWait?: (waitMs: number, model: string, said: string) => void,
   tag?: string,
+  onRetryWait?: (waitMs: number, attempt: number, of: number, said: string) => void,
 ): Promise<Response> {
+  const cfg = loadConfig();
+  const maxUpstream = Math.max(0, cfg.upstreamRetries ?? UPSTREAM_RETRIES);
+  const upstreamDelay = Math.max(0, cfg.upstreamRetryDelayMs ?? UPSTREAM_RETRY_DELAY_MS);
   let rateRetries = 0;
   let rateWaited = 0;
   let transientRetries = 0;
+  let upstreamRetries = 0;
   let authRenewed = false;
   for (;;) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
@@ -514,7 +667,7 @@ async function postWithRetry(
     const err = new ApiError(describeStatus(res.status, text, model), res.status, text);
     if (!RETRYABLE.has(res.status)) throw err;
     const rateLimited = res.status === 429;
-    if (rateLimited ? rateRetries >= RATE_LIMIT_RETRIES || rateWaited >= RATE_LIMIT_PATIENCE_MS : transientRetries >= TRANSIENT_RETRIES) throw err;
+    if (rateLimited ? rateRetries >= RATE_LIMIT_RETRIES || rateWaited >= RATE_LIMIT_PATIENCE_MS : upstreamRetries >= maxUpstream) throw err;
     if (rateLimited) {
       // The host's own idea of "when" wins: Retry-After first, then the
       // window spelled out in the message, then the fallback.
@@ -531,8 +684,11 @@ async function postWithRetry(
       continue;
     }
     const retryAfter = Number(res.headers.get("retry-after"));
-    const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : 2 ** transientRetries * 700;
-    transientRetries++;
+    const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : upstreamDelay;
+    upstreamRetries++;
+    // Said before the sleep: ten seconds of a silent terminal reads as a hang,
+    // and the user's next move would be Esc or a resend by hand.
+    onRetryWait?.(waitMs, upstreamRetries, maxUpstream, extractError(text));
     await sleep(waitMs, signal);
   }
 }
@@ -591,11 +747,24 @@ function extractError(body: string): string {
  * and retries once so an unsupported model degrades instead of failing.
  */
 async function postChat(req: ChatRequest, stream: boolean): Promise<Response> {
-  const path = pathFor(protocolForModel(req.model));
+  const path = pathFor(protocolForModel(req.model), stream);
   for (;;) {
     try {
-      return await postWithRetry(req.model, path, buildBodyFor(req, stream), req.signal, req.onRateWait, conversationTag(req));
+      return await postWithRetry(req.model, path, buildBodyFor(req, stream), req.signal, req.onRateWait, conversationTag(req), req.onRetryWait);
     } catch (err) {
+      // A history whose tool-call turns predate the reasoning field: the host
+      // names exactly what is missing, and an empty field answers it. One
+      // round-trip per model, not a failed turn — and from then on every send
+      // fills the field for turns that have nothing to say.
+      if (
+        err instanceof ApiError &&
+        err.status === 400 &&
+        /reasoning_content/i.test(err.body ?? err.message) &&
+        !reasoningBackNeeded.has(req.model)
+      ) {
+        reasoningBackNeeded.add(req.model);
+        continue;
+      }
       // A host that does not understand cache breakpoints: drop them and go
       // on. Costs one round-trip once per model, never a failed turn.
       if (err instanceof ApiError && isCacheComplaint(err)) {
@@ -620,9 +789,17 @@ async function postChat(req: ChatRequest, stream: boolean): Promise<Response> {
       // A host that cannot take multimodal content: resend as plain text. The
       // images stay in the stored history; only this request loses them, and
       // the model is learned once so later steps do not pay a round-trip.
-      if (err instanceof ApiError && hasImages(req.messages) && !imageRejected.has(req.model) && isImageComplaint(err)) {
-        imageRejected.add(req.model);
-        continue;
+      if (err instanceof ApiError && hasImages(req.messages) && isImageComplaint(err)) {
+        // First rung: a host that refuses pixels in tool results only. The next
+        // one takes them off the whole history, exactly as before.
+        if (hasToolImages(req.messages) && !imageToolRejected.has(req.model) && isToolImageComplaint(err)) {
+          imageToolRejected.add(req.model);
+          continue;
+        }
+        if (!imageRejected.has(req.model)) {
+          imageRejected.add(req.model);
+          continue;
+        }
       }
       const worthRetrying =
         err instanceof ApiError &&
@@ -638,7 +815,8 @@ async function postChat(req: ChatRequest, stream: boolean): Promise<Response> {
   }
 }
 
-function pathFor(p: Protocol): string {
+function pathFor(p: Protocol, stream = true): string {
+  if (p === "gemini") return stream ? ":streamGenerateContent?alt=sse" : ":generateContent";
   return p === "responses" ? "/responses" : p === "anthropic" ? "/messages" : "/chat/completions";
 }
 
@@ -650,14 +828,32 @@ function buildBodyFor(rawReq: ChatRequest, stream: boolean): Record<string, unkn
   // the pixels have to come off here or two of them would resend them and
   // earn the same 400 again (see postChat).
   const paired = repairToolPairs(rawReq.messages);
+  const noImages = imageRejected.has(rawReq.model);
   const req: ChatRequest = {
     ...rawReq,
-    messages: imageRejected.has(rawReq.model)
+    messages: noImages
       ? paired.map((m) => (m.images?.length ? { ...m, images: undefined } : m))
-      : paired,
+      : imageToolRejected.has(rawReq.model)
+        ? hoistToolImages(paired)
+        : paired,
   };
   const cfg = loadConfig();
   const protocol = protocolForModel(req.model);
+  // Hosts that refuse part of a dialect state it per mode; the body is trimmed
+  // to what the host takes rather than sent whole and bounced with a 400.
+  const { providerId } = splitModelId(req.model);
+  const mode = modeFor(providerId);
+  const modeCfg = mode ? modeConfig(providerId, mode) : null;
+  if (protocol === "gemini") {
+    return buildGeminiBody({
+      model: wireModelId(req.model),
+      project: providerProject(providerId),
+      messages: req.messages,
+      tools: req.tools,
+      maxTokens: req.maxTokens ?? cfg.maxTokens,
+      temperature: temperatureFor(req.model, req.temperature, cfg.temperature),
+    });
+  }
   if (protocol === "responses") {
     const body = buildResponsesBody(
       {
@@ -669,6 +865,10 @@ function buildBodyFor(rawReq: ChatRequest, stream: boolean): Record<string, unkn
       },
       stream,
     );
+    if (modeCfg?.streamOnly) body.stream = true;
+    if (modeCfg?.store !== undefined) body.store = modeCfg.store;
+    if (modeCfg?.omitMaxTokens) delete body.max_output_tokens;
+    if (modeCfg?.promptCacheKey) body.prompt_cache_key = conversationTag(rawReq);
     return body;
   }
   if (protocol === "anthropic") {
@@ -895,6 +1095,7 @@ export async function* streamChat(req: ChatRequest): AsyncGenerator<StreamEvent>
   const acc = new ToolCallAccumulator();
   const responsesParser = protocol === "responses" ? new ResponsesStreamParser() : null;
   const anthropicParser = protocol === "anthropic" ? new AnthropicStreamParser() : null;
+  const geminiParser = protocol === "gemini" ? new GeminiStreamParser() : null;
   let finishReason = "";
   let usage: Usage | undefined;
   let buffer = "";
@@ -937,6 +1138,10 @@ export async function* streamChat(req: ChatRequest): AsyncGenerator<StreamEvent>
           if (/upstream idle timeout/i.test(detail)) throw new ApiError(`HTTP 500 — ${detail}`, 500, body);
           throw new ApiError(describeStatus(500, body), 500, body);
         }
+        if (geminiParser) {
+          for (const ev of geminiParser.handle(json)) yield ev;
+          continue;
+        }
         if (json.usage) usage = normalizeUsage(json.usage);
         const choice = json.choices?.[0];
         if (!choice) continue;
@@ -969,6 +1174,11 @@ export async function* streamChat(req: ChatRequest): AsyncGenerator<StreamEvent>
   }
   if (anthropicParser) {
     const r = anthropicParser.result();
+    yield { type: "done", toolCalls: r.toolCalls, usage: r.usage, finishReason: r.finishReason };
+    return;
+  }
+  if (geminiParser) {
+    const r = geminiParser.result();
     yield { type: "done", toolCalls: r.toolCalls, usage: r.usage, finishReason: r.finishReason };
     return;
   }
@@ -1028,6 +1238,9 @@ export interface CompletionResult {
 
 /** Non-streaming completion, used for compaction, titles and quick utilities. */
 export async function complete(req: ChatRequest): Promise<CompletionResult> {
+  // A host that serves nothing but streams still owes callers this shape; the
+  // same request is sent streamed and assembled here.
+  if (streamOnlyFor(req.model)) return completeStreamed(req);
   // The streaming path has an idle watchdog; this one has no bytes to watch,
   // so a flat deadline stands in — without it a dead connection on a
   // non-streamed call (compaction, titles) would hang forever.
@@ -1062,6 +1275,7 @@ export async function complete(req: ChatRequest): Promise<CompletionResult> {
   const protocol = protocolForModel(req.model);
   if (protocol === "responses") return parseResponsesResult(json);
   if (protocol === "anthropic") return parseAnthropicResult(json);
+  if (protocol === "gemini") return parseGeminiResult(json);
   const choice = json.choices?.[0] ?? {};
   return {
     content: choice.message?.content ?? "",
@@ -1069,6 +1283,30 @@ export async function complete(req: ChatRequest): Promise<CompletionResult> {
     usage: json.usage ? normalizeUsage(json.usage) : undefined,
     finishReason: choice.finish_reason ?? "stop",
   };
+}
+
+/** True when this model's host serves only streamed requests (ProviderMode.streamOnly). */
+function streamOnlyFor(model: string): boolean {
+  const { providerId } = splitModelId(model);
+  const mode = modeFor(providerId);
+  return Boolean(mode && modeConfig(providerId, mode)?.streamOnly);
+}
+
+/** Assembles a streamed answer into the shape non-streamed callers expect. */
+async function completeStreamed(req: ChatRequest): Promise<CompletionResult> {
+  let content = "";
+  let toolCalls: ToolCall[] = [];
+  let usage: Usage | undefined;
+  let finishReason = "stop";
+  for await (const ev of streamChat(req)) {
+    if (ev.type === "text" && ev.text) content += ev.text;
+    else if (ev.type === "done") {
+      toolCalls = ev.toolCalls ?? [];
+      usage = ev.usage;
+      finishReason = ev.finishReason ?? "stop";
+    }
+  }
+  return { content, toolCalls, usage, finishReason };
 }
 
 export interface ProviderCheck {
@@ -1093,12 +1331,22 @@ export async function verifyProvider(providerId: string): Promise<ProviderCheck>
   }
   try {
     const mode = modeFor(providerId);
-    const catalog = (mode ? modeConfig(providerId, mode) : null)?.catalogPath ?? "models";
-    const res = await fetch(`${auth.baseUrl}/${catalog}`, { headers: auth.headers });
+    const cfg = mode ? modeConfig(providerId, mode) : null;
+    const catalog = cfg?.catalogPath ?? "models";
+    const query = cfg?.catalog?.query ? `?${cfg.catalog.query}` : "";
+    const res = await fetch(`${auth.baseUrl}/${catalog}${query}`, { headers: auth.headers });
     if (res.ok) {
       const body: any = await res.json().catch(() => ({}));
-      const list: any[] = Array.isArray(body?.data) ? body.data : Array.isArray(body) ? body : [];
-      const cfg = mode ? modeConfig(providerId, mode) : null;
+      const raw = Array.isArray(body?.data)
+        ? body.data
+        : Array.isArray(body)
+          ? body
+          : ((cfg?.catalog?.list ? body?.[cfg.catalog.list] : undefined) ?? []);
+      // Some hosts list internal models next to usable ones; the count here is
+      // the same one /model shows, so the same rows are dropped.
+      const list: any[] = cfg?.catalog?.list
+        ? raw.filter((row: any) => row?.visibility === undefined || row.visibility === "list")
+        : raw;
       // A public listing answers the same to everyone: it has said nothing
       // about the credential, so the credential has to be asked elsewhere.
       if (cfg?.publicCatalog) return probeAuth(auth, providerId, list);
@@ -1150,13 +1398,16 @@ async function probeAuth(auth: ResolvedAuth, providerId: string, catalog: any[])
     const res = await fetch(`${auth.baseUrl}${pathFor(protocol)}`, {
       method: "POST",
       headers: {
-        ...auth.headers,
         "Content-Type": "application/json",
         "User-Agent": USER_AGENT,
-        // The probe is its own one-request conversation. Without this a host
-        // that requires the header refuses on that ground instead of on the
+        // Provider headers last, as in send(): a host that gates on its own
+        // User-Agent must see it here too, or the probe fails on a ground the
+        // real request would have passed.
+        ...auth.headers,
+        // The probe is its own one-request conversation. Without these a host
+        // that requires them refuses on that ground instead of on the
         // credential, and the probe learns nothing about the key.
-        ...(auth.sessionHeader ? { [auth.sessionHeader]: conversationTag({ model: "", messages: [], conversationId: "auth-probe" }) } : {}),
+        ...sessionHeaderValues(auth, conversationTag({ model: "", messages: [], conversationId: "auth-probe" })),
       },
       body: JSON.stringify(body),
     });

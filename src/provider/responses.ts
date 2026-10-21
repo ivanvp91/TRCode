@@ -84,6 +84,9 @@ export function toResponsesInput(messages: Message[]): { instructions: string; i
 export function buildResponsesBody(req: ResponsesRequest, stream: boolean): Record<string, unknown> {
   const { instructions, input } = toResponsesInput(req.messages);
   const body: Record<string, unknown> = { model: req.model, input, stream };
+  // Responses defaults to serial calls; the flag is stated on every request
+  // rather than left to the host's default.
+  body.parallel_tool_calls = true;
   if (instructions) body.instructions = instructions;
   if (req.tools?.length) {
     body.tools = req.tools.map((t) => ({

@@ -150,20 +150,40 @@ export function modalButtons(w: number, actions: ModalAction[], focused: number 
   return rows.map((r) => modalRow(w, r));
 }
 
-/** Tab strip: the panel's own sections, switched with ←/→. */
+/**
+ * Tab strip: the panel's own sections, switched with ←/→. Wraps onto further
+ * rows like the buttons do — there are as many providers as the user has keys
+ * for, and a section scrolled off the right edge cannot be picked at all.
+ */
 export function modalTabs(
   w: number,
   tabs: { label: string; count?: number }[],
   active: number,
 ): string[] {
   if (tabs.length < 2) return [];
-  const strip = tabs
-    .map((tab, i) => {
-      const text = `${tab.label}${tab.count !== undefined ? ` ${tab.count}` : ""}`;
-      return i === active ? c.inverse(c.bold(` ${text} `)) : c.gray("[ ") + c.white(text) + c.gray(" ]");
-    })
-    .join(" ");
-  return [modalRow(w, strip), modalRow(w)];
+  const inner = innerWidth(w);
+  const rows: string[] = [];
+  let row = "";
+  let rowW = 0;
+
+  for (const [i, tab] of tabs.entries()) {
+    const text = `${tab.label}${tab.count !== undefined ? ` ${tab.count}` : ""}`;
+    const cell = i === active ? c.inverse(c.bold(` ${text} `)) : c.gray("[ ") + c.white(text) + c.gray(" ]");
+    const cellW = width(cell);
+    if (rowW && rowW + 1 + cellW > inner) {
+      rows.push(row);
+      row = "";
+      rowW = 0;
+    }
+    if (rowW) {
+      row += " ";
+      rowW += 1;
+    }
+    row += cell;
+    rowW += cellW;
+  }
+  if (row) rows.push(row);
+  return [...rows.map((r) => modalRow(w, r)), modalRow(w)];
 }
 
 /** The key legend at the foot of the panel, and the position counter. */

@@ -151,6 +151,25 @@ export class InterruptWatcher {
     this.timer = null;
   }
 }
+
+/**
+ * Cancels whatever is waiting when Esc (or Ctrl+C) is pressed.
+ *
+ * During a turn the bar below reads the keyboard. Everything else — the
+ * browser login, the Code Assist project lookup, a catalog refresh — used to
+ * print "esc to interrupt" with nobody listening at all, which is exactly what
+ * "Esc does not interrupt" looks like from the outside. Returns the function
+ * that gives the keyboard back.
+ */
+export function escWatch(onEsc: () => void): () => void {
+  if (!process.stdin.isTTY) return () => {};
+  const watch = new InterruptWatcher(onEsc);
+  const release = pushConsumer((buf) => void watch.feed(buf.toString("utf8")));
+  return () => {
+    watch.stop();
+    release();
+  };
+}
 export interface TurnBarOptions {
   status: () => EditorStatus;
   /** Cancels the running turn — Esc and Ctrl+C both land here. */

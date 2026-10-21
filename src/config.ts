@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 import type { SubagentRole } from "./agent/roles.js";
 
-export const VERSION = "0.1.8";
+export const VERSION = "0.1.9";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";
@@ -176,6 +176,17 @@ export interface Config {
   /** Abort a request after this long without any data from the server. */
   requestTimeoutMs: number;
   /**
+   * How many times a request is resent after the host answers with a transient
+   * upstream failure — a 503 "Endpoint is unavailable", a 502/504, a plain 500.
+   * A proxy restarting under a turn takes longer than the three quick tries
+   * this used to do, and the alternative is handing the user an error to
+   * retype by hand. Ten attempts ten seconds apart ride out about a minute and
+   * a half of downtime. 0 disables the retry.
+   */
+  upstreamRetries: number;
+  /** Pause before each of those attempts, in ms. */
+  upstreamRetryDelayMs: number;
+  /**
    * Cap on the history sent with each request. The loop resends everything on
    * every step, so without a cap a long session bills quadratically. Old tool
    * output is shortened once this is exceeded; 0 disables the cap.
@@ -217,8 +228,17 @@ export interface Config {
    * of them race for the same slot.
    */
   toolConcurrency: number;
-  /** Auto-compact once the context passes this fraction of the window. */
+  /**
+   * Auto-compact at all. False leaves the history alone however full it gets —
+   * `/compact` still works by hand, and `/compact auto on|off` flips this.
+   */
+  autoCompact: boolean;
+  /** Full compaction once the context passes this fraction of the window. */
   autoCompactAt: number;
+  /** Medium compaction — a digest plus the working tail — from this fraction. */
+  autoCompactMediumAt: number;
+  /** Light trim — old tool output and old thinking, no model call — from here. */
+  autoCompactLightAt: number;
   /**
    * Ask the provider to cache the prompt prefix. On the OpenAI path caching is
    * automatic and this changes nothing; on the Anthropic path nothing is
@@ -243,7 +263,10 @@ export interface Config {
    * third-party coding endpoints are undocumented and can change what they
    * serve, or expect, without warning.
    */
-  providers?: Record<string, { baseUrl?: string; headers?: Record<string, string>; models?: string[] }>;
+  providers?: Record<
+    string,
+    { baseUrl?: string; headers?: Record<string, string>; models?: string[]; project?: string }
+  >;
   /**
    * Provider a new session starts on. Without it the default model decides,
    * which is the same thing said less directly.
@@ -275,6 +298,12 @@ export interface Config {
    * in .trcode/mcp.json (same shape; wins on a shared id).
    */
   mcpServers: Record<string, McpServerConfig>;
+  /**
+   * Expose MCP tools through a `find_mcp_tools` search instead of sending every
+   * server's schemas with every request. Off by default: the search costs a
+   * step, and only pays on servers with a dozen tools or a fat schema.
+   */
+  mcpToolSearch: boolean;
   /** Extra system prompt appended for every session. */
   instructions?: string;
   /**
@@ -394,6 +423,12 @@ const DEFAULTS: Config = {
   // minutes, and hosts that do not stream reasoning sit silent for the whole
   // thinking phase, so the guard errs long.
   requestTimeoutMs: 600_000,
+  // An upstream that is down for a few seconds is the common case (a proxy
+  // restarting); one that is down for minutes is not this client's to wait
+  // out. Ten tries ten seconds apart covers the first without turning a dead
+  // endpoint into a five-minute hang.
+  upstreamRetries: 10,
+  upstreamRetryDelayMs: 10_000,
   // Derived from the model's window rather than fixed: 40k was the same
   // number for a 128k model and a 1M one, and on the big one it meant the
   // trimmer rewrote history that had plenty of room — moving the prefix and
@@ -427,8 +462,12 @@ const DEFAULTS: Config = {
   // auto-compaction already handle. Set a number to put a ceiling back.
   maxSteps: 0,
   toolConcurrency: 4,
-  // Late on purpose: compaction loses detail, so it waits until the window is
+  // The ladder from cheapest loss to latest: nothing is thrown away before it
+  // has to be, and the lossy full handoff still waits until the window is
   // nearly full rather than digesting a history the model can still hold.
+  autoCompact: true,
+  autoCompactLightAt: 0.25,
+  autoCompactMediumAt: 0.5,
   autoCompactAt: 0.9,
   promptCache: true,
   orca: true,
@@ -447,6 +486,7 @@ const DEFAULTS: Config = {
   codeMode: false,
   codeModeTimeoutMs: 60_000,
   mcpServers: {},
+  mcpToolSearch: false,
   statusFields: { model: true, tokens: true, steps: true, time: true, speed: true },
   updateCheck: true,
 };

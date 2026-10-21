@@ -229,11 +229,11 @@ function check(name, cond, detail = "") {
   check("separator row is dropped", !/\|---\|/.test(text) && !/\| Plan \|/.test(text), text);
   check("heading survives", /Pricing review/.test(text), text);
   check("bullets are rendered", /• The gap between Starter/.test(text), text);
-  check("tool call is listed", /read\(/.test(text), text);
-  check("long turn is capped", /more lines/.test(text), text);
+  check("tool call is listed", /Read\(pricing\.php\)/.test(text), text);
+  check("its output sits under it", /└ …file…/.test(text), text);
 }
 
-// ── 3b. earlier prompts show as a table of contents, not a bare count ───────
+// ── 3b. the whole session replays, nothing is folded into a list ────────────
 {
   const app = makeApp();
   const s = new Session({ cwd: CWD, model: "moonshotai/kimi-k3", title: "long one" });
@@ -246,11 +246,41 @@ function check(name, cond, detail = "") {
   app.replayHistory();
   const text = screen.lines().map(strip).join("\n");
 
-  check("folded part is announced", /Earlier in this session/.test(text), text);
-  check("each folded prompt is listed", /question number 1/.test(text) && /question number 3/.test(text), text);
-  check("folded prompts carry their age", /just now/.test(text), text);
-  check("folded answers stay folded", !/answer 1\b/.test(text), text);
-  check("recent turns still replay in full", /answer 7/.test(text), text);
+  check("the first prompt is replayed", /question number 1/.test(text), text);
+  check("and its answer", /answer 1\b/.test(text), text);
+  check("the last prompt is replayed", /question number 7/.test(text), text);
+  check("no table of contents stands in for history", !/Earlier in this session/.test(text), text);
+}
+
+// ── 3c. a long answer replays whole, tool results preview and fold ──────────
+{
+  const app = makeApp();
+  const s = new Session({ cwd: CWD, model: "moonshotai/kimi-k3", title: "deep" });
+  const long = Array.from({ length: 60 }, (_, i) => `answer line ${i + 1}`).join("\n");
+  s.add({ role: "user", content: "walk me through it" });
+  s.add({ role: "assistant", content: long, meta: { model: "moonshotai/kimi-k3" } });
+  s.add({
+    role: "assistant",
+    content: null,
+    tool_calls: [{ id: "c1", type: "function", function: { name: "read", arguments: '{"path":"src/x.ts"}' } }],
+  });
+  s.add({
+    role: "tool",
+    content: "out line 1\nout line 2\nout line 3\nout line 4\nout line 5\nout line 6\nout line 7\nout line 8",
+    tool_call_id: "c1",
+    name: "read",
+  });
+  app.session = s;
+  screen.reset();
+  app.replayHistory();
+  const lines = screen.lines().map(strip);
+  const text = lines.join("\n");
+
+  check("a 60-line answer is not capped", /answer line 60/.test(text), text);
+  check("the call names its target, not its json", /Read\(src\/x\.ts\)/.test(text) && !/\{"path"/.test(text), text);
+  check("the result follows its call", lines.findIndex((l) => /Read\(src\/x\.ts\)/.test(l)) < lines.findIndex((l) => /out line 1/.test(l)), text);
+  check("output is previewed", /└ out line 1/.test(text), text);
+  check("and the rest folded away", /\+3 lines \(ctrl\+o to expand\)/.test(text), text);
 }
 
 // ── 4. a compacted digest replays as a labelled block ───────────────────────
@@ -287,7 +317,8 @@ function check(name, cond, detail = "") {
   await done;
   const text = screen.lines().map(strip).join("\n");
 
-  check("compaction reports the saving", /Compacted \d+ messages into a digest/.test(text), text);
+  check("compaction reports the saving", /Compacted \d+ messages into a summary/.test(text), text);
+  check("compaction says what was kept", /\d+ recent user messages kept/.test(text), text);
   check("compaction reports tokens", /~[\d.]+k? → ~[\d.]+k? tokens/.test(text), text);
   check("history actually shrank", app.session.messages.length < 5, String(app.session.messages.length));
   check("session is marked compacted", app.session.compactions === 1, String(app.session.compactions));

@@ -119,16 +119,24 @@ check("subagents get the same discipline", /grep first, then read around the hit
   void say;
 }
 
-// ── when auto-compaction fires ──────────────────────────────────────────────
-// Compaction is lossy, so it has to wait for the window to actually fill. It
-// used to also trigger at twice the on-the-wire trim budget, which on a 1M
-// window meant compacting at 8% — a history the model could still hold whole.
+// ── when auto-compaction fires, and how hard ───────────────────────────────
+// Compaction is lossy, so the ladder spends the cheap losses first: a trim at a
+// quarter of the window, a digest at half, the full handoff at ninety percent.
+// It used to fire only at 90% — and, before that, also at twice the on-the-wire
+// trim budget, which on a 1M window meant compacting at 8% of a history the
+// model could still hold whole.
 {
-  const { shouldAutoCompact, contextPressure } = await import("../dist/session/compact.js");
+  const { autoCompactLevel, shouldAutoCompact, contextPressure } = await import("../dist/session/compact.js");
   const { Session } = await import("../dist/session/session.js");
   const { saveConfig } = await import("../dist/config.js");
 
-  saveConfig({ maxRequestTokens: 40_000, autoCompactAt: 0.9 });
+  saveConfig({
+    maxRequestTokens: 40_000,
+    autoCompact: true,
+    autoCompactLightAt: 0.25,
+    autoCompactMediumAt: 0.5,
+    autoCompactAt: 0.9,
+  });
   const catalog = [{ id: "big", contextWindow: 1_000_000 }];
   const s = new Session({ cwd: WORK, model: "big", title: "t" });
   const fill = (tokens) => {
@@ -137,23 +145,30 @@ check("subagents get the same discipline", /grep first, then read around the hit
 
   fill(200_000); // 20% of the window, five times the request budget
   const low = contextPressure(s, catalog);
-  check(
-    "a fifth of the window does not compact",
-    !shouldAutoCompact(s, catalog),
-    `ratio ${low.ratio.toFixed(2)}`,
-  );
+  check("a fifth of the window is left alone", autoCompactLevel(s, catalog) === null, `ratio ${low.ratio.toFixed(2)}`);
 
-  fill(880_000); // 88% — close, but the threshold is 90
-  check("just under the threshold still holds", !shouldAutoCompact(s, catalog));
+  fill(300_000);
+  check("a third of the window gets the light trim", autoCompactLevel(s, catalog) === "light");
+
+  fill(600_000);
+  check("half the window gets the medium digest", autoCompactLevel(s, catalog) === "medium");
+
+  fill(880_000); // 88% — close, but the full pass waits for 90
+  check("just under the threshold is still medium", autoCompactLevel(s, catalog) === "medium");
 
   fill(920_000);
-  check("past 90% of the window it compacts", shouldAutoCompact(s, catalog));
+  check("past 90% of the window the full handoff runs", autoCompactLevel(s, catalog) === "full");
+  check("and shouldAutoCompact agrees there is work", shouldAutoCompact(s, catalog));
+
+  saveConfig({ autoCompact: false });
+  check("autoCompact: false silences the whole ladder", autoCompactLevel(s, catalog) === null);
+  saveConfig({ autoCompact: true });
 
   // The share is what decides, on any window size.
   const small = [{ id: "small", contextWindow: 100_000 }];
   s.model = "small";
   fill(95_000);
-  check("the same share fires on a small window", shouldAutoCompact(s, small));
+  check("the same share fires on a small window", autoCompactLevel(s, small) === "full");
 }
 
 // "Check my servers" has an answer on this machine — but only if the agent

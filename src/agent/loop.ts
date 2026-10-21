@@ -33,6 +33,10 @@ export interface AgentEvents {
   onTrim?(savedTokens: number, count: number): void;
   /** The connection died; the step is being resent. `hadText`: part of the answer had already been streamed. */
   onReconnect?(reason: string, attempt: number, of: number, hadText?: boolean): void;
+  /** The history was compacted mid-turn, between a tool round and the next request. */
+  onCompacted?(): void;
+  /** Mid-turn compaction failed; the turn continues on the history as it stands. */
+  onCompactFailed?(reason: string): void;
 }
 
 export interface RunOptions {
@@ -52,6 +56,8 @@ export interface RunOptions {
   onStall?: (idleMs: number) => Promise<boolean>;
   /** A send is held back by a learned rate limit; see ChatRequest.onRateWait. */
   onRateWait?: (waitMs: number, model: string, said: string) => void;
+  /** A transient upstream failure is being waited out; see ChatRequest.onRetryWait. */
+  onRetryWait?: (waitMs: number, attempt: number, of: number, said: string) => void;
   events?: AgentEvents;
   /** Tool calls in one assistant turn run concurrently up to this many. */
   toolConcurrency?: number;
@@ -65,6 +71,13 @@ export interface RunOptions {
    * and by then nothing is looking. See skills/match.ts.
    */
   interject?: (assistant: Message, calls: ToolCall[]) => Message | null;
+  /**
+   * Called after a tool round lands and before the next request, in the middle
+   * of a turn. Compaction mutates the history array in place, so the run keeps
+   * sending the live one; the caller decides whether the budget was actually
+   * reached (see shouldAutoCompact). Returns true when it compacted.
+   */
+  midTurnCompact?: () => Promise<boolean>;
   /**
    * When set, every request appends a projection record — what the model was
    * actually sent, by component — to the session's .proj.jsonl. Absent for
@@ -262,6 +275,13 @@ function loopBreakResults(calls: ToolCall[], times: number): Message[] {
 
 export async function runAgent(opts: RunOptions): Promise<RunResult> {
   const { messages, tools, events } = opts;
+  // A tool may bring more tools with it (MCP discovery): the next step's
+  // request is built from this same array, so pushing here is enough.
+  if (opts.toolContext) {
+    opts.toolContext.exposeTools = (defs: ToolDef[]) => {
+      for (const def of defs) if (!tools.some((t) => t.name === def.name)) tools.push(def);
+    };
+  }
   let finalText = "";
   let step = 0;
   // Dropped connections, counted for the whole turn rather than per step: a
@@ -321,6 +341,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     let toolCalls: ToolCall[] = [];
     let finishReason = "stop";
     let usage: Usage | undefined;
+    let reasoning = "";
 
     try {
       for await (const ev of streamChat({
@@ -331,12 +352,17 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         signal: opts.signal,
         onStall: opts.onStall,
         onRateWait: opts.onRateWait,
+        onRetryWait: opts.onRetryWait,
         conversationId: opts.conversationId,
       })) {
         if (ev.type === "text" && ev.text) {
           text += ev.text;
           events?.onText?.(ev.text);
         } else if (ev.type === "reasoning" && ev.text) {
+          // Kept beside the text as well as streamed: a host in thinking mode
+          // wants the thinking handed back on the next step, and this turn is
+          // exactly what the next request replays.
+          reasoning += ev.text;
           events?.onReasoning?.(ev.text);
         } else if (ev.type === "done") {
           toolCalls = ev.toolCalls ?? [];
@@ -360,6 +386,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         step--; // the same step, sent again
         text = "";
         toolCalls = [];
+        reasoning = "";
         continue;
       }
       if (isConnectionDrop(err)) {
@@ -399,6 +426,10 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       meta: { model: opts.model },
     };
     if (toolCalls.length) assistantMsg.tool_calls = toolCalls;
+    // Only when the host actually streamed some: an empty field is a claim the
+    // model thought nothing, and hosts that look for it take the absence of the
+    // key as "not a thinking turn".
+    if (reasoning) assistantMsg.reasoning = reasoning;
     messages.push(assistantMsg);
     events?.onAssistantMessage?.(assistantMsg);
 
@@ -441,6 +472,23 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     messages.push(...toolMessages);
 
     if (opts.signal.aborted) return { finalText, steps: step + 1, stoppedBecause: "aborted" };
+
+    // Between the tool results and the next request, which is where a turn
+    // that outgrew its window actually stalls. The history is spliced in
+    // place, so the messages this loop holds stay the ones being sent.
+    if (opts.midTurnCompact) {
+      try {
+        if (await opts.midTurnCompact()) events?.onCompacted?.();
+      } catch (err) {
+        if ((err as Error)?.name === "AbortError" || opts.signal.aborted) {
+          return { finalText, steps: step + 1, stoppedBecause: "aborted" };
+        }
+        // A compaction that failed must not end a turn that is otherwise fine:
+        // the next request goes out on the history as it stands, and trim still
+        // keeps that one inside the window.
+        events?.onCompactFailed?.((err as Error).message);
+      }
+    }
 
     // After the results, not before: the message lands where the next request
     // will read it last, which is where an instruction is actually followed.

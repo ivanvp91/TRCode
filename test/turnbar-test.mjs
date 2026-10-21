@@ -388,5 +388,48 @@ line("   after the turn");
   third.stop();
 }
 
+// ── escWatch: Esc outside a turn ──────────────────────────────────────────
+// The login wait printed "esc to interrupt" with nobody reading the keyboard:
+// pressing it did nothing at all, and the spinner kept going. The watcher is
+// what makes that hint true outside a turn.
+{
+  const { escWatch } = await import("../dist/ui/turnbar.js");
+
+  let fired = 0;
+  const release = escWatch(() => fired++);
+  await key(ESC);
+  await sleep(60); // the watcher holds a lone Esc for 40ms before deciding
+  check("esc fires the watcher with no turn bar", fired === 1, String(fired));
+
+  await key(ESC + "[A"); // a cursor key is not a cancel
+  await sleep(60);
+  check("arrow keys do not fire it", fired === 1, String(fired));
+
+  await key(String.fromCharCode(3)); // Ctrl+C
+  await sleep(60);
+  check("ctrl+c fires it too", fired === 2, String(fired));
+
+  release();
+  await key(ESC);
+  await sleep(60);
+  check("after release esc is inert again", fired === 2, String(fired));
+}
+
+// ── the spinner only advertises esc where somebody listens ────────────────
+{
+  const { Spinner } = await import("../dist/ui/render.js");
+  const read = async (spinner) => {
+    screen.reset();
+    spinner.start();
+    await sleep(160);
+    // Read before stop(): the spinner clears its own line on the way out.
+    const shown = strip(screen.text());
+    spinner.stop();
+    return shown;
+  };
+  check("a bare spinner promises no key", !(await read(new Spinner("жду"))).includes("esc to interrupt"), "");
+  check("a cancellable one does", (await read(new Spinner("жду", { escape: true }))).includes("esc to interrupt"), "");
+}
+
 say(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

@@ -286,6 +286,8 @@ export interface BannerInfo {
   provider: string;
   model: string;
   effort: string;
+  /** The host drops the budget for this model; the header leaves it out. */
+  effortIgnored?: boolean;
   cwdLabel: string;
   sessionId: string;
   version: string;
@@ -314,8 +316,13 @@ const LOGO = [
  */
 export function banner(info: BannerInfo & { compact?: boolean }): void {
   const inner = contentWidth() - 2;
+  // The header states the same three switchable things as the status row, and a
+  // budget the model never receives is not one of them.
   const modelValue =
-    c.brightCyan(info.model) + (info.effort === "off" ? "" : c.gray(t("  thinking: ", "  мышление: ")) + c.brightMagenta(info.effort));
+    c.brightCyan(info.model) +
+    (info.effort === "off" || info.effortIgnored
+      ? ""
+      : c.gray(t("  thinking: ", "  мышление: ")) + c.brightMagenta(info.effort));
 
   /** One framed row, padded to the box width. */
   const row = (content = "") => {
@@ -458,7 +465,11 @@ export function toolStart(name: string, summary: string): void {
   for (const l of rows.slice(1)) padded("  " + l);
 }
 
-export function toolDone(ok: boolean, detail: string, kind: "text" | "diff" = "text"): void {
+/**
+ * Prints a tool's output. `null` marks a call being replayed: the corner is
+ * grey because whether it succeeded was not written down, only what came back.
+ */
+export function toolDone(ok: boolean | null, detail: string, kind: "text" | "diff" = "text"): void {
   // A diff arrives already laid out — bands, gutter and all — and dimming or
   // clipping it here would undo exactly that.
   if (kind === "diff") {
@@ -478,7 +489,7 @@ export function toolDone(ok: boolean, detail: string, kind: "text" | "diff" = "t
     }
     return;
   }
-  const mark = ok ? c.green("└ ") : c.red("└ ");
+  const mark = ok === null ? c.gray("└ ") : ok ? c.green("└ ") : c.red("└ ");
   const all = detail.split("\n");
   // The corner marks the block, not every line of it: a run of results reads
   // as one thing when only the first line carries the gutter.
@@ -922,8 +933,20 @@ export class Spinner {
   private started = 0;
   private inTokens = 0;
   private outTokens = 0;
+  /**
+   * Whether Esc is actually wired to cancel this wait. A spinner sits in
+   * places with no turn bar above it — a login, a catalog refresh — where
+   * nothing reads the keyboard; advertising the key there and ignoring it is
+   * the worst of both, so the hint is opt-in.
+   */
+  private cancelable: boolean;
 
-  constructor(private label: string) {}
+  constructor(
+    private label: string,
+    opts: { escape?: boolean } = {},
+  ) {
+    this.cancelable = opts.escape === true;
+  }
 
   start(): void {
     if (!process.stdout.isTTY || this.timer) return;
@@ -962,7 +985,7 @@ export class Spinner {
         " " +
         c.dim(this.label) +
         c.gray(` (${elapsed}${counts}${tps})`) +
-        c.gray("  esc to interrupt"),
+        (this.cancelable ? c.gray("  esc to interrupt") : ""),
     );
   }
 

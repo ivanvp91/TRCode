@@ -9,16 +9,18 @@
 import { spawn } from "node:child_process";
 import { saveConfig } from "../config.js";
 import { verifyProvider } from "../provider/client.js";
-import { clearCredentials, importVendorCredentials, writeCredentials } from "../provider/credentials.js";
+import { clearCredentials, importVendorCredentials, readCredentials, writeCredentials, type Credentials } from "../provider/credentials.js";
 import { fetchModels } from "../provider/models.js";
-import { pollForToken, requestDeviceCode } from "../provider/oauth.js";
-import { modeConfig, qualifyModelId, rememberBaseUrl, type ProviderDef } from "../provider/registry.js";
+import { listOrgs, pollForToken, requestDeviceCode, webLogin, type DeviceFlowConfig, type Org, type WebFlowConfig } from "../provider/oauth.js";
+import { modeConfig, providerProject, qualifyModelId, rememberBaseUrl, rememberProject, type ProviderDef } from "../provider/registry.js";
+import { discoverProject } from "../provider/gemini.js";
 import { c } from "./ansi.js";
 import { choose } from "./choice.js";
 import { askLine } from "./prompt.js";
 import { pick } from "./picker.js";
 import { error, hint, info, line, padded, Spinner, success, warn } from "./render.js";
 import { askSecret } from "./secret.js";
+import { escWatch } from "./turnbar.js";
 import { t } from "../i18n.js";
 
 export interface LoginOptions {
@@ -76,41 +78,64 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
       error(t(`${def.label} has no API-key endpoint configured.`, `У ${def.label} не настроен эндпоинт для ключа API.`));
       return FAILED;
     }
-    // A host that differs per account is asked for before the key: a wrong one
-    // answers 404 to everything, and the credential is not what was wrong.
-    if (opts.baseUrl) {
-      rememberBaseUrl(def.id, opts.baseUrl);
-    } else if ((def.hosts?.length || def.hostHint) && process.stdin.isTTY) {
-      const url = await chooseHost(def, exclusive);
-      if (url === null) {
-        error(t("Cancelled.", "Отменено."));
+    // A provider with no account login of its own may still have a vendor CLI
+    // that keeps one: Muse Code stores a session or a pasted key, and reusing
+    // it saves the key hunt. An explicit key always wins.
+    const inheritedKey = !def.oauth && !opts.key && !opts.fresh ? def.importFrom && importVendorCredentials(def.importFrom) : null;
+    if (inheritedKey) {
+      if (def.oauthWarning) {
+        line();
+        warn(def.oauthWarning);
+      }
+      writeCredentials(def.id, inheritedKey);
+      info(t(`Reusing the ${def.label} CLI credential from ${inheritedKey.source}.`, `Переиспользую учётные данные ${def.label} CLI из ${inheritedKey.source}.`));
+      // The credential is in hand; skip the key prompts below.
+    } else {
+      // A host that differs per account is asked for before the key: a wrong one
+      // answers 404 to everything, and the credential is not what was wrong.
+      if (opts.baseUrl) {
+        rememberBaseUrl(def.id, opts.baseUrl);
+      } else if ((def.hosts?.length || def.hostHint) && process.stdin.isTTY) {
+        const url = await chooseHost(def, exclusive);
+        if (url === null) {
+          error(t("Cancelled.", "Отменено."));
+          return FAILED;
+        }
+        if (url) rememberBaseUrl(def.id, url);
+      }
+      const key = (opts.key ?? (await exclusive(() => askSecret(`  ${def.keyHint}: `)))).trim();
+      if (!key) {
+        error(t("No key entered.", "Ключ не введён."));
         return FAILED;
       }
-      if (url) rememberBaseUrl(def.id, url);
+      writeCredentials(def.id, { mode: "apikey", accessToken: key, source: "pasted key" });
     }
-    const key = (opts.key ?? (await exclusive(() => askSecret(`  ${def.keyHint}: `)))).trim();
-    if (!key) {
-      error(t("No key entered.", "Ключ не введён."));
-      return FAILED;
-    }
-    writeCredentials(def.id, { mode: "apikey", accessToken: key, source: "pasted key" });
   } else {
     if (!def.oauth) {
       error(t(`${def.label} does not support OAuth.`, `${def.label} не поддерживает OAuth.`));
       return FAILED;
+    }
+    // Said before anything is reused or opened, not after: on Google's login
+    // this is the difference between a session and a suspended account, and a
+    // session inherited from the vendor's CLI carries the same risk.
+    if (def.oauthWarning) {
+      line();
+      warn(def.oauthWarning);
     }
     // A login the vendor's own CLI already performed is the same login.
     const inherited = opts.fresh ? null : def.importFrom && importVendorCredentials(def.importFrom);
     if (inherited) {
       writeCredentials(def.id, inherited);
       info(t(`Reusing the ${def.label} CLI session from ${inherited.source}.`, `Переиспользую сессию ${def.label} CLI из ${inherited.source}.`));
-    } else if (!(await deviceLogin(def))) {
-      return FAILED;
+    } else {
+      if (!(await oauthLogin(def, exclusive))) return FAILED;
     }
+    // Code Assist refuses a request that names no project. The token alone does
+    // not say which one it acts for, so it is resolved here, once, and pinned.
+    if (mode === "oauth" && def.id === "gemini") await settleGeminiProject(def);
   }
 
-  const check = await verifyProvider(def.id);
-  if (!check.ok) {
+  const check = await verifyProvider(def.id);  if (!check.ok) {
     // A rejected token is worth deleting; a lapsed plan is not — the login
     // itself worked, and asking the user to repeat it would fix nothing.
     if (check.status === 401 || check.status === 403) {
@@ -179,13 +204,132 @@ export async function chooseHost(
   return typed === null ? null : typed.trim() === current ? "" : typed.trim();
 }
 
-async function deviceLogin(def: ProviderDef): Promise<boolean> {
+/**
+ * The Code Assist project the token will act for.
+ *
+ * Paid accounts have one; a free account is onboarded to its default tier by the
+ * same two calls Gemini CLI makes on first run, which can take a few seconds. A
+ * failure is not a failed login — the tokens are saved, and the user can pin a
+ * project (GOOGLE_CLOUD_PROJECT or config → providers.gemini.project) later.
+ */
+async function settleGeminiProject(def: ProviderDef): Promise<void> {
+  const known = providerProject(def.id);
+  if (known) {
+    info(t(`Code Assist project: ${known}`, `Проект Code Assist: ${known}`));
+    return;
+  }
+  const creds = readCredentials(def.id);
+  if (!creds) return;
+  const sp = new Spinner(t("looking up the Code Assist project", "ищу проект Code Assist"), { escape: true });
+  sp.start();
+  const ac = new AbortController();
+  const releaseEsc = escWatch(() => ac.abort());
+  try {
+    const { projectId, tier } = await discoverProject(creds.accessToken, {
+      baseUrl: modeConfig(def.id, "oauth")?.baseUrl,
+      signal: ac.signal,
+      onWait: (attempt) =>
+        sp.setLabel(
+          t(
+            `onboarding the Code Assist project (check ${attempt})`,
+            `онбординг проекта Code Assist (проверка ${attempt})`,
+          ),
+        ),
+    });
+    if (projectId) {
+      rememberProject(def.id, projectId);
+      info(t(`Code Assist project: ${projectId}${tier ? ` (${tier})` : ""}`, `Проект Code Assist: ${projectId}${tier ? ` (${tier})` : ""}`));
+    } else {
+      warn(t("Code Assist returned no project for this account.", "Code Assist не вернул проект для этого аккаунта."));
+      hint(t("Set GOOGLE_CLOUD_PROJECT, or config → providers.gemini.project.", "Задайте GOOGLE_CLOUD_PROJECT или config → providers.gemini.project."));
+    }
+  } catch (err) {
+    if (ac.signal.aborted) {
+      // The tokens are already written; the project is the only thing skipped,
+      // and it can be pinned later.
+      hint(t("Project lookup cancelled. Set GOOGLE_CLOUD_PROJECT to use the tokens.", "Поиск проекта отменён. Задайте GOOGLE_CLOUD_PROJECT, чтобы использовать токены."));
+    } else {
+      warn(t(`Could not resolve the Code Assist project: ${(err as Error).message}`, `Не удалось получить проект Code Assist: ${(err as Error).message}`));
+      hint(t("The tokens are saved. Set GOOGLE_CLOUD_PROJECT to use them.", "Токены сохранены. Задайте GOOGLE_CLOUD_PROJECT, чтобы их использовать."));
+    }
+  } finally {
+    releaseEsc();
+    sp.stop();
+  }
+}
+
+async function oauthLogin(def: ProviderDef, exclusive: <T>(fn: () => Promise<T>) => Promise<T>): Promise<boolean> {  const cfg = def.oauth!;
+  const creds = cfg.kind === "web" ? await webLoginFlow(def, cfg) : await deviceLoginFlow(def, cfg, exclusive);
+  if (!creds) return false;
+  writeCredentials(def.id, creds);
+  return true;
+}
+
+/**
+ * The browser flow: the listener is already up when the URL is printed, so the
+ * redirect cannot arrive before there is something to receive it.
+ */
+async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig): Promise<Credentials | null> {
+  // In a holder: the spinner is created inside the onUrl callback, and a local
+  // the compiler never sees assigned would narrow to never in the finally.
+  const waiting: { spinner: Spinner | null } = { spinner: null };
+  // The wait is minutes long and there is no turn behind it: without this the
+  // "esc to interrupt" on the spinner was purely decorative.
+  const ac = new AbortController();
+  const releaseEsc = escWatch(() => ac.abort());
+  try {
+    const creds = await webLogin(cfg, {
+      signal: ac.signal,
+      onUrl: (url) => {
+        line();
+        padded(t(`Open ${c.brightCyan(url)}`, `Откройте ${c.brightCyan(url)}`));
+        hint(
+          t(
+            "approve it in the browser — this window finishes the sign-in by itself",
+            "подтвердите в браузере — это окно завершит вход само",
+          ),
+        );
+        line();
+        openBrowser(url);
+        waiting.spinner = new Spinner(t("waiting for approval", "жду подтверждения"), { escape: true });
+        waiting.spinner.start();
+      },
+    });
+    return creds;
+  } catch (err) {
+    if ((err as { code?: string }).code === "cancelled") {
+      warn(t("Sign-in cancelled.", "Вход отменён."));
+      return null;
+    }
+    error(t(`${def.label} login failed: ${(err as Error).message}`, `Вход в ${def.label} не удался: ${(err as Error).message}`));
+    // A browser flow is the one that needs a hint when it cannot work: the
+    // listener is on this machine, so a URL opened on another one never returns.
+    if ((err as Error).name === "OAuthError") {
+      hint(
+        t(
+          "The callback comes back to this machine — the browser has to run here, or the port cannot be reached.",
+          "Callback возвращается на эту машину — браузер должен быть здесь, иначе порт недоступен.",
+        ),
+      );
+    }
+    return null;
+  } finally {
+    releaseEsc();
+    waiting.spinner?.stop();
+  }
+}
+
+async function deviceLoginFlow(
+  def: ProviderDef,
+  cfg: DeviceFlowConfig,
+  exclusive: <T>(fn: () => Promise<T>) => Promise<T>,
+): Promise<Credentials | null> {
   let code;
   try {
-    code = await requestDeviceCode(def.oauth!);
+    code = await requestDeviceCode(cfg);
   } catch (err) {
     error(t(`Could not start the ${def.label} login: ${(err as Error).message}`, `Не удалось начать вход в ${def.label}: ${(err as Error).message}`));
-    return false;
+    return null;
   }
 
   const url = code.verificationUriComplete ?? code.verificationUri;
@@ -195,17 +339,74 @@ async function deviceLogin(def: ProviderDef): Promise<boolean> {
   line();
   openBrowser(url);
 
-  const sp = new Spinner(t("waiting for approval", "жду подтверждения"));
+  const sp = new Spinner(t("waiting for approval", "жду подтверждения"), { escape: true });
   sp.start();
+  // No turn bar is running here, so the spinner's own hint needs somebody
+  // behind it: Esc ends the wait instead of being swallowed by the terminal.
+  const ac = new AbortController();
+  const releaseEsc = escWatch(() => ac.abort());
+  let creds: Credentials;
   try {
-    writeCredentials(def.id, await pollForToken(def.oauth!, code));
-    return true;
+    creds = await pollForToken(cfg, code, { signal: ac.signal });
   } catch (err) {
-    error(t(`${def.label} login failed: ${(err as Error).message}`, `Вход в ${def.label} не удался: ${(err as Error).message}`));
-    return false;
-  } finally {
     sp.stop();
+    releaseEsc();
+    if ((err as { code?: string }).code === "cancelled") {
+      warn(t("Sign-in cancelled.", "Вход отменён."));
+      return null;
+    }
+    error(t(`${def.label} login failed: ${(err as Error).message}`, `Вход в ${def.label} не удался: ${(err as Error).message}`));
+    return null;
   }
+  sp.stop();
+  releaseEsc();
+  if (cfg.orgs) {
+    const org = await chooseOrg(def, cfg, creds.accessToken, creds.orgId, exclusive);
+    if (org === null) return null;
+    if (org) Object.assign(creds, { orgId: org.id, orgName: org.name });
+  }
+  return creds;
+}
+
+/**
+ * The workspace a token will act for, on hosts that refuse one naming none.
+ * One the approval page already scoped the token to is kept; a single one is
+ * taken without asking; several are a question. Returns undefined when the
+ * list could not be read — the host then decides — and null when the user
+ * backed out.
+ */
+async function chooseOrg(
+  def: ProviderDef,
+  cfg: DeviceFlowConfig,
+  token: string,
+  scoped: string | undefined,
+  exclusive: <T>(fn: () => Promise<T>) => Promise<T>,
+): Promise<Org | undefined | null> {
+  let orgs: Org[];
+  try {
+    orgs = await listOrgs(cfg, token);
+  } catch (err) {
+    warn(t(`Could not list ${def.label} workspaces: ${(err as Error).message}`, `Не удалось получить рабочие пространства ${def.label}: ${(err as Error).message}`));
+    return scoped ? { id: scoped, name: scoped } : undefined;
+  }
+  const hit = scoped && orgs.find((o) => o.id === scoped);
+  if (scoped) return hit || { id: scoped, name: scoped };
+  if (!orgs.length) {
+    warn(t(`The ${def.label} account has no workspace — create one at opencode.ai.`, `В аккаунте ${def.label} нет рабочего пространства — создайте его на opencode.ai.`));
+    return undefined;
+  }
+  if (orgs.length === 1 || !process.stdin.isTTY) {
+    info(t(`Workspace: ${orgs[0].name}`, `Рабочее пространство: ${orgs[0].name}`));
+    return orgs[0];
+  }
+  const picked = await exclusive(() =>
+    pick({
+      title: t(`${def.label} — workspace`, `${def.label} — рабочее пространство`),
+      items: orgs.map((o) => ({ value: o.id, label: o.name, hint: o.id })),
+      initial: orgs[0].id,
+    }),
+  );
+  return picked === null ? null : orgs.find((o) => o.id === picked) ?? null;
 }
 
 /** Names the models that just became available, and an alias to reach them. */

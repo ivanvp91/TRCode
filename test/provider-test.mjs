@@ -305,6 +305,42 @@ ok("отсутствующий файл не роняет импорт", creds.i
   const router = status("moonshotai/kimi-k3");
   ok("для роутера тоже назван провайдер", router.includes("TokenRouter"), router);
   ok("id роутера не урезан", router.includes("moonshotai/kimi-k3"), router);
+
+  // A level the host drops is not state: "thinking: high" beside a model that
+  // never receives the parameter reads as if the turn runs at high effort. The
+  // real session showed exactly that (deepseek-v4.1-flash, learned as refusing
+  // the parameter, footer still advertising high), so the segment goes.
+  const ignored = strip(
+    composeStatus({
+      provider: "Kimi",
+      model: "kimi:k3",
+      effort: "high",
+      effortIgnored: true,
+      cwdLabel: "~/p",
+      contextUsed: 1,
+      contextWindow: 100,
+      contextEstimated: false,
+    }).left,
+  );
+  ok("неисполнимый уровень в строке не показан", !ignored.includes("thinking") && ignored.includes("k3"), ignored);
+
+  const { banner } = await import("../dist/ui/render.js");
+  const shot = (effortIgnored) => {
+    let out = "";
+    const real = process.stdout.write.bind(process.stdout);
+    process.stdout.write = (chunk) => {
+      out += String(chunk);
+      return true;
+    };
+    try {
+      banner({ provider: "Kimi", model: "kimi:k3", effort: "high", effortIgnored, cwdLabel: "~/p", sessionId: "s1", version: "0.1.0" });
+    } finally {
+      process.stdout.write = real;
+    }
+    return strip(out);
+  };
+  ok("и в шапке тоже", !shot(true).includes("thinking:"), shot(true).slice(0, 120));
+  ok("а на обычной модели уровень остался", shot(false).includes("thinking: high"), shot(false).slice(0, 120));
 }
 
 // ── Claude: a console key, and deliberately nothing else ──────────────────
@@ -361,16 +397,21 @@ ok("отсутствующий файл не роняет импорт", creds.i
   const seeded = registry.seedModels("meta", "apikey");
   ok(
     "опубликованный набор моделей",
-    seeded.map((m) => m.id).join() === "meta:muse-spark-1.2,meta:muse-spark-1.2-contributor,meta:muse-spark-1.1",
+    seeded.map((m) => m.id).join() ===
+      "meta:muse-wonder-1.0,meta:muse-spark-1.3,meta:muse-spark-1.3-contributor,meta:muse-spark-1.2,meta:muse-spark-1.2-contributor,meta:muse-spark-1.1",
     seeded.map((m) => m.id).join(),
   );
   ok("окно — 1M на всю линейку", seeded.every((m) => m.contextWindow === 1_048_576));
   ok("модели помечены как рабочие", seeded.every((m) => m.chatCapable));
   // Каталог Meta цен не отдаёт, а контрибьюторский SKU дешевле в десять раз —
-  // разница должна быть видна в /cost до выбора модели.
-  ok("цена стандартной сборки проставлена", seeded[0].pricing?.input === 1.25 && seeded[0].pricing?.output === 4.25, JSON.stringify(seeded[0].pricing));
-  ok("кэш-цена тоже", seeded[0].pricing?.cachedInput === 0.15);
-  ok("контрибьюторская дешевле", seeded[1].pricing?.input === 0.1 && seeded[1].pricing?.output === 0.2, JSON.stringify(seeded[1].pricing));
+  // разница должна быть видна в /cost до выбора модели. Цены ищутся по id, а
+  // не по позиции: ростер пополняется, и порядок — не контракт.
+  const priced = (id) => seeded.find((m) => m.id === `meta:${id}`);
+  const standard = priced("muse-spark-1.2");
+  ok("цена стандартной сборки проставлена", standard?.pricing?.input === 1.25 && standard?.pricing?.output === 4.25, JSON.stringify(standard?.pricing));
+  ok("кэш-цена тоже", standard?.pricing?.cachedInput === 0.15);
+  const contributor = priced("muse-spark-1.2-contributor");
+  ok("контрибьюторская дешевле", contributor?.pricing?.input === 0.1 && contributor?.pricing?.output === 0.2, JSON.stringify(contributor?.pricing));
 
   // Чья это модель — читается из имени, у какого бы хоста её ни взяли.
   ok("Muse у Meta — Meta", catalogModels.vendorOf({ id: "meta:muse-spark-1.2" }) === "Meta");
@@ -385,7 +426,23 @@ ok("отсутствующий файл не роняет импорт", creds.i
   const def = registry.providerById("opencode");
   ok("Zen есть в реестре", Boolean(def));
   ok("шлюз откликается на своё второе имя", registry.providerById("zen")?.id === "opencode");
-  ok("подписочного режима у него нет", def.modes.oauth === undefined);
+  // Вход через аккаунт OpenCode Console — тот же device flow, что у самого
+  // opencode, и токен идёт на тот же хост, где стоял бы ключ.
+  ok("есть вход через аккаунт", def.oauth?.clientId === "opencode-cli");
+  ok("device flow на Console", def.oauth?.deviceAuthUrl === "https://opencode.ai/console/auth/device/code");
+  ok("OAuth-режим смотрит на тот же хост", def.modes.oauth?.baseUrl === def.modes.apikey?.baseUrl);
+  creds.writeCredentials("opencode", { mode: "oauth", accessToken: "console-access", refreshToken: "r", expiresAt: Date.now() + 3600_000 });
+  const viaAccount = await registry.resolveAuth("opencode");
+  ok("токен аккаунта — на zen/v1", viaAccount.baseUrl === "https://opencode.ai/zen/v1", viaAccount.baseUrl);
+  ok("и в обоих заголовках, как ключ", viaAccount.headers.Authorization === "Bearer console-access" && viaAccount.headers["x-api-key"] === "console-access");
+  ok("x-opencode-session и в OAuth-режиме", viaAccount.sessionHeader === "x-opencode-session");
+  // Токен без рабочего пространства Zen отвергает: «Workspace selection is
+  // required». Выбранное при входе едет в x-org-id, как у самого opencode.
+  ok("без workspace x-org-id не выдумывается", viaAccount.headers["x-org-id"] === undefined);
+  creds.writeCredentials("opencode", { mode: "oauth", accessToken: "console-access", orgId: "wrk_1", expiresAt: Date.now() + 3600_000 });
+  ok("workspace едет в x-org-id", (await registry.resolveAuth("opencode")).headers["x-org-id"] === "wrk_1");
+  creds.writeCredentials("opencode", { mode: "apikey", accessToken: "sk-zen-key", orgId: "wrk_1" });
+  ok("ключу workspace не нужен", (await registry.resolveAuth("opencode")).headers["x-org-id"] === undefined);
 
   creds.writeCredentials("opencode", { mode: "apikey", accessToken: "sk-zen-key" });
   const auth = await registry.resolveAuth("opencode");
@@ -412,7 +469,7 @@ ok("отсутствующий файл не роняет импорт", creds.i
   // знает реестр, а не хост.
   const dialect = (m) => registry.protocolForModel(`opencode:${m}`);
   ok("GPT → /responses", dialect("gpt-5.5") === "responses", dialect("gpt-5.5"));
-  ok("codex-сборки туда же", dialect("gpt-5.3-codex") === "responses", dialect("gpt-5.3-codex"));
+  ok("GPT-5.3-сборки туда же", dialect("gpt-5.3-codex") === "responses", dialect("gpt-5.3-codex"));
   ok("Grok туда же", dialect("grok-4.6") === "responses", dialect("grok-4.6"));
   ok("Claude → /messages", dialect("claude-opus-5") === "anthropic", dialect("claude-opus-5"));
   ok("Qwen у Zen тоже /messages", dialect("qwen3.7-max") === "anthropic", dialect("qwen3.7-max"));
@@ -446,12 +503,14 @@ ok("отсутствующий файл не роняет импорт", creds.i
   // Хост перечисляет модели, но ни окна, ни цен, ни типов эндпоинтов в списке
   // нет — значит их проставляет клиент, и проверяется именно это.
   const probes = [];
+  const sentHeaders = [];
   const zen = http.createServer((req, res) => {
     if (req.method === "POST") {
       // Хост, отдающий каталог всем подряд: подтвердить ключ может только
       // эндпоинт запроса, и заголовок он читает свой для каждого пути.
       const key = req.headers["x-api-key"] ?? String(req.headers.authorization ?? "").replace(/^Bearer /, "");
       probes.push(req.url);
+      sentHeaders.push({ ua: req.headers["user-agent"], session: req.headers["x-opencode-session"] });
       const good = key === "sk-zen-key";
       res.writeHead(good ? 400 : 401, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ error: { message: good ? "messages must not be empty" : "Invalid API key." } }));
@@ -474,7 +533,12 @@ ok("отсутствующий файл не роняет импорт", creds.i
   // бы звать по сети, а этот набор офлайновый.
   creds.clearCredentials("kimi");
   const savedKey = loadConfig().apiKey;
-  saveConfig({ apiKey: "", providers: { opencode: { baseUrl: `http://127.0.0.1:${zen.address().port}` } } });
+  // Заголовки провайдера идут последними и в проверке ключа: хост, который
+  // узнаёт клиента по своему User-Agent, иначе откажет пробе на чужом основании.
+  saveConfig({
+    apiKey: "",
+    providers: { opencode: { baseUrl: `http://127.0.0.1:${zen.address().port}`, headers: { "User-Agent": "test-agent/1.0" } } },
+  });
 
   const models = await imp_models();
   const catalog = (await models.fetchModels({ force: true })).filter((m) => m.id.startsWith("opencode:"));
@@ -502,6 +566,15 @@ ok("отсутствующий файл не роняет импорт", creds.i
   const good = await client.verifyProvider("opencode");
   ok("верный ключ принят", good.ok === true, good.detail);
   ok("проверка ушла на эндпоинт первой модели", probes[0] === "/responses", probes.join());
+  ok("и несёт User-Agent провайдера, а не общий", sentHeaders[0]?.ua === "test-agent/1.0", JSON.stringify(sentHeaders[0]));
+  ok("и сессионный заголовок", Boolean(sentHeaders[0]?.session), JSON.stringify(sentHeaders[0]));
+  // Free-тир Zen читает сам id: не свой формат `ses_<12 hex><14 base62>` —
+  // и отказ, каким бы ни был ключ и тело.
+  ok(
+    "и в формате сессии opencode",
+    /^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$/.test(String(sentHeaders[0]?.session)),
+    String(sentHeaders[0]?.session),
+  );
 
   creds.writeCredentials("opencode", { mode: "apikey", accessToken: "sk-wrong" });
   const bad = await client.verifyProvider("opencode");
@@ -525,6 +598,17 @@ ok("отсутствующий файл не роняет импорт", creds.i
   const auth = await registry.resolveAuth("opencode-go");
   ok("свой префикс пути", auth.baseUrl === "https://opencode.ai/zen/go/v1", auth.baseUrl);
   ok("оба заголовка и здесь", auth.headers.Authorization === "Bearer sk-go-key" && auth.headers["x-api-key"] === "sk-go-key");
+
+  // Подписка Go — тоже аккаунт Console: тот же вход, свой хост и своя таблица
+  // диалектов. Учётка своя на файл: Console ротирует refresh-токен, и общий
+  // на двоих сломался бы у второго после первого же обновления.
+  ok("у Go тот же вход через аккаунт", def.oauth?.clientId === "opencode-cli" && def.oauth === registry.providerById("opencode").oauth);
+  creds.writeCredentials("opencode-go", { mode: "oauth", accessToken: "console-access", refreshToken: "r", expiresAt: Date.now() + 3600_000 });
+  const goAccount = await registry.resolveAuth("opencode-go");
+  ok("токен аккаунта — на zen/go/v1", goAccount.baseUrl === "https://opencode.ai/zen/go/v1", goAccount.baseUrl);
+  ok("в обоих заголовках", goAccount.headers.Authorization === "Bearer console-access" && goAccount.headers["x-api-key"] === "console-access");
+  ok("диалекты Go и под OAuth", registry.protocolForModel("opencode-go:qwen3.8-max") === "anthropic");
+  creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
 
   const go = (m) => registry.protocolForModel(`opencode-go:${m}`);
   ok("GPT и Grok → /responses", go("gpt-5.6-luna") === "responses" && go("grok-4.5") === "responses");
@@ -725,6 +809,145 @@ ok("отсутствующий файл не роняет импорт", creds.i
   saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
 }
 
+// ── 400 «only text parts on the gRPC path» — пиксели режем только из tool ──
+// Живой ответ шлюза на tool-сообщение с content-массивом: «HTTP 400 —
+// Upstream request failed: [invalid_request_error] tool message content part 1
+// is not text; only text parts are supported on the gRPC path». Слов «image» в
+// нём нет, зато сказано, где именно: шлюз принимает скриншот, вставленный в
+// чат, и отказывает только результату инструмента. Поэтому первый откат —
+// снять пиксели с tool-сообщений, оставив историю пользователя нетронутой.
+{
+  const seen = [];
+  let refused = false;
+  const host = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      seen.push(JSON.parse(body));
+      if (!refused) {
+        refused = true;
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(
+          JSON.stringify({
+            error: {
+              code: "invalid_request_error",
+              message:
+                "Upstream request failed: [invalid_request_error] tool message content part 1 is not text; only text parts are supported on the gRPC path (request_id: gw-7000a4e4d1bd-bc526)",
+            },
+          }),
+        );
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ choices: [{ message: { content: "ок" } }] }));
+    });
+  });
+  await new Promise((r) => host.listen(0, "127.0.0.1", r));
+
+  const savedKey = loadConfig().apiKey;
+  creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
+  saveConfig({ apiKey: "", providers: { "opencode-go": { baseUrl: `http://127.0.0.1:${host.address().port}` } } });
+
+  const client = await import("../dist/provider/client.js");
+  const model = "opencode-go:glm-5.3-flash";
+  const pasted = { data: "dXNlcg", mime: "image/png", width: 4, height: 4 };
+  const shot = { data: "dG9vbA", mime: "image/png", width: 4, height: 4 };
+  const messages = [
+    { role: "user", content: "вот скрин", images: [pasted] },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "c10", type: "function", function: { name: "read_image", arguments: "{}" } }],
+    },
+    { role: "tool", tool_call_id: "c10", name: "read_image", content: "гифка в приложении", images: [shot] },
+  ];
+
+  const res = await client.complete({ model, conversationId: "sess-grpc", messages });
+  const second = seen[1] ?? {};
+  const secondJson = JSON.stringify(second);
+  const toolMsgs = (second.messages ?? []).filter((m) => m.role === "tool");
+  const hoisted = (second.messages ?? []).find(
+    (m) => m.role === "user" && JSON.stringify(m.content ?? "").includes("dG9vbA"),
+  );
+
+  ok("ход пережил 400 gRPC-пути", res.content === "ок", JSON.stringify(res.content));
+  ok("запросов было два", seen.length === 2, String(seen.length));
+  ok("tool-сообщение стало чистым текстом", toolMsgs.length > 0 && toolMsgs.every((m) => typeof m.content === "string"), JSON.stringify(toolMsgs[0]?.content));
+  ok("пиксели инструмента не потеряны, а перенесены", Boolean(hoisted), secondJson.slice(0, 160));
+  ok("перенос подписан именем инструмента", /Output of|tool result/i.test(JSON.stringify(hoisted?.content ?? "")), JSON.stringify(hoisted?.content));
+  ok("вставленный скриншот остался", secondJson.includes("dXNlcg"), "dXNlcg stripped");
+  ok("модель не сочли слепой: пиксели дошли", !client.modelStripsImages(model));
+
+  const again = await client.complete({ model, conversationId: "sess-grpc", messages });
+  const third = seen[2] ?? {};
+  ok("следующий ход не платит за 400", again.content === "ок" && seen.length === 3, String(seen.length));
+  ok(
+    "перенос работает и в следующем ходе",
+    (third.messages ?? []).filter((m) => m.role === "tool").every((m) => typeof m.content === "string") &&
+      JSON.stringify(third).includes("dG9vbA") &&
+      JSON.stringify(third).includes("dXNlcg"),
+    JSON.stringify(third).slice(0, 160),
+  );
+
+  host.close();
+  creds.clearCredentials("opencode-go");
+  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
+}
+
+// ── 400 про reasoning_content — не повод выключать бюджет навсегда ───────
+// Отказ DeepSeek-овского thinking mode на проводе звучит как «The
+// `reasoning_content` в thinking mode должен быть возвращён» и содержит слово
+// reasoning. Прочитанный как жалоба на параметр бюджета, он записывал в конфиг
+// «модель не берёт reasoning-параметр» — и после этого бюджет молча не
+// отправлялся никогда, а футер продолжал показывать уровень.
+{
+  const seen = [];
+  const host = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      seen.push(JSON.parse(body));
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: {
+            code: "invalid_request_error",
+            message: "The `reasoning_content` in the thinking mode must be passed back to the API.",
+          },
+        }),
+      );
+    });
+  });
+  await new Promise((r) => host.listen(0, "127.0.0.1", r));
+
+  const savedKey = loadConfig().apiKey;
+  creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
+  saveConfig({ apiKey: "", providers: { "opencode-go": { baseUrl: `http://127.0.0.1:${host.address().port}` } } });
+
+  const client = await import("../dist/provider/client.js");
+  const model = "opencode-go:passback-probe";
+  let thrown = null;
+  try {
+    await client.complete({ model, conversationId: "sess-passback", effort: "high", messages: [{ role: "user", content: "hi" }] });
+  } catch (err) {
+    thrown = err;
+  }
+
+  ok("отказ всё равно возвращается наверх", thrown?.status === 400, String(thrown?.status));
+  // Один ресенд на обучение passback — и всё: второй отказ не считается
+  // жалобой на бюджет и не превращается в третью попытку без параметра.
+  ok("лишних запросов не было", seen.length === 2, String(seen.length));
+  ok(
+    "бюджет уходил в каждом запросе",
+    seen.every((b) => b.reasoning_effort === "high"),
+    JSON.stringify(seen.map((b) => b.reasoning_effort)),
+  );
+  ok("и модель не записана как брезгующая", !client.modelRejectsEffort(model));
+
+  host.close();
+  creds.clearCredentials("opencode-go");
+  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
+}
+
 // ── the authorize URL has to survive the shell ────────────────────────────
 {
   const { browserCommand } = await import("../dist/ui/login.js");
@@ -798,6 +1021,69 @@ ok("тело формой, как в RFC 8628", seen[0].contentType === "applica
 ok("client_id отправлен", seen[0].params.client_id === "test-client");
 ok("заголовки флоу дошли", seen[0].ua === "kimi-code/test");
 
+// OpenCode Console отдаёт ссылки путями ("/console/device?..."), а не URL —
+// открыть такое в браузере нельзя, пока не приложен хост, выдавший код.
+{
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    new Response(
+      JSON.stringify({
+        device_code: "d",
+        user_code: "TRKG-HPRJ",
+        verification_uri: "/console/device",
+        verification_uri_complete: "/console/device?user_code=TRKG-HPRJ&client_id=opencode-cli",
+        expires_in: 600,
+        interval: 5,
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } },
+    );
+  try {
+    let sent = "";
+    const fetchRel = globalThis.fetch;
+    globalThis.fetch = async (url, init) => ((sent = String(init?.body ?? "")), fetchRel(url, init));
+    const rel = await oauth.requestDeviceCode(registry.providerById("opencode").oauth);
+    globalThis.fetch = fetchRel;
+    ok("просим токен с workspace", new URLSearchParams(sent).get("supports_org_scope") === "true", sent);
+    ok("относительная ссылка достроена до хоста", rel.verificationUri === "https://opencode.ai/console/device", rel.verificationUri);
+    ok(
+      "и предзаполненная тоже",
+      rel.verificationUriComplete === "https://opencode.ai/console/device?user_code=TRKG-HPRJ&client_id=opencode-cli",
+      rel.verificationUriComplete,
+    );
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  // Список пространств — по имени, как выбирает сам opencode; токен — Bearer.
+  let orgAuth = "";
+  globalThis.fetch = async (url, init) => {
+    orgAuth = init?.headers?.Authorization ?? "";
+    return new Response(JSON.stringify([{ id: "wrk_b", name: "Beta" }, { id: "wrk_a", name: "Alpha" }]), { status: 200 });
+  };
+  try {
+    const orgs = await oauth.listOrgs(registry.providerById("opencode-go").oauth, "tok");
+    ok("пространства по алфавиту", orgs.map((o) => o.id).join() === "wrk_a,wrk_b", orgs.map((o) => o.id).join());
+    ok("список просится с токеном", orgAuth === "Bearer tok", orgAuth);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+
+  // Обновление токена не теряет выбранное пространство.
+  globalThis.fetch = async () => new Response(JSON.stringify({ access_token: "next", refresh_token: "r2", expires_in: 600 }), { status: 200 });
+  try {
+    const next = await oauth.refreshToken(registry.providerById("opencode").oauth, {
+      mode: "oauth",
+      accessToken: "old",
+      refreshToken: "r1",
+      orgId: "wrk_a",
+      orgName: "Alpha",
+    });
+    ok("workspace пережил refresh", next.orgId === "wrk_a" && next.orgName === "Alpha" && next.refreshToken === "r2");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
 const granted = await oauth.pollForToken(flow, code);
 ok("authorization_pending не считается ошибкой", polls === 2, `опросов: ${polls}`);
 ok("токен получен", granted.accessToken === "granted-token" && granted.refreshToken === "granted-refresh");
@@ -852,6 +1138,341 @@ try {
 creds.writeCredentials("kimi", { mode: "apikey", accessToken: "sk-platform-key" });
 ok("api-ключ не «обновляется»", (await registry.renewRejectedToken("kimi")) === false);
 ok("tokenrouter без oauth — false", (await registry.renewRejectedToken("tokenrouter")) === false);
+
+// ── Gemini: ключ через шим и аккаунт через Code Assist ─────────────────────
+{
+  const def = registry.providerById("gemini");
+  ok("Gemini есть в реестре", Boolean(def));
+  ok("google — его второе имя", registry.providerById("google")?.id === "gemini");
+  ok(
+    "база ключа — OpenAI-совместимый шим",
+    def.modes.apikey?.baseUrl === "https://generativelanguage.googleapis.com/v1beta/openai",
+    def.modes.apikey?.baseUrl,
+  );
+  ok("диалект ключа — chat completions", def.modes.apikey?.protocol === "openai");
+  ok("каталог ключа спрашивается у хоста", def.modes.apikey?.listModels === true);
+
+  // Аккаунт: OAuth клиента Gemini CLI, тот же host, что у самого CLI.
+  ok("аккаунт идёт в Code Assist", def.modes.oauth?.baseUrl === "https://cloudcode-pa.googleapis.com/v1internal", def.modes.oauth?.baseUrl);
+  ok("диалект аккаунта — gemini", def.modes.oauth?.protocol === "gemini");
+  ok("вход — браузерный PKCE", def.oauth?.kind === "web" && def.oauth?.clientId.startsWith("681255809395-"));
+  ok("redirect на свободный loopback-порт", def.oauth?.redirectUri === "http://127.0.0.1:{port}/oauth2callback", def.oauth?.redirectUri);
+  ok("scope — cloud-platform", /cloud-platform/.test(def.oauth?.scope ?? "") && /offline/.test(def.oauth?.params?.access_type ?? ""));
+  ok("предупреждение об ToS есть", /terms violation|terms/i.test(def.oauthWarning ?? ""), def.oauthWarning);
+  ok("ростер Code Assist непустой", (def.modes.oauth?.seed ?? []).some((m) => m.id.includes("gemini-3")));
+  ok("каталог Code Assist не запрашивается", def.modes.oauth?.listModels === false);
+
+  creds.writeCredentials("gemini", { mode: "apikey", accessToken: "AIza-test" });
+  const gem = await registry.resolveAuth("gemini");
+  ok("ключ уходит Bearer", gem.headers.Authorization === "Bearer AIza-test");
+  ok("диалект ключевой модели — openai", registry.protocolForModel("gemini:gemini-3.8-flash") === "openai");
+
+  creds.writeCredentials("gemini", { mode: "oauth", accessToken: "tok-gem", expiresAt: Date.now() + 3600_000 });
+  ok("диалект аккаунтной модели — gemini", registry.protocolForModel("gemini:gemini-3.1-pro-preview") === "gemini");
+  const ga = await registry.resolveAuth("gemini");
+  ok("аккаунт уходит Bearer", ga.headers.Authorization === "Bearer tok-gem");
+  ok("UA называет Gemini CLI", /GeminiCLI\//.test(ga.headers["User-Agent"] ?? ""), ga.headers["User-Agent"]);
+  creds.clearCredentials("gemini");
+}
+
+// ── Meta: опубликованный ростер знает и Wonder, и Spark 1.3 ───────────────
+{
+  creds.writeCredentials("meta", { mode: "apikey", accessToken: "meta-test" });
+  const ids = registry.seedModels("meta", "apikey").map((m) => m.id);
+  ok("Muse Wonder в опубликованном списке", ids.includes("meta:muse-wonder-1.0"), ids.join(", "));
+  ok("Muse Spark 1.3 в списке", ids.includes("meta:muse-spark-1.3"), ids.join(", "));
+  ok("Muse Wonder идёт на Responses", registry.protocolForModel("meta:muse-wonder-1.0") === "responses");
+  ok("Muse Spark 1.3 идёт на Responses", registry.protocolForModel("meta:muse-spark-1.3") === "responses");
+  creds.clearCredentials("meta");
+}
+
+// ── OpenAI: ключ на платформе и подписка ChatGPT ──────────────────────────
+{
+  const def = registry.providerById("openai");
+  ok("OpenAI есть в реестре", Boolean(def));
+  ok("chatgpt — его второе имя", registry.providerById("chatgpt")?.id === "openai");
+  ok("ключ идёт на платформу", def.modes.apikey?.baseUrl === "https://api.openai.com/v1");
+  ok("подписка — на бэкенд ChatGPT", def.modes.oauth?.baseUrl === "https://chatgpt.com/backend-api/codex");
+  ok("вход браузерный, PKCE", def.oauth?.kind === "web" && /^app_/.test(def.oauth?.clientId ?? ""));
+  ok("callback на порту из allow-list", def.oauth?.redirectUri === "http://127.0.0.1:1455/auth/callback", def.oauth?.redirectUri);
+  ok("и запасной порт из того же списка", def.oauth?.fallbackRedirectUris?.[0] === "http://127.0.0.1:1457/auth/callback");
+  ok("аккаунт носится заголовком", def.oauth?.accountHeader === "ChatGPT-Account-Id");
+  ok("бэкенд отвечает только стримом", def.modes.oauth?.streamOnly === true);
+  ok("каталог просит client_version", def.modes.oauth?.catalog?.query === "client_version=1.0.0");
+
+  creds.writeCredentials("openai", {
+    mode: "oauth",
+    accessToken: "chatgpt-access",
+    refreshToken: "chatgpt-refresh",
+    orgId: "acc_123",
+    expiresAt: Date.now() + 3600_000,
+  });
+  const a = await registry.resolveAuth("openai");
+  ok(
+    "клиент называет себя так, как требует бэкенд",
+    a.headers.originator === "codex_cli_rs" && /^codex_cli_rs\//.test(a.headers["User-Agent"] ?? ""),
+    `${a.headers.originator} / ${a.headers["User-Agent"]}`,
+  );
+  ok("бета Responses запрошена", a.headers["OpenAI-Beta"] === "responses=experimental");
+  ok("аккаунт из токена — в заголовке", a.headers["ChatGPT-Account-Id"] === "acc_123");
+  ok("разговор едет под своим именем", def.modes.oauth?.sessionHeaders?.[0] === "session-id", String(def.modes.oauth?.sessionHeaders));
+  creds.clearCredentials("openai");
+}
+
+// ── браузерный OAuth: PKCE, loopback-callback, аккаунт из JWT ─────────────
+{
+  const seen = [];
+  const host = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      if (!req.url.startsWith("/token")) {
+        res.writeHead(404).end();
+        return;
+      }
+      const asJson = String(req.headers["content-type"] ?? "").includes("json");
+      const params = asJson ? JSON.parse(body || "{}") : Object.fromEntries(new URLSearchParams(body));
+      seen.push({ path: req.url, contentType: String(req.headers["content-type"]), params });
+      res.writeHead(200, { "Content-Type": "application/json" });
+      if (params.grant_type === "refresh_token") {
+        return res.end(JSON.stringify({ access_token: "at-2", refresh_token: "rt-2", expires_in: 900 }));
+      }
+      const claims = Buffer.from(
+        JSON.stringify({
+          "https://api.openai.com/auth": { chatgpt_account_id: "acc_jwt", chatgpt_plan_type: "plus" },
+          exp: Math.floor(Date.now() / 1000) + 3600,
+        }),
+      ).toString("base64url");
+      res.end(JSON.stringify({ access_token: "at-1", refresh_token: "rt-1", id_token: `x.${claims}.y` }));
+    });
+  });
+  await new Promise((r) => host.listen(0, "127.0.0.1", r));
+  const base = `http://127.0.0.1:${host.address().port}`;
+
+  // Два порта: основной занимает «чужой login», запасной отдаётся нам —
+  // 1457 страхует занятый 1455.
+  const freePort = async () => {
+    const s = http.createServer(() => {});
+    await new Promise((r) => s.listen(0, "127.0.0.1", r));
+    const p = s.address().port;
+    await new Promise((r) => s.close(r));
+    return p;
+  };
+  const callbackPort = await freePort();
+  const altPort = await freePort();
+
+  const cfg = {
+    // Настоящая конфигурация подписки, только хосты подменены: проверяются и её
+    // client_id, scope, параметры страницы и JSON на refresh.
+    ...registry.providerById("openai").oauth,
+    authorizeUrl: `${base}/authorize`,
+    tokenUrl: `${base}/token`,
+    redirectUri: `http://127.0.0.1:${callbackPort}/auth/callback`,
+    fallbackRedirectUris: [`http://127.0.0.1:${altPort}/auth/callback`],
+  };
+  const altUri = cfg.fallbackRedirectUris[0];
+
+  const squatter = http.createServer(() => {});
+  await new Promise((r) => squatter.listen(callbackPort, "127.0.0.1", r));
+
+  let page = "";
+  const login = oauth.webLogin(cfg, {
+    onUrl: (url) => {
+      page = url;
+      const state = new URL(url).searchParams.get("state");
+      // «Браузер»: человек подтверждает, хост редиректит на наш порт.
+      setTimeout(() => {
+        fetch(`${altUri}?code=code-1&state=${state}`).catch(() => {});
+      }, 10);
+    },
+  });
+  const got = await login;
+
+  const authorize = new URL(page);
+  ok("страница ведёт на authorize хоста", authorize.pathname === "/authorize");
+  ok("PKCE объявлен как S256", authorize.searchParams.get("code_challenge_method") === "S256");
+  ok("challenge непустой", (authorize.searchParams.get("code_challenge") ?? "").length > 20);
+  ok("занятый порт обойдён запасным", authorize.searchParams.get("redirect_uri") === altUri, authorize.searchParams.get("redirect_uri"));
+  ok(
+    "scope с коннекторами",
+    authorize.searchParams.get("scope") === "openid profile email offline_access api.connectors.read api.connectors.invoke",
+    authorize.searchParams.get("scope"),
+  );
+  ok("client_id — тот же, что у вендорного CLI", authorize.searchParams.get("client_id") === "app_EMoamEEZ73f0CkXaXp7hrann");
+  ok("упрощённый вход запрошен", authorize.searchParams.get("codex_cli_simplified_flow") === "true");
+  ok("токен получен", got.accessToken === "at-1" && got.refreshToken === "rt-1");
+  ok("аккаунт вычитан из id_token", got.orgId === "acc_jwt", String(got.orgId));
+  ok("план попал в имя аккаунта", got.orgName === "plus", String(got.orgName));
+  ok("срок взят из JWT exp", typeof got.expiresAt === "number" && got.expiresAt > Date.now() + 3_500_000);
+  const exchange = seen[0];
+  ok("обмен кода — формой", exchange.contentType.includes("x-www-form-urlencoded"), exchange.contentType);
+  ok("grant_type authorization_code", exchange.params.grant_type === "authorization_code");
+  ok("verifier доехал", (exchange.params.code_verifier ?? "").length > 20);
+  ok("redirect_uri в обмене тот же", exchange.params.redirect_uri === altUri, exchange.params.redirect_uri);
+
+  const refreshed = await oauth.refreshToken(cfg, got);
+  ok("refresh уходит JSON-ом", seen[1].contentType.includes("json"), seen[1].contentType);
+  ok("grant_type refresh_token", seen[1].params.grant_type === "refresh_token");
+  ok("scope на refresh не переспрашивается", seen[1].params.scope === undefined, String(seen[1].params.scope));
+  ok("новый access сохранён", refreshed.accessToken === "at-2" && refreshed.refreshToken === "rt-2");
+  ok("аккаунт пережил refresh", refreshed.orgId === "acc_jwt" && refreshed.orgName === "plus");
+
+  // Оба порта заняты (второй вход или чужой CLI) — это отказ на старте, а
+  // не пятиминутное ожидание.
+  const second = http.createServer(() => {});
+  await new Promise((r) => second.listen(altPort, "127.0.0.1", r));
+  let busy = "";
+  try {
+    await oauth.webLogin(cfg, {});
+  } catch (err) {
+    busy = err.code;
+  } finally {
+    squatter.close();
+    second.close();
+    host.close();
+  }
+  ok("занятые порты — внятная ошибка", busy === "listen_failed", busy);
+}
+
+// ── провод подписки: заголовки, store:false, только стрим ────────────────
+{
+  const calls = [];
+  const api = http.createServer((req, res) => {
+    let body = "";
+    req.on("data", (d) => (body += d));
+    req.on("end", () => {
+      calls.push({ url: req.url, headers: req.headers, body: JSON.parse(body || "{}") });
+      res.writeHead(200, { "Content-Type": "text/event-stream" });
+      const ev = (o) => res.write(`event: ${o.type}\ndata: ${JSON.stringify(o)}\n\n`);
+      ev({ type: "response.output_text.delta", delta: "готово" });
+      ev({
+        type: "response.completed",
+        response: { status: "completed", usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } },
+      });
+      res.end();
+    });
+  });
+  await new Promise((r) => api.listen(0, "127.0.0.1", r));
+  const savedKey = loadConfig().apiKey;
+
+  creds.writeCredentials("openai", {
+    mode: "oauth",
+    accessToken: "at-wire",
+    refreshToken: "rt-wire",
+    orgId: "acc_wire",
+    expiresAt: Date.now() + 3600_000,
+  });
+  saveConfig({ apiKey: "", providers: { openai: { baseUrl: `http://127.0.0.1:${api.address().port}` } } });
+
+  const client = await import("../dist/provider/client.js");
+  // complete() — нестримовый вход, но хост нестримовых не принимает.
+  const res = await client.complete({
+    model: "openai:gpt-5.3-codex",
+    conversationId: "sess-chatgpt",
+    messages: [
+      { role: "system", content: "системный промпт" },
+      { role: "user", content: "привет" },
+    ],
+  });
+
+  ok("ответ собран из стрима", res.content === "готово", res.content);
+  const call = calls[0];
+  ok("путь — /responses", call.url === "/responses", call.url);
+  ok("стрим включён", call.body.stream === true);
+  ok("store выключен", call.body.store === false);
+  ok("max_output_tokens не отправляется", !("max_output_tokens" in call.body), JSON.stringify(call.body));
+  ok("параллельные вызовы разрешены", call.body.parallel_tool_calls === true);
+  ok(
+    "prompt_cache_key = все три session-заголовка",
+    typeof call.body.prompt_cache_key === "string" &&
+      call.body.prompt_cache_key === call.headers["session-id"] &&
+      call.body.prompt_cache_key === call.headers["thread-id"] &&
+      call.body.prompt_cache_key === call.headers["x-client-request-id"],
+    `${call.body.prompt_cache_key} / ${call.headers["session-id"]} / ${call.headers["thread-id"]}`,
+  );
+  ok("аккаунт в заголовке", call.headers["chatgpt-account-id"] === "acc_wire", String(call.headers["chatgpt-account-id"]));
+  ok("UA подменён на клиентский", String(call.headers["user-agent"]).startsWith("codex_cli_rs/"), String(call.headers["user-agent"]));
+  ok("системный промпт ушёл в instructions", call.body.instructions === "системный промпт");
+
+  api.close();
+  creds.clearCredentials("openai");
+  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
+}
+
+// ── 503 «Endpoint is unavailable» переживается сам ─────────────────────────
+// Живой случай: прокси на минуту отдал 503 Upstream request failed, а клиент
+// сдался через три быстрых попытки и вернул ошибку — человеку пришлось вручную
+// повторять тот же промпт. Теперь попыток десять с паузой в десять секунд, и
+// каждая пауза объявляется в колбэк, чтобы терминал не выглядел зависшим.
+{
+  const cfgNow = loadConfig();
+  ok(
+    "по умолчанию десять попыток по десять секунд",
+    cfgNow.upstreamRetries === 10 && cfgNow.upstreamRetryDelayMs === 10_000,
+    `${cfgNow.upstreamRetries}/${cfgNow.upstreamRetryDelayMs}`,
+  );
+
+  const realFetch = globalThis.fetch;
+  const savedKey = loadConfig().apiKey;
+  const waits = [];
+  let attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    if (attempts <= 3) {
+      return new Response(
+        JSON.stringify({ error: { message: "Upstream request failed: Endpoint is unavailable." } }),
+        { status: 503, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(
+      JSON.stringify({ choices: [{ message: { content: "ок" } }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  };
+  saveConfig({ apiKey: "sk-test", upstreamRetries: 10, upstreamRetryDelayMs: 1 });
+  try {
+    const client = await import("../dist/provider/client.js");
+    const res = await client.complete({
+      model: "gpt-5.3-codex",
+      messages: [{ role: "user", content: "привет" }],
+      onRetryWait: (waitMs, attempt, of, said) => waits.push({ waitMs, attempt, of, said }),
+    });
+    ok("503 переживается сам, ответ доходит", res.content === "ок", JSON.stringify(res));
+    ok("четыре запроса: отказ и три повтора", attempts === 4, String(attempts));
+    ok("пауза объявлена трижды", waits.length === 3, JSON.stringify(waits));
+    ok("номера попыток по порядку", waits.map((w) => w.attempt).join(",") === "1,2,3", JSON.stringify(waits));
+    ok("счётчик знает предел", waits.every((w) => w.of === 10), JSON.stringify(waits[0]));
+    ok("причина названа", /Endpoint is unavailable/.test(waits[0].said), waits[0].said);
+  } finally {
+    globalThis.fetch = realFetch;
+    saveConfig({ apiKey: savedKey, upstreamRetries: 10, upstreamRetryDelayMs: 10_000 });
+  }
+
+  // Исчерпанные попытки — это по-прежнему ошибка, а не бесконечное ожидание.
+  attempts = 0;
+  globalThis.fetch = async () => {
+    attempts++;
+    return new Response(JSON.stringify({ error: { message: "Upstream request failed: Endpoint is unavailable." } }), {
+      status: 503,
+      headers: { "content-type": "application/json" },
+    });
+  };
+  saveConfig({ apiKey: "sk-test", upstreamRetries: 2, upstreamRetryDelayMs: 1 });
+  try {
+    const client = await import("../dist/provider/client.js");
+    let failed = null;
+    try {
+      await client.complete({ model: "gpt-5.3-codex", messages: [{ role: "user", content: "привет" }] });
+    } catch (err) {
+      failed = err;
+    }
+    ok("после лимита ошибка возвращается", failed?.status === 503, String(failed?.status));
+    ok("и запросов ровно на одну попытку больше", attempts === 3, `${attempts} / ${failed?.message}`);
+  } finally {
+    globalThis.fetch = realFetch;
+    saveConfig({ apiKey: savedKey, upstreamRetries: 10, upstreamRetryDelayMs: 10_000 });
+  }
+}
 
 // ── cleanup ───────────────────────────────────────────────────────────────
 try {

@@ -8,7 +8,7 @@
  */
 import type { ModelInfo } from "../types.js";
 
-export type Protocol = "openai" | "responses" | "anthropic" | "unsupported";
+export type Protocol = "openai" | "responses" | "anthropic" | "gemini" | "unsupported";
 
 const byModel = new Map<string, Protocol>();
 
@@ -26,6 +26,10 @@ export function protocolOfEndpoints(e: string[]): Protocol {
   if (!e.length) return "openai"; // no metadata — assume the common case
   if (e.includes("openai")) return "openai";
   if (e.includes("openai-response")) return "responses";
+  // Google's own shape behind Code Assist, which is not the public Gemini API
+  // nor the OpenAI shim. A bare `gemini` endpoint is the native generateContent
+  // route the gateways serve, and stays unsupported here.
+  if (e.includes("gemini-codeassist")) return "gemini";
   if (e.some((x) => x.startsWith("anthropic"))) return "anthropic";
   return "unsupported";
 }

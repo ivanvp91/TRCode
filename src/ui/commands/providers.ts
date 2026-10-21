@@ -8,9 +8,11 @@ import { latestRelease, isNewer, applyUpdate } from "../../update.js";
 import { fetchModels } from "../../provider/models.js";
 import { DEFAULT_PROVIDER, modeConfig, modeFor, providerById, providerLabel, providers, providerState, rememberBaseUrl, rememberProviderState, type ProviderDef } from "../../provider/registry.js";
 import { clearCredentials } from "../../provider/credentials.js";
+import { LIGHT_BUDGET, MEDIUM_BUDGET } from "../../session/compact.js";
 import { chooseHost, loginProvider } from "../login.js";
 import { t, count, t as tr } from "../../i18n.js";
 import type { App } from "../repl.js";
+import { escWatch } from "../turnbar.js";
 import { currentProviderId, providerModels, defaultModelFor, setModel, warnIfIncompatible } from "./shared.js";
 
 /** Records where the session currently is, so coming back restores it. */
@@ -78,11 +80,20 @@ export async function switchToProvider(app: App, def: ProviderDef): Promise<void
  */
 export async function refreshCatalog(app: App, opts: { quiet?: boolean } = {}): Promise<void> {
   const before = app.catalog.length;
-  const sp = new Spinner(t("refreshing the model catalog", "обновляю каталог моделей"));
+  const sp = new Spinner(t("refreshing the model catalog", "обновляю каталог моделей"), { escape: true });
   sp.start();
+  // A host that does not answer leaves this on screen indefinitely, and the
+  // refresh runs outside a turn: without its own listener Esc did nothing.
+  const ac = new AbortController();
+  const releaseEsc = escWatch(() => ac.abort());
   try {
-    app.catalog = await fetchModels({ force: true });
+    app.catalog = await fetchModels({ force: true, signal: ac.signal });
+  } catch (err) {
+    if (!ac.signal.aborted) throw err;
+    warn(t("Catalog refresh cancelled.", "Обновление каталога отменено."));
+    return;
   } finally {
+    releaseEsc();
     sp.stop();
   }
   app.rebuildTools();
@@ -163,6 +174,8 @@ export async function settingsModal(app: App): Promise<void> {
     { key: "speed", label: t("output speed", "скорость вывода"), example: "27 tok/s avg" },
   ];
   const updatesOn = cfg.updateCheck !== false;
+  const autoCompactOn = cfg.autoCompact !== false;
+  const level = (n: number) => `${Math.round(n * 100)}%`;
   const skillsOn = cfg.skillsEnabled === true;
   const skillAutoOn = skillsOn && cfg.skillAuto !== false;
   const uilibAutoOn = cfg.uilibAuto !== false;
@@ -206,6 +219,25 @@ export async function settingsModal(app: App): Promise<void> {
       ),
       badge: favAllOn ? c.brightGreen(t("on", "вкл")) : c.gray(t("off", "выкл")),
     },
+    {
+      header: t("Context", "Контекст"),
+      value: "__hdr-context",
+      label: "",
+    },
+    {
+      value: "autoCompact",
+      label: t(
+        "compact the history automatically as the window fills",
+        "сжимать историю самому по мере заполнения окна",
+      ),
+      hint: c.dim(
+        t(
+          `trim ×${LIGHT_BUDGET} at ${level(cfg.autoCompactLightAt)}, digest ×${MEDIUM_BUDGET} at ${level(cfg.autoCompactMediumAt)}, full at ${level(cfg.autoCompactAt)} · /compact auto off`,
+          `сокращение ×${LIGHT_BUDGET} с ${level(cfg.autoCompactLightAt)}, конспект ×${MEDIUM_BUDGET} с ${level(cfg.autoCompactMediumAt)}, полное с ${level(cfg.autoCompactAt)} · /compact auto off`,
+        ),
+      ),
+      badge: autoCompactOn ? c.brightGreen(t("on", "вкл")) : c.gray(t("off", "выкл")),
+    },
     { header: t("Status line", "Строка состояния"), value: "__hdr-status", label: "" },
     ...fields.map((f) => ({
       value: `status:${f.key}`,
@@ -237,6 +269,7 @@ export async function settingsModal(app: App): Promise<void> {
       ...(skillAutoOn ? ["skillAuto"] : []),
       ...(uilibAutoOn ? ["uilibAuto"] : []),
       ...(favAllOn ? ["favoritesAllProviders"] : []),
+      ...(autoCompactOn ? ["autoCompact"] : []),
       ...fields.filter((f) => cfg.statusFields[f.key] !== false).map((f) => `status:${f.key}`),
       ...(updatesOn ? ["updateCheck"] : []),
     ],
@@ -249,6 +282,7 @@ export async function settingsModal(app: App): Promise<void> {
   app.cfg = saveConfig({
     statusFields: next,
     updateCheck: picked.includes("updateCheck"),
+    autoCompact: picked.includes("autoCompact"),
     // Auto-selection lives only while the skills take part in requests at all:
     // an ⚡ injection without them would be a body nobody asked to see.
     skillAuto: skillsOn && picked.includes("skillAuto"),
@@ -257,12 +291,61 @@ export async function settingsModal(app: App): Promise<void> {
   });
   const shown = STATUS_FIELDS.filter((k) => next[k]).length;
   const upd = picked.includes("updateCheck");
+  const compact = picked.includes("autoCompact");
   success(
     t(
-      `Saved: skills ${picked.includes("skillAuto") ? "on" : "off"}, UI library ${picked.includes("uilibAuto") ? "on" : "off"}, favorites ${picked.includes("favoritesAllProviders") ? "all providers" : "current provider"}, ${shown} of ${STATUS_FIELDS.length} status fields, update check ${upd ? "on" : "off"}.`,
-      `Сохранено: навыки ${picked.includes("skillAuto") ? "вкл" : "выкл"}, UI-библиотека ${picked.includes("uilibAuto") ? "вкл" : "выкл"}, избранное ${picked.includes("favoritesAllProviders") ? "со всех поставщиков" : "только текущий поставщик"}, полей статуса ${shown} из ${STATUS_FIELDS.length}, проверка обновлений ${upd ? "вкл" : "выкл"}.`,
+      `Saved: skills ${picked.includes("skillAuto") ? "on" : "off"}, UI library ${picked.includes("uilibAuto") ? "on" : "off"}, favorites ${picked.includes("favoritesAllProviders") ? "all providers" : "current provider"}, auto-compact ${compact ? "on" : "off"}, ${shown} of ${STATUS_FIELDS.length} status fields, update check ${upd ? "on" : "off"}.`,
+      `Сохранено: навыки ${picked.includes("skillAuto") ? "вкл" : "выкл"}, UI-библиотека ${picked.includes("uilibAuto") ? "вкл" : "выкл"}, избранное ${picked.includes("favoritesAllProviders") ? "со всех поставщиков" : "только текущий поставщик"}, автосжатие ${compact ? "вкл" : "выкл"}, полей статуса ${shown} из ${STATUS_FIELDS.length}, проверка обновлений ${upd ? "вкл" : "выкл"}.`,
     ),
   );
+}
+
+// ── /compact auto ─────────────────────────────────────────────────────────
+
+/**
+ * The auto-compaction switch, without opening the settings panel.
+ *
+ * With no argument it reports the ladder, because "when will it touch my
+ * history" is the question the command raises, and the thresholds are far
+ * easier to read here than in config.json.
+ */
+export function setAutoCompact(app: App, arg: string): void {
+  const cfg = loadConfig();
+  const word = arg.trim().toLowerCase();
+  const want = /^(on|вкл|true|yes|1)$/.test(word) ? true : /^(off|выкл|false|no|0)$/.test(word) ? false : undefined;
+  const pct = (n: number) => `${Math.round(n * 100)}%`;
+  if (want === undefined) {
+    if (word) {
+      return warn(
+        t(`Unknown value "${arg.trim()}" — use /compact auto on|off.`, `Неизвестное значение «${arg.trim()}» — используйте /compact auto on|off.`),
+      );
+    }
+    const on = cfg.autoCompact !== false;
+    const left = app.session.autoCompacts;
+    info(
+      t(
+        `Auto-compaction is ${on ? "on" : "off"}: trims old tool output at ${pct(cfg.autoCompactLightAt)} (up to ${LIGHT_BUDGET} per cycle), digests with the working tail kept at ${pct(cfg.autoCompactMediumAt)} (up to ${MEDIUM_BUDGET}), full handoff at ${pct(cfg.autoCompactAt)}. This cycle: ${left.light}/${LIGHT_BUDGET} trims, ${left.medium}/${MEDIUM_BUDGET} digests — a full pass starts a new cycle.`,
+        `Автосжатие ${on ? "включено" : "выключено"}: сокращение старых результатов с ${pct(cfg.autoCompactLightAt)} (до ${LIGHT_BUDGET} раз за цикл), конспект с сохранением рабочего хвоста с ${pct(cfg.autoCompactMediumAt)} (до ${MEDIUM_BUDGET} раз), полная сводка с ${pct(cfg.autoCompactAt)}. В этом цикле: ${left.light}/${LIGHT_BUDGET} сокращений, ${left.medium}/${MEDIUM_BUDGET} конспектов — полная сводка начинает новый цикл.`,
+      ),
+    );
+    return;
+  }
+  app.cfg = saveConfig({ autoCompact: want });
+  if (want) {
+    success(
+      t(
+        `Auto-compaction on: trim at ${pct(cfg.autoCompactLightAt)}, digest at ${pct(cfg.autoCompactMediumAt)}, full at ${pct(cfg.autoCompactAt)}.`,
+        `Автосжатие включено: сокращение с ${pct(cfg.autoCompactLightAt)}, конспект с ${pct(cfg.autoCompactMediumAt)}, полное с ${pct(cfg.autoCompactAt)}.`,
+      ),
+    );
+  } else {
+    warn(
+      t(
+        "Auto-compaction off — the history will grow until the host refuses it. /compact still works by hand.",
+        "Автосжатие выключено — история будет расти, пока хост не откажет. /compact по-прежнему работает вручную.",
+      ),
+    );
+  }
 }
 
 // ── /update ───────────────────────────────────────────────────────────────

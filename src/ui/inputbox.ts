@@ -16,7 +16,11 @@ export interface StatusInfo {
   provider?: string;
   model: string;
   effort: string;
-  /** This model rejected the reasoning parameter, so it is being dropped. */
+  /**
+   * This model rejected the reasoning parameter, so it is being dropped — and
+   * a level nothing receives is not state: the segment is left out rather than
+   * advertising a budget the turn does not run at.
+   */
   effortIgnored?: boolean;
   cwdLabel: string;
   contextUsed: number;
@@ -44,12 +48,12 @@ export function composeStatus(s: StatusInfo): EditorStatus {
     s.mode ? c.brightYellow(s.mode) : "",
     s.provider ? c.brightBlue(s.provider) : "",
     c.brightCyan(bareModel),
-    c.gray(t("thinking: ", "мышление: ")) +
-      (s.effort === "off"
-        ? c.dim("off")
-        : s.effortIgnored
-          ? c.dim(s.effort + t(" (unsupported)", " (не поддерживается)"))
-          : c.brightMagenta(s.effort)),
+    // "thinking: high" beside a model that never gets the parameter reads as if
+    // the turn runs at high effort. /effort says it was dropped when it is set;
+    // the row states what is true of this turn, so it omits the level entirely.
+    s.effortIgnored
+      ? ""
+      : c.gray(t("thinking: ", "мышление: ")) + (s.effort === "off" ? c.dim("off") : c.brightMagenta(s.effort)),
   ]
     .filter(Boolean)
     .join("  ");

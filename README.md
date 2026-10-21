@@ -13,8 +13,9 @@
 agent in the spirit of Claude Code, with live model switching, subagents, skills and
 token accounting.
 
-One client, ten providers: the TokenRouter catalog, Kimi, Anthropic, OpenRouter,
-OpenCode Zen, OpenCode Go, Meta (Muse), Alibaba Cloud (Qwen), xAI (Grok) and Z.AI —
+One client, twelve providers: the TokenRouter catalog, Kimi, Anthropic, OpenRouter,
+OpenCode Zen, OpenCode Go, OpenAI (a ChatGPT subscription or a platform key), Google Gemini,
+Meta (Muse), Alibaba Cloud (Qwen), xAI (Grok) and Z.AI —
 subscriptions and API keys side by side, each model served on the wire protocol its
 vendor speaks (OpenAI chat, Responses and Anthropic Messages), with reasoning effort and
 prompt caching shaped per host.
@@ -54,7 +55,7 @@ and quotes, so invisible terminal noise never ends up inside it.
 
 TokenRouter is the default, but the platform is cross-platform by design: a model can be
 reached at its own vendor instead — useful when you already pay for a subscription there
-and would rather spend the plan than the router's per-token price. Ten providers are
+and would rather spend the plan than the router's per-token price. Twelve providers are
 built in, and each remembers its own model, reasoning budget and host.
 
 ```bash
@@ -64,6 +65,8 @@ trc auth login --provider claude        # Anthropic console key
 trc auth login --provider openrouter    # OpenRouter key (sk-or-…)
 trc auth login --provider opencode      # OpenCode Zen key; /login zen works too
 trc auth login --provider opencode-go   # the Go subscription; /login go works too
+trc auth login --provider openai        # ChatGPT subscription or an API key
+trc auth login --provider gemini        # Google AI Studio key, or the account login (risky)
 trc auth login --provider alibabacloud  # QwenCloud key; asks which host it is for
 trc auth login --provider xai           # SuperGrok subscription or a console.x.ai key
 trc auth login --provider meta          # Meta Model API key (Muse); /login muse works too
@@ -81,9 +84,20 @@ rather than for a router key.
 
 The subscription path is an OAuth 2.0 device flow (RFC 8628): the CLI prints a URL and
 a code, you approve them in a browser on any machine, and the access token is renewed
-automatically from then on. If the vendor's own CLI is already logged in on this
+automatically from then on. A host with no device grant (OpenAI's ChatGPT sign-in) uses
+authorization code + PKCE instead: the CLI listens on a loopback port, opens the page,
+and finishes the login when the browser redirects back — so that browser has to run on
+the same machine. If the vendor's own CLI is already logged in on this
 machine, that session is picked up instead of asking you to authorize twice — pass
-`--fresh` to force a new authorization.
+`--fresh` to force a new authorization. OpenAI is the exception: the subscription
+server rotates the refresh token on every use, so sharing its file would sign the
+vendor CLI out — the browser sign-in keeps its own.
+
+Two of these logins wear the vendor's own client. Gemini's account path is Gemini CLI's
+OAuth client against Code Assist, and Meta's reuses the session `muse login` left behind.
+Both vendors scope those credentials to their own CLI, and Google has suspended accounts
+for exactly this since February 2026 — the CLI prints that warning before opening the
+browser. Their API-key paths are the supported ones.
 
 Models from a direct provider carry its name as a prefix and group under it in `/model`:
 
@@ -366,7 +380,8 @@ insert, Esc to dismiss. `/help` prints the full reference.
 | `/orchestrate resume \| status \| replan <instructions>` | continue saved work, inspect its plan, or revise unfinished steps |
 | `/swarm <task>` | several models solve it in parallel, then a synthesis pass |
 | `/swarm` | the roster panel: who runs, who merges the answers; `/swarm models` picks them |
-| `/compact [focus]` | compact the history into a structured digest |
+| `/compact [focus]` | compact into a handoff summary, keeping recent user messages |
+| `/compact auto [on\|off]` | switch auto-compaction off or on, or report the thresholds |
 | `/rewind [last]` | put files back to how they were before a turn |
 | `/yolo [on\|off]` | skip confirmations — tools run immediately (also Shift+Tab) |
 | `/goal <objective> [--turns <n>]` | set a persistent goal the agent keeps working toward — see [Working toward a goal](#working-toward-a-goal) |
@@ -640,9 +655,12 @@ Choosing one does not commit you to it. A card shows the size, then three button
 bloated history does not cost full price on the very first turn. **Back to the list**
 returns to the picker rather than dropping you back at the prompt.
 
-Then the last few turns are replayed as real markdown — tables aligned into columns, code
-fences kept as blocks, long turns cut off with a line count. A compacted session shows its
-digest as a labelled block instead of raw XML:
+Then the whole session is replayed, each message through the renderer the live transcript
+used: prompts as you sent them, answers as real markdown — tables aligned into columns, code
+fences kept as blocks — and every tool call under the name and target it ran with, followed
+by the first lines of its output. Nothing is folded into a "last four turns" list, because a
+resumed session that starts mid-conversation is a session you have to read twice. A compacted
+session shows its digest as a labelled block instead of raw XML:
 
 ```
    ───────────────  resumed · 202608011349-e115a0  ───────────────
@@ -659,6 +677,11 @@ digest as a labelled block instead of raw XML:
    ────────┼───────┼──────────┼───────
    Free    │ 0     │ 3        │ 5 min
    Starter │ 9.99  │ 10       │ 30 sec
+
+   ● Read(pricing.php)
+       └ 1  <?php
+         2  $plans = [
+         … +118 lines (ctrl+o to expand)
 ```
 
 `/sessions` is the same list with four actions instead of two — **Continue · Rename ·
@@ -787,13 +810,45 @@ Tool output is also bounded at the source: `shell` keeps the first 20k character
 **last** 20k, marking what it dropped in between. Cutting only at the head loses the
 summary line a test run exists for, and the model then reruns the command to see it.
 
-The second safeguard is auto-compaction: past `autoCompactAt` of the context window (0.9 by
-default) the history is digested. It used to also fire at twice `maxRequestTokens`, which
+The second safeguard is auto-compaction, and it runs as a ladder — the cheap losses
+first, the lossy one only when the window is nearly gone. It is checked twice, before a
+turn and again between tool rounds, because a turn that reads a hundred files overflows
+inside itself, not between prompts:
+
+| Share of the window | What happens | What it costs |
+| --- | --- | --- |
+| `autoCompactLightAt` (0.25) | old tool output shrinks to a stub, old thinking is dropped; the last few turns are untouched | no model call, nothing thrown away that cannot be re-read |
+| `autoCompactMediumAt` (0.5) | older history becomes a handoff summary; the working tail (last ~12 messages) stays verbatim | one summariser call, the tail survives |
+| `autoCompactAt` (0.9) | full compaction: a handoff summary plus the recent **user** messages verbatim (up to 20k tokens) | one summariser call, assistant turns and tool traffic are gone |
+
+Each rung is rationed per cycle — **3 light passes and 2 medium ones**, then the ladder
+waits for the next threshold instead of repeating a rung that has had its chances. Without
+that, a history hovering just above 25% would be trimmed on every turn and never reach 50%.
+Three is where the maths lands: a light pass can only reclaim tool output that has aged out
+of the kept tail, so the number of passes needed to climb from 25% to 50% is `1/(1−φ)` for a
+tool share φ — with coding turns at roughly φ ≈ 2/3 that is 3. Two mediums is one effective
+pass plus a retry; a medium pass at the 50% mark frees about a third of the window, so a
+third one would need that much fresh growth again. A full pass rewrites the history and
+starts a new cycle; the counters are saved with the session.
+
+The full pass keeps the user's own words because the task and its corrections are the one
+thing a model cannot rediscover by reading the workspace, while assistant turns and tool
+traffic are exactly what grows without bound.
+It used to also fire at twice `maxRequestTokens`, which
 sounded like a safety net and behaved like a trap — that budget is the on-the-wire trim, not
 the window, so on a 1M-token model it compacted at 80k, throwing away a history the model
-could still hold whole. Compaction loses detail, so it waits for the window to fill.
+could still hold whole. Compaction loses detail, so the lossy rungs wait for the window to fill.
 
-`/compact` compacts on demand; `/cost` shows where the tokens went.
+`/compact [focus]` compacts on demand with the full rules; `/compact auto on|off` (or the
+**Context** row in `/settings`) turns the ladder off entirely, leaving `/compact` manual.
+`/cost` shows where the tokens went.
+
+A host that answers a transient upstream failure — a 503 “Endpoint is unavailable” from a
+proxy that is restarting, a 502/504 — is not taken for a verdict: the same request is resent
+up to `upstreamRetries` times (10 by default) `upstreamRetryDelayMs` apart (10 s), and each
+pause is announced in the transcript with its attempt number. Esc cancels the wait. Retries
+live in the provider client, so they cover a turn's own requests, titles and compactions
+alike.
 
 The third safeguard is the provider's prompt cache. On the OpenAI path it applies by
 itself; on the **Anthropic** path nothing is cached unless the request says where, so
@@ -1072,8 +1127,8 @@ request rebuilds the prompt cache from scratch — both halves of the request ch
 
 ### MCP servers
 
-Any stdio MCP server — the same ones Claude Code runs — plugs in through the config,
-in the same shape:
+Any MCP server — the same ones Claude Code runs — plugs in through the config, in
+the same shape. Stdio is the default; `url` selects Streamable HTTP:
 
 ```json
 // ~/.trcode/config.json, or .trcode/mcp.json in a project (project wins on a shared id)
@@ -1082,7 +1137,14 @@ in the same shape:
     "command": "npx",
     "args": ["-y", "some-tradingview-mcp"],
     "env": { "API_KEY": "…" },
-    "tools": ["get_quote", "search_symbols"]
+    "tools": ["get_quote", "search_symbols"],
+    "approval": "ask"
+  },
+  "docs": {
+    "url": "https://mcp.example.com/mcp",
+    "headers": { "X-Client": "trcode" },
+    "bearerTokenEnvVar": "DOCS_TOKEN",
+    "toolInputSchemaMaxBytes": 3000
   }
 }
 ```
@@ -1090,12 +1152,41 @@ in the same shape:
 Servers start in the background at session start; their tools appear in the registry as
 `mcp__<id>__<tool>` when each one is ready. Names that require sanitizing or truncating
 receive a hash suffix to avoid collisions. Tools explicitly marked read-only use
-`network` permission; other tools use `write` permission. Both ask by default.
-`/mcp` shows
-status and tool lists, `/mcp reload` restarts the servers after a config change.
+`network` permission (`read` when the server's `approval` is `auto`); other tools use
+`write`. Both ask by default.
 
-`"tools"` is optional but worth setting on fat servers: every exposed schema travels in
-every request. Remote SSE/HTTP servers are not supported yet — stdio only.
+What a server can say and what this client does with it:
+
+- **`tools/list`** is paginated (`nextCursor`) and re-read when the server sends
+  `notifications/tools/list_changed` — a tool added mid-session becomes callable
+  without `/mcp reload`. A failed re-list keeps the previous catalog.
+- **Schemas are compacted.** One tool schema may cost more than the tool's answer;
+  `toolInputSchemaMaxBytes` (default 5000) is the budget. Over it, descriptions are
+  dropped first, then `$defs`, then objects deeper than three levels collapse. This
+  also caps what a third-party server can inject into every request.
+- **Filters.** `tools` is an allowlist; `enabledTools` / `disabledTools` refine it.
+- **Resources** become three tools — `list_mcp_resources`, `read_mcp_resource`,
+  `list_mcp_resource_templates` — that appear once a connected server advertises them.
+- **Results** keep text, attach `image` blocks to the model (vision hosts), fold
+  `structuredContent` into a JSON block, and cut at `outputLimit` characters.
+- **Progress** (`notifications/progress`) is printed in the transcript; **images** and
+  **resource links** are no longer replaced by `[content omitted]`.
+- **Transport failures** are retried three times (250 ms, 1 s) for the handshake and
+  the catalog; a Streamable HTTP session the server forgot (404) is re-established and
+  the call replayed once. A crashed server is restarted with backoff (1 s → 30 s).
+- **Protocol revisions**: `"protocol": "legacy"` (default) speaks `initialize`;
+  `"auto"` probes `server/discover` and falls back; `"2026-07-28"` insists on the
+  stateless revision and carries version and client identity in `_meta` on every
+  request. A server older than the revision is the expected case, not an error.
+
+`/mcp` shows status, protocol, tools, resources and templates; `/mcp restart <id>`,
+`/mcp stop`, `/mcp logs <id>` and `/mcp reload` cover the rest.
+
+`"tools"` is optional but worth setting on fat servers, and `mcpToolSearch: true` goes
+further: instead of sending every server's schemas, the registry exposes one
+`find_mcp_tools` search, and the schemas of the matches join the request as soon as the
+model asks for them.
+
 
 ### Multi-agent work
 
@@ -1452,6 +1543,8 @@ Prices are not published either, so no money is shown anywhere — only tokens.
   "trimKeepRecent": 4,
   "trimMinBytes": 400,
   "requestTimeoutMs": 600000,
+  "upstreamRetries": 10,
+  "upstreamRetryDelayMs": 10000,
   "maxSteps": 0,
   "autoCompactAt": 0.9,
   "promptCache": true,
@@ -1815,8 +1908,8 @@ preview of the answer, permission requests (the pane goes red until you answer) 
 end of the turn.
 
 One wrinkle worth knowing: Orca answers **404** to an agent id it does not know, and
-TRCode is not on its list — the routes are `claude`, `codex`, `cursor`, `gemini`, `grok`,
-`kimi`, `opencode` and ten more. So the reports go out as `opencode`, whose contract is
+TRCode is not on its list — the routes are `claude`, `cursor`, `gemini`, `grok`,
+`kimi`, `opencode` and a dozen more. So the reports go out as `opencode`, whose contract is
 public (Orca ships the plugin that speaks it). The pane will show an opencode icon; the
 status, the preview and the notifications are the real ones.
 

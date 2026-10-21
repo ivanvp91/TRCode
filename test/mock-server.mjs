@@ -37,6 +37,9 @@ const MODELS = [
   { id: "mock-fixedtemp", owned_by: "mock", context_window: 64000 },
   // Streams reasoning forever and never finishes: the hung turn Esc must cut.
   { id: "mock-slow", owned_by: "mock", context_window: 64000 },
+  // Thinking mode with tools: DeepSeek refuses any later step whose assistant
+  // turns do not carry back the reasoning that came with the tool call.
+  { id: "mock-thinking", owned_by: "mock", context_window: 64000 },
   // Hangs up in the middle of the answer the first time, then behaves: the
   // dropped connection a client has to resend rather than report.
   { id: "mock-drop", owned_by: "mock", context_window: 64000 },
@@ -305,6 +308,8 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    if (payload.model === "mock-thinking") return thinking(payload, res);
+
     const sawToolResult = messages.some((m) => m.role === "tool");
     const stream = payload.stream !== false;
 
@@ -400,6 +405,63 @@ const server = http.createServer((req, res) => {
     res.end();
   });
 });
+
+/**
+ * DeepSeek's thinking mode with tools, reduced to the one rule that breaks
+ * clients: once a tool call has been answered, every assistant turn in the
+ * history must carry the `reasoning_content` it was streamed with. A client
+ * that renders the thinking and then forgets it gets the real 400 back on the
+ * second step, which is the whole point of the model here.
+ */
+function thinking(payload, res) {
+  const messages = payload.messages ?? [];
+  const sawToolResult = messages.some((m) => m.role === "tool");
+
+  if (sawToolResult) {
+    const missing = messages.some((m) => m.role === "assistant" && m.tool_calls?.length && m.reasoning_content === undefined);
+    if (missing) {
+      log(`THINKING model=mock-thinking status=400 missing-reasoning\n`);
+      res.writeHead(400, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: {
+            type: "invalid_request_error",
+            message: "The `reasoning_content` in the thinking mode must be passed back to the API.",
+          },
+        }),
+      );
+      return;
+    }
+    log(`THINKING model=mock-thinking status=200 passback=${messages.filter((m) => m.reasoning_content !== undefined).length}\n`);
+    res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+    sse(res, chunk({ role: "assistant", content: "" }));
+    sse(res, chunk({ reasoning_content: "Confirmed with the tool result. " }));
+    for (const piece of "17 × 23 = 391.\n".match(/.{1,6}/gs) ?? []) sse(res, chunk({ content: piece }));
+    sse(res, chunk({}, "stop"));
+    sse(res, { ...chunk({}), usage: { prompt_tokens: 300, completion_tokens: 12, total_tokens: 312 } });
+    res.write("data: [DONE]\n\n");
+    res.end();
+    return;
+  }
+
+  log(`THINKING model=mock-thinking status=200 toolcall\n`);
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+  sse(res, chunk({ role: "assistant", content: "" }));
+  sse(res, chunk({ reasoning_content: "The user wants 17 times 23. " }));
+  sse(res, chunk({ reasoning_content: "I should call calc rather than guess. " }));
+  sse(
+    res,
+    chunk({
+      tool_calls: [
+        { index: 0, id: "call_think", type: "function", function: { name: "calc", arguments: JSON.stringify({ expr: "17*23" }) } },
+      ],
+    }),
+  );
+  sse(res, chunk({}, "tool_calls"));
+  sse(res, { ...chunk({}), usage: { prompt_tokens: 200, completion_tokens: 10, total_tokens: 210 } });
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
 
 /**
  * Anthropic Messages endpoint. Reports what it saw so the test can assert on

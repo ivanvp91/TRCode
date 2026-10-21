@@ -63,6 +63,9 @@ function sizeOf(messages: Message[]): number {
     n += estimateTokens(String(m.content ?? ""));
     // Vision uses model-dependent patch/tile tokens, not base64 text tokens.
     n += (m.images?.length ?? 0) * 2048;
+    // Thinking travels back on the wire with reasoning models, so it is paid
+    // for on every later step like any other history.
+    n += estimateTokens(m.reasoning ?? "");
     for (const tc of m.tool_calls ?? []) n += estimateTokens(tc.function.arguments) + 12;
   }
   return n;

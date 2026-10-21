@@ -347,6 +347,7 @@ export function historyTokens(messages: Message[]): number {
   for (const m of messages) {
     used += estimateTokens(String(m.content ?? ""));
     used += (m.images?.length ?? 0) * 2048; // vision estimate, never base64 as text tokens
+    used += estimateTokens(m.reasoning ?? ""); // thinking replayed with the turn
     for (const tc of m.tool_calls ?? []) used += estimateTokens(tc.function.arguments) + 12;
   }
   return used;

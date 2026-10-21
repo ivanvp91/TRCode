@@ -1,5 +1,5 @@
 /**
- * What was borrowed from Codex, held to what it promises: subagent roles that
+ * Harness features held to what they promise: subagent roles that
  * narrow and never widen, a subagent that takes a follow-up with its own
  * history, helper spend marked as such, skill rules and the skill check,
  * all-or-nothing multi_edit, and background processes driven through
@@ -9,8 +9,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "trc-codex-home-"));
-const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "trc-codex-cwd-"));
+const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "trc-harness-home-"));
+const WORK = fs.mkdtempSync(path.join(os.tmpdir(), "trc-harness-cwd-"));
 process.env.TRCODE_HOME = HOME;
 process.env.TOKENROUTER_BASE_URL = "http://127.0.0.1:9/v1";
 process.env.TOKENROUTER_API_KEY = "sk-test";

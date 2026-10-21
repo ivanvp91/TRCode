@@ -101,6 +101,8 @@ export function historyWireSize(messages: Message[]): number {
   for (const m of messages) {
     n += estimateTokens(String(m.content ?? ""));
     n += (m.images?.length ?? 0) * 2048;
+    // The thinking a reasoning model needs handed back rides on every step.
+    n += estimateTokens(m.reasoning ?? "");
     for (const tc of m.tool_calls ?? []) n += estimateTokens(tc.function.arguments) + 12;
   }
   return n;

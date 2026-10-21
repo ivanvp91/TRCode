@@ -304,6 +304,21 @@ for (let v = 0; v < 3; v++) {
   await m2;
 }
 
+// ── the tab strip wraps ────────────────────────────────────────────────────
+// One tab per connected provider does not fit a narrow panel: the tail used to
+// be clipped by the border, which made those sections unreachable.
+{
+  const { modalTabs } = await import("../dist/ui/modal.js");
+  const many = Array.from({ length: 12 }, (_, i) => ({ label: `Provider${i} 100` }));
+  const lines = modalTabs(100, many, 0);
+  const strip1 = lines.slice(0, -1);
+  check("a tab strip wider than the panel wraps", strip1.length >= 2, strip1.length + " row(s)");
+  check("every wrapped tab row fits the panel", strip1.every((l) => strip(l).length === 100),
+    strip1.map((l) => strip(l).length).join(","));
+  check("the last tab survives the wrap", strip1.join("").includes("Provider11 100"));
+  check("no tab is lost to the wrap", many.every((tb) => strip1.join("").includes(tb.label)));
+}
+
 say("");
 say(passed + " passed, " + failed + " failed");
 process.exit(failed ? 1 : 0);

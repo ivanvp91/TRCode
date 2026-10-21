@@ -437,7 +437,7 @@ function modalityFromName(id: string): ModelInfo["modality"] {
 
 /** Reads whatever metadata the provider happens to expose, defensively. */
 function normalize(raw: any): ModelInfo {
-  const id = String(raw?.id ?? raw?.model ?? "").trim();
+  const id = String(raw?.id ?? raw?.slug ?? raw?.model ?? "").trim();
   const pricingRaw = raw?.pricing ?? raw?.price ?? {};
   const inNum = num(pricingRaw.input ?? pricingRaw.prompt ?? pricingRaw.input_per_million);
   const outNum = num(pricingRaw.output ?? pricingRaw.completion ?? pricingRaw.output_per_million);
@@ -581,12 +581,21 @@ async function fetchProviderModels(
   try {
     const auth = await resolveAuth(providerId);
     const catalog = modeCfg.catalogPath ?? "models";
+    const query = modeCfg.catalog?.query ? `?${modeCfg.catalog.query}` : "";
     const signal = opts.signal ?? AbortSignal.timeout(FETCH_TIMEOUT_MS);
-    const res = await fetch(`${auth.baseUrl}/${catalog}`, { headers: auth.headers, signal });
+    const res = await fetch(`${auth.baseUrl}/${catalog}${query}`, { headers: auth.headers, signal });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const body: any = await res.json();
-    const list: any[] = Array.isArray(body) ? body : body?.data ?? [];
-    const models = list
+    // Most hosts answer { data: [...] }; a few have a shape of their own, which
+    // the provider states (mode.catalog). One republishes its roster under
+    // `models`, ids in `slug`, and marks the ones to hide.
+    const list: any[] = Array.isArray(body)
+      ? body
+      : (body?.data ?? (modeCfg.catalog?.list ? body?.[modeCfg.catalog.list] : undefined) ?? []);
+    const visible = modeCfg.catalog?.list
+      ? list.filter((raw) => raw?.visibility === undefined || raw.visibility === "list")
+      : list;
+    const models = visible
       .map(normalize)
       .filter((m) => m.id)
       .map((m) => stampProviderFacts(m, modeCfg))

@@ -25,6 +25,9 @@ export interface Credentials {
   expiresAt?: number;
   /** Where it came from, shown by `trc auth status`. */
   source?: string;
+  /** The workspace the token acts for, on hosts that need one named (FlowConfig.orgs). */
+  orgId?: string;
+  orgName?: string;
 }
 
 function authDir(): string {
@@ -125,13 +128,24 @@ export function importVendorCredentials(files: string[]): Credentials | null {
       continue;
     }
     const accessToken = deepFind(json, ["access_token", "accessToken", "token"]);
-    if (!accessToken) continue;
+    if (!accessToken) {
+      // A vendor CLI may keep a plain API key instead of a session (Muse Code
+      // does when the user chose "paste an API key").
+      const apiKey = deepFind(json, ["api_key", "apiKey", "META_API_KEY"]);
+      if (apiKey) return { mode: "apikey", accessToken: apiKey, source: file };
+      continue;
+    }
     const refreshToken = deepFind(json, ["refresh_token", "refreshToken"]);
+    // Hosts that serve several accounts name the one a token acts for in the
+    // file too (often `tokens.account_id`), and a request without it
+    // is refused even though the token itself is fine.
+    const accountId = deepFind(json, ["account_id", "accountId"]);
     return {
       mode: "oauth",
       accessToken,
       refreshToken,
       expiresAt: deepExpiry(json),
+      orgId: accountId,
       source: file,
     };
   }
@@ -153,7 +167,7 @@ function deepFind(node: unknown, keys: string[]): string | undefined {
 
 /** Absolute expiry in ms, from whichever of the usual spellings is present. */
 function deepExpiry(node: unknown): number | undefined {
-  const at = deepNumber(node, ["expires_at", "expiresAt", "expiry", "expiration"]);
+  const at = deepNumber(node, ["expires_at", "expiresAt", "expiry", "expiration", "expiry_date"]);
   if (at !== undefined) return at < 1e12 ? at * 1000 : at; // seconds or ms
   const inSec = deepNumber(node, ["expires_in", "expiresIn"]);
   return inSec !== undefined ? Date.now() + inSec * 1000 : undefined;

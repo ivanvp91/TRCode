@@ -8,6 +8,11 @@ export interface ToolCall {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
+  /**
+   * Gemini 3 signs each function call and refuses a history that replays one
+   * without its signature. Other dialects ignore the field.
+   */
+  signature?: string;
 }
 
 /** An image attached to a message: what a vision model reads on the wire. */
@@ -25,6 +30,15 @@ export interface Message {
   tool_call_id?: string;
   /** Screenshots and other images the model should see with this message. */
   images?: ImageAttachment[];
+  /**
+   * The thinking a reasoning model streamed with this turn. Not for display —
+   * the transcript already has it — but for hosts that demand it back: DeepSeek
+   * in thinking mode answers 400 ("The `reasoning_content` in the thinking mode
+   * must be passed back to the API") when the assistant turn that carries tool
+   * calls returns without it. Kept on the message so every later step replays
+   * what that step actually thought.
+   */
+  reasoning?: string;
   /**
    * Local bookkeeping. `hidden` is stripped before hitting the wire; `skill`
    * marks an auto-loaded procedure, which the model must see but which would
@@ -90,17 +104,57 @@ export interface ModelInfo {
   chatCapable?: boolean;
 }
 
-/** One MCP server: how to launch it and, optionally, which tools to expose. */
+/**
+ * One MCP server: how to reach it and how it may act.
+ *
+ * Exactly one transport is configured: `command` (stdio) or `url` (Streamable
+ * HTTP). The same door admits Claude Code's config shape, so `{"command":
+ * "npx", "args": […]}` copied from `claude_desktop_config.json` works as is.
+ */
 export interface McpServerConfig {
-  command: string;
+  /** stdio: the program to launch. */
+  command?: string;
   args?: string[];
   env?: Record<string, string>;
   cwd?: string;
+  /** Streamable HTTP: where the server lives. */
+  url?: string;
+  /** Extra HTTP headers (env placeholders `${VAR}` are expanded). */
+  headers?: Record<string, string>;
+  /** Bearer token, or the name of an environment variable holding it. */
+  bearerToken?: string;
+  bearerTokenEnvVar?: string;
+  /** False skips the server entirely without deleting its config. */
+  enabled?: boolean;
+  /** A server the project cannot work without: its failure is reported as one. */
+  required?: boolean;
+  /**
+   * "legacy" (default) speaks `initialize`; "auto" tries `server/discover`
+   * first and falls back; "2026-07-28" insists on the stateless revision.
+   */
+  protocol?: "legacy" | "auto" | "2026-07-28";
+  startupTimeoutSec?: number;
+  toolTimeoutSec?: number;
   /**
    * Expose only these tools (names as the server reports them). Every schema
    * rides along in every request, so a fat server is worth filtering.
    */
   tools?: string[];
+  /** Allow/deny lists applied after `tools`. */
+  enabledTools?: string[];
+  disabledTools?: string[];
+  /**
+   * UTF-8 budget for one tool schema. Over it, descriptions are dropped, then
+   * `$defs`, then deep objects collapse — a 40 KB schema costs tokens on every
+   * request and is the model's largest prompt-injection surface.
+   */
+  toolInputSchemaMaxBytes?: number;
+  /** "ask" (default) prompts before every call; "auto" lets read-only tools run. */
+  approval?: "ask" | "auto";
+  /** Per-tool override of `approval`. */
+  toolApprovals?: Record<string, "ask" | "auto">;
+  /** Characters kept from one result; the rest is cut with a marker. */
+  outputLimit?: number;
 }
 
 export interface ToolDef {
@@ -161,6 +215,12 @@ export interface ToolContext {
   billMedia?(model: string, cost?: number, jobId?: string): void;
   /** Files already read this session, used to guard blind overwrites. */
   readFiles: Set<string>;
+  /**
+   * Adds tools to the request that is being built right now. A discovery tool
+   * (MCP search) uses it: the next step of the same turn sees the schemas it
+   * brought, without a session-level rebuild.
+   */
+  exposeTools?(defs: ToolDef[]): void;
   /**
    * Where oversized tool output is parked so the history stays append-only.
    * Absent outside the REPL, where there is no session to park it beside.
