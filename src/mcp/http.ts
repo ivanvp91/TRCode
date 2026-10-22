@@ -159,11 +159,15 @@ export class HttpTransport implements McpTransport {
 
         if (status === 404 && this.sessionId && !isHandshake(msg?.method)) {
           res.resume();
+          // The spec's rule for a 404: start a new session *without* the old id.
+          // Kept, it rode along on the re-initialise, and a server that does not
+          // know it refused that too — the recovery this exists for never worked.
+          this.sessionId = "";
           return done(new SessionExpiredError());
         }
         if (status < 200 || status >= 300) {
           collect(res, (text) => {
-            const preview = text.slice(0, NON_JSON_PREVIEW).trim();
+            const preview = (text ?? "").slice(0, NON_JSON_PREVIEW).trim();
             done(new Error(`HTTP ${status}${preview ? `: ${preview}` : ""}`));
           });
           return;
@@ -171,7 +175,7 @@ export class HttpTransport implements McpTransport {
 
         const type = String(res.headers["content-type"] ?? "");
         if (type.includes("text/event-stream")) {
-          this.readEvents(res, expectId, () => done());
+          this.readEvents(res, expectId, () => done(), (err) => done(err));
           res.on("end", () => {
             if (expectId === undefined) done();
             else done(new Error("the stream ended before a response arrived"));
@@ -181,6 +185,7 @@ export class HttpTransport implements McpTransport {
         }
 
         collect(res, (text) => {
+          if (text === null) return done(new Error(TOO_BIG));
           const trimmed = text.trim();
           if (!trimmed) {
             // 202 Accepted: a notification was taken, nothing to read.
@@ -205,7 +210,12 @@ export class HttpTransport implements McpTransport {
     });
   }
 
-  private readEvents(res: http.IncomingMessage, expectId: number | undefined, finish: () => void): void {
+  private readEvents(
+    res: http.IncomingMessage,
+    expectId: number | undefined,
+    finish: () => void,
+    fail: (err: Error) => void,
+  ): void {
     let buf = "";
     let size = 0;
     res.setEncoding("utf8");
@@ -213,7 +223,9 @@ export class HttpTransport implements McpTransport {
       size += Buffer.byteLength(chunk);
       if (size > MAX_FRAME_BYTES) {
         res.destroy();
-        this.onExit?.("the response exceeded the 8 MiB MCP frame limit");
+        // A destroyed response never ends, so the request is failed here —
+        // left to its timer, it hung for minutes and then blamed the network.
+        fail(new Error(TOO_BIG));
         return;
       }
       buf += chunk;
@@ -251,18 +263,27 @@ export class HttpTransport implements McpTransport {
   }
 }
 
-function collect(res: http.IncomingMessage, cb: (text: string) => void): void {
+const TOO_BIG = "the response exceeded the 8 MiB MCP frame limit";
+
+/** The whole body, or null once it outgrows the frame limit. */
+function collect(res: http.IncomingMessage, cb: (text: string | null) => void): void {
   const chunks: Buffer[] = [];
   let size = 0;
+  let over = false;
   res.on("data", (chunk: Buffer) => {
+    if (over) return;
     size += chunk.byteLength;
     if (size > MAX_FRAME_BYTES) {
+      over = true;
       res.destroy();
+      cb(null);
       return;
     }
     chunks.push(chunk);
   });
-  res.on("end", () => cb(Buffer.concat(chunks).toString("utf8")));
+  res.on("end", () => {
+    if (!over) cb(Buffer.concat(chunks).toString("utf8"));
+  });
 }
 
 function isHandshake(method: string | undefined): boolean {

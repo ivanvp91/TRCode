@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { VERSION, configDir } from "./config.js";
 import { t as tr } from "./i18n.js";
 
@@ -68,6 +69,18 @@ interface CheckCache {
 const cachePath = () => path.join(configDir(), "update-check.json");
 
 /**
+ * Whether the passive startup check may run at all. One place decides, because
+ * there used to be two callers with different ideas: the CLI honoured the
+ * environment switches, the interactive start did not, so `TRCODE_NO_UPDATE_CHECK`
+ * still made a request, and a first start made the same request twice.
+ */
+export function passiveCheckEnabled(cfg: { updateCheck?: boolean } = {}): boolean {
+  if (process.env.TRCODE_UPDATE_API) return false; // pointing somewhere else is a test, not a user
+  if (process.env.TRCODE_NO_UPDATE_CHECK) return false;
+  return cfg.updateCheck !== false;
+}
+
+/**
  * One passive GET, at most once per maxAge. Nothing is ever applied here and
  * no state leaves the machine — the answer lands in a local cache file that
  * the next interactive start reads.
@@ -113,7 +126,14 @@ const appliedPath = () => path.join(configDir(), "update-applied.json");
 
 export function markUpdateApplied(version: string): void {
   fs.mkdirSync(configDir(), { recursive: true });
-  fs.writeFileSync(appliedPath(), JSON.stringify({ ts: Date.now(), version }));
+  const stage = fs.mkdtempSync(path.join(configDir(), ".update-applied-"));
+  try {
+    const file = path.join(stage, "update-applied.json");
+    fs.writeFileSync(file, JSON.stringify({ ts: Date.now(), version }));
+    fs.renameSync(file, appliedPath());
+  } finally {
+    try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* locked marker temp */ }
+  }
   try {
     fs.rmSync(cachePath(), { force: true });
   } catch {
@@ -199,31 +219,110 @@ export function versionBadge(): { text: string; note?: string } {
   return { text: VERSION };
 }
 
-function moveDir(src: string, dst: string): void {
-  try {
-    fs.renameSync(src, dst);
-  } catch {
-    // Cross-device, or a handle somewhere refuses the rename.
-    fs.cpSync(src, dst, { recursive: true });
-    fs.rmSync(src, { recursive: true, force: true });
+const require = createRequire(import.meta.url);
+type Manifest = { dependencies?: Record<string, string>; devDependencies?: Record<string, string>; scripts?: unknown };
+
+/** Resolve the first installed package, including a broken package shadowing a parent. */
+function installedVersion(from: string, dep: string, localOnly: boolean): string | null {
+  for (let dir = from; ; ) {
+    const pkg = path.join(dir, "node_modules", dep);
+    if (fs.existsSync(pkg)) {
+      try {
+        const version = JSON.parse(fs.readFileSync(path.join(pkg, "package.json"), "utf8")).version;
+        return typeof version === "string" ? version : null;
+      } catch {
+        return null;
+      }
+    }
+    const up = path.dirname(dir);
+    if (localOnly || up === dir) return null;
+    dir = up;
   }
 }
 
 /**
- * Downloads the release, stages it in a temp dir, swaps it over `opts.to`
- * (default: this install's dist). The old tree is renamed aside first and
- * only deleted after the new one is fully in place, so a failure halfway
- * leaves a working install behind — the running process keeps its own code
- * in memory regardless.
+ * Missing or incompatible dependencies, as npm specs. Load semver only when
+ * updating: older clients that swapped dist without dependencies can still
+ * boot and report how to repair the install.
  */
-export async function applyUpdate(rel: Release, opts: { to?: string } = {}): Promise<{ to: string }> {
+function missingDeps(deps: Record<string, string>, root: string, localOnly = false): string[] {
+  if (!Object.keys(deps).length) return [];
+  let semver: { validRange(range: string): string | null; satisfies(version: string, range: string): boolean };
+  try { semver = require("semver"); }
+  catch { throw new Error("Dependency checker is missing. Run npm install semver in the TRCode install directory, then update again."); }
+  return Object.entries(deps).flatMap(([dep, range]) => {
+    if (typeof range !== "string" || !semver.validRange(range)) {
+      throw new Error(`Cannot verify dependency ${dep}@${range}: expected a semver range.`);
+    }
+    const version = installedVersion(root, dep, localOnly);
+    return version && semver.satisfies(version, range) ? [] : [`${dep}@${range}`];
+  });
+}
+
+/**
+ * npm's own entry point, run through this node: no PATH lookup and no shell,
+ * so the specs from the archive reach npm as plain arguments. Overridable so
+ * the tests need neither the network nor a real install.
+ */
+function npmCli(): string | null {
+  if (process.env.TRCODE_UPDATE_NPM) return process.env.TRCODE_UPDATE_NPM;
+  const bin = path.dirname(process.execPath);
+  return (
+    [
+      path.join(bin, "node_modules", "npm", "bin", "npm-cli.js"), // Windows
+      path.join(bin, "..", "lib", "node_modules", "npm", "bin", "npm-cli.js"), // Unix layouts
+    ].find((p) => fs.existsSync(p)) ?? null
+  );
+}
+
+/**
+ * npm runs against a staged copy of node_modules. A failed install must never
+ * change the dependencies used by the working build.
+ */
+function installDeps(root: string, specs: string[]): Promise<void> {
+  const cli = npmCli();
+  if (!cli) return Promise.reject(new Error("npm was not found next to node"));
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [cli, "install", "--no-save", "--no-audit", "--no-fund", "--loglevel=error", ...specs],
+      { cwd: root, windowsHide: true, stdio: ["ignore", "ignore", "pipe"] },
+    );
+    let stderr = "";
+    child.stderr?.on("data", (d) => (stderr = (stderr + d).slice(-4000)));
+    // A native package downloads its prebuilt binary; give it room, not forever.
+    const timer = setTimeout(() => child.kill(), 5 * 60_000);
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("exit", (code) => {
+      clearTimeout(timer);
+      if (code === 0) return resolve();
+      const last = stderr.trim().split(/\r?\n/).filter(Boolean).slice(-2).join(" ");
+      reject(new Error(last || `npm exited with code ${code}`));
+    });
+  });
+}
+
+/**
+ * Prepare everything before touching the install. Live directories are only
+ * renamed on the same filesystem; a failed rename cannot partially delete
+ * them. Keep backups until all replacements and the restart marker succeed.
+ */
+export async function applyUpdate(
+  rel: Release,
+  opts: { to?: string; onStep?: (msg: string) => void } = {},
+): Promise<{ to: string }> {
   if (!rel.tarball) throw new Error("No download URL for this release.");
-  const target = opts.to ?? distDir();
+  const target = path.resolve(opts.to ?? distDir());
   if (!fs.existsSync(path.join(target, "index.js"))) {
     throw new Error(`Unexpected install layout: no index.js in ${target}`);
   }
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "trc-update-"));
+  let work: string | undefined;
+  let keepBackups = false;
   try {
     const tgz = path.join(tmp, "release.tgz");
     await download(rel.tarball, tgz);
@@ -235,21 +334,81 @@ export async function applyUpdate(rel: Release, opts: { to?: string } = {}): Pro
     if (!src || !fs.existsSync(path.join(src, "index.js"))) {
       throw new Error("The downloaded archive has no dist/ folder — refusing to install it.");
     }
-
-    const backup = `${target}.old`;
-    fs.rmSync(backup, { recursive: true, force: true });
-    moveDir(target, backup);
+    const root = path.dirname(target);
+    const manifest = JSON.parse(fs.readFileSync(path.join(path.dirname(src), "package.json"), "utf8")) as Manifest;
+    const deps = manifest.dependencies ?? {};
+    const missing = missingDeps(deps, root);
+    // Stage on the install's filesystem, so every live replacement is an
+    // atomic rename even if the download directory is on another drive.
+    work = fs.mkdtempSync(path.join(root, ".trc-update-"));
+    const stagedDist = path.join(work, "dist");
+    fs.cpSync(src, stagedDist, { recursive: true });
+    const replacements: { target: string; staged: string; backup: string; backed?: boolean; installed?: boolean }[] = [];
+    if (missing.length) {
+      opts.onStep?.(`Installing ${missing.join(", ")}…`);
+      const stage = path.join(work, "deps");
+      fs.mkdirSync(stage);
+      const modules = path.join(root, "node_modules");
+      if (fs.existsSync(modules)) {
+        fs.cpSync(modules, path.join(stage, "node_modules"), { recursive: true, dereference: true });
+      }
+      let current: Manifest = {};
+      if (fs.existsSync(path.join(root, "package.json"))) {
+        current = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+      }
+      // Preserve development dependencies in source checkouts, and omit root
+      // lifecycle scripts: installing dependencies should not run the app.
+      const { scripts: _scripts, ...stagedManifest } = current;
+      fs.writeFileSync(path.join(stage, "package.json"), JSON.stringify({
+        ...stagedManifest, private: true, dependencies: { ...current.dependencies, ...deps },
+      }));
+      try {
+        await installDeps(stage, missing);
+        const still = missingDeps(deps, stage, true);
+        if (still.length) throw new Error(`npm left incompatible dependencies: ${still.join(", ")}`);
+      } catch (err) {
+        const cmd = `npm install ${missing.map((d) => `"${d}"`).join(" ")}`;
+        throw new Error(
+          `Release ${rel.version} needs ${missing.join(", ")}, and npm could not add (${(err as Error).message}). ` +
+          `Run ${cmd} in ${root}, then update again`,
+        );
+      }
+      replacements.push({ target: modules, staged: path.join(stage, "node_modules"), backup: path.join(work, "old-node_modules") });
+    }
+    replacements.push({ target, staged: stagedDist, backup: path.join(work, "old-dist") });
     try {
-      moveDir(src, target);
+      for (const entry of replacements) {
+        if (fs.existsSync(entry.target)) {
+          fs.renameSync(entry.target, entry.backup);
+          entry.backed = true;
+        }
+        fs.renameSync(entry.staged, entry.target);
+        entry.installed = true;
+      }
+      markUpdateApplied(rel.version);
     } catch (err) {
-      fs.rmSync(target, { recursive: true, force: true });
-      moveDir(backup, target);
+      const failures: string[] = [];
+      for (const entry of [...replacements].reverse()) {
+        try {
+          if (entry.installed) fs.renameSync(entry.target, entry.staged);
+          if (entry.backed) fs.renameSync(entry.backup, entry.target);
+        } catch (restoreError) {
+          failures.push((restoreError as Error).message);
+        }
+      }
+      if (failures.length) {
+        keepBackups = true;
+        throw new Error(`Update failed (${(err as Error).message}); rollback failed (${failures.join("; ")}). Backups kept in ${work}`);
+      }
       throw err;
     }
-    fs.rmSync(backup, { recursive: true, force: true });
-    markUpdateApplied(rel.version);
     return { to: target };
   } finally {
-    fs.rmSync(tmp, { recursive: true, force: true });
+    // Cleanup cannot turn a committed update into a reported failure. A locked
+    // leftover is safe to remove later; failed rollback backups must survive.
+    if (work && !keepBackups) {
+      try { fs.rmSync(work, { recursive: true, force: true }); } catch { /* locked backup */ }
+    }
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* locked download */ }
   }
 }

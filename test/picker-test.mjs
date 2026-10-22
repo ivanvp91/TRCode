@@ -319,6 +319,36 @@ for (let v = 0; v < 3; v++) {
   check("no tab is lost to the wrap", many.every((tb) => strip1.join("").includes(tb.label)));
 }
 
+// ── an arrow redraws the panel in one write, never through a blank screen ──
+// The panel used to be erased and then printed row by row: at every arrow key
+// the terminal showed the panel gone for a moment, and walking the list made
+// it blink.
+{
+  const writes = [];
+  process.stdout.write = (chunk) => {
+    writes.push(String(chunk));
+    return true;
+  };
+  const m = openModal({ title: "Sessions", items: items.filter((it) => !it.header) });
+  writes.length = 0;
+  type(ESC + "[B");
+  const content = writes.findIndex((w) => /qwen|kimi/.test(strip(w)));
+  check("one keypress is one write", writes.length === 1, `${writes.length} writes`);
+  const frame = writes[0] ?? "";
+  const firstClear = frame.indexOf(ESC + "[J");
+  check(
+    "the old panel is not cleared before the new one is drawn",
+    content === 0 && (firstClear === -1 || firstClear > frame.search(/qwen|kimi/)),
+    JSON.stringify(frame.slice(0, 120)),
+  );
+  type(ESC);
+  await m;
+  process.stdout.write = (chunk) => {
+    painted += String(chunk);
+    return true;
+  };
+}
+
 say("");
 say(passed + " passed, " + failed + " failed");
 process.exit(failed ? 1 : 0);

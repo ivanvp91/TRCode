@@ -28,7 +28,7 @@ Object.defineProperty(process.stdout, "columns", { value: 90, configurable: true
 let painted = 0;
 const realWrite = process.stdout.write.bind(process.stdout);
 process.stdout.write = (chunk) => {
-  if (String(chunk).includes("╭")) painted++;
+  if (String(chunk).includes("›")) painted++;
   return true;
 };
 

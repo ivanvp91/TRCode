@@ -32,7 +32,7 @@ import {
 } from "./provider/registry.js";
 import { importVendorCredentials, readCredentials } from "./provider/credentials.js";
 import { isChatgptRegistration } from "./provider/chatgpt.js";
-import { latestRelease, isNewer, applyUpdate, refreshCache } from "./update.js";
+import { latestRelease, isNewer, applyUpdate } from "./update.js";
 import { sweepMediaTmp } from "./tools/mediaworkspace.js";
 
 interface Args {
@@ -422,13 +422,12 @@ async function cmdUpdate(rest: string[]): Promise<number> {
   }
 
   try {
-    const { to } = await applyUpdate(rel);
+    const { to } = await applyUpdate(rel, { onStep: (msg) => info(msg) });
     success(`Updated to ${rel.version} in ${to}`);
     warn("Restart trc to run the new build.");
     return 0;
   } catch (err) {
     error(`Update failed: ${(err as Error).message}`);
-    line(c.gray("  The previous install is untouched."));
     return 1;
   }
 }
@@ -582,13 +581,11 @@ async function main(): Promise<void> {
   await app.init();
   if (args.effort) app.effortOverride = args.effort;
 
-  // A new release is worth one gray line at startup and nothing more: the
-  // check itself runs in the background at most once every six hours and
-  // never applies anything. The header carries the persistent state — the
-  // starred version and, after an update, the restart reminder.
-  if (!process.env.TRCODE_UPDATE_API && !process.env.TRCODE_NO_UPDATE_CHECK && loadConfig().updateCheck !== false) {
-    void refreshCache().catch(() => {});
-  }
+  // A new release is worth one gray line at startup and nothing more: the check
+  // itself runs in the background at most once every six hours and never applies
+  // anything. The header carries the persistent state — the starred version and,
+  // after an update, the restart reminder. App.init() owns that check; asking
+  // here as well doubled the first request of a fresh install.
 
   if (args.model) {
     try {

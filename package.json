@@ -1,6 +1,6 @@
 {
   "name": "trcode",
-  "version": "0.1.9",
+  "version": "0.2.0",
   "description": "TRCode — cross-platform agentic coding CLI: one client over TokenRouter, Kimi, Anthropic, OpenRouter, OpenCode Zen, OpenCode Go, OpenAI (a ChatGPT subscription or a platform key), Google Gemini, Meta Muse, Alibaba Cloud, xAI and Z.AI",
   "type": "module",
   "bin": {
@@ -45,6 +45,7 @@
     "typescript": "^5.7.2"
   },
   "dependencies": {
+    "semver": "^7.8.5",
     "sharp": "^0.35.5"
   }
 }

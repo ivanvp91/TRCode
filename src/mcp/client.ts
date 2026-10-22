@@ -19,8 +19,9 @@
  */
 import fs from "node:fs";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { createHash } from "node:crypto";
-import { loadConfig, VERSION } from "../config.js";
+import { loadConfig, projectKey, saveConfig, VERSION } from "../config.js";
 import type { ImageAttachment, McpServerConfig, ToolDef, ToolResult } from "../types.js";
 import { compactSchema, DEFAULT_SCHEMA_MAX_BYTES } from "./schema.js";
 import { StdioTransport, expandEnv, type McpTransport, delay } from "./transport.js";
@@ -87,6 +88,8 @@ export class McpClient {
   onCatalogChanged?: (client: McpClient) => void;
   /** Set by the registry: the transport died on its own. */
   onCrash?: (client: McpClient) => void;
+  /** The workspace, answered to `roots/list`. Set by the registry. */
+  root?: string;
 
   private transport: McpTransport | null = null;
   private nextId = 1;
@@ -437,10 +440,12 @@ export class McpClient {
     const blocks: any[] = Array.isArray(result?.content) ? result.content : [];
     const parts: string[] = [];
     const images: ImageAttachment[] = [];
+    const texts: string[] = [];
     for (const block of blocks) {
       switch (block?.type) {
         case "text":
           parts.push(String(block.text ?? ""));
+          texts.push(String(block.text ?? ""));
           break;
         case "image": {
           const data = typeof block.data === "string" ? block.data : "";
@@ -465,7 +470,11 @@ export class McpClient {
           parts.push(`[${String(block?.type ?? "unknown")} content omitted]`);
       }
     }
-    if (result?.structuredContent !== undefined) {
+    // The spec asks a server that returns structured content to put the same
+    // JSON in a text block too, and most do: appended regardless, the model
+    // read every such result twice. It is added unless a text block already is
+    // that JSON.
+    if (result?.structuredContent !== undefined && !texts.some((t) => sameJson(t, result.structuredContent))) {
       try {
         parts.push("```json\n" + JSON.stringify(result.structuredContent, null, 2) + "\n```");
       } catch {
@@ -570,11 +579,18 @@ export class McpClient {
       return;
     }
     if (msg.id !== undefined && msg.method) {
-      // A server-initiated request (sampling, roots, elicitation): refused, not
-      // ignored — leaving it unanswered would hang the server's own loop.
-      void this.transport
-        ?.send({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: "not supported by trcode" } })
-        .catch(() => {});
+      // Server-initiated requests. `ping` must be answered — a keep-alive that
+      // gets an error back reads as a dead client — and `roots/list` is what
+      // the `roots` capability we announce promises. The rest (sampling,
+      // elicitation) is refused, not ignored: leaving it unanswered would hang
+      // the server's own loop.
+      const reply =
+        msg.method === "ping"
+          ? { result: {} }
+          : msg.method === "roots/list"
+            ? { result: { roots: this.root ? [{ uri: pathToFileURL(this.root).href, name: path.basename(this.root) }] : [] } }
+            : { error: { code: -32601, message: "not supported by trcode" } };
+      void this.transport?.send({ jsonrpc: "2.0", id: msg.id, ...reply }).catch(() => {});
       return;
     }
     switch (msg.method) {
@@ -682,15 +698,55 @@ export function onMcpCatalogChange(listener: (client: McpClient) => void): () =>
  * shared id.
  */
 export function mcpServerConfigs(cwd: string): Record<string, McpServerConfig> {
-  const out: Record<string, McpServerConfig> = { ...(loadConfig().mcpServers ?? {}) };
+  return { ...(loadConfig().mcpServers ?? {}), ...projectMcpConfigs(cwd) };
+}
+
+/** The servers the repository itself declares in .trcode/mcp.json. */
+export function projectMcpConfigs(cwd: string): Record<string, McpServerConfig> {
   try {
     const raw = JSON.parse(fs.readFileSync(path.join(cwd, ".trcode", "mcp.json"), "utf8"));
     const map = raw && typeof raw === "object" ? (raw.mcpServers ?? raw) : null;
-    if (map && typeof map === "object") Object.assign(out, map);
+    if (map && typeof map === "object" && !Array.isArray(map)) return map as Record<string, McpServerConfig>;
   } catch {
     /* optional file */
   }
-  return out;
+  return {};
+}
+
+// ── project trust ────────────────────────────────────────────────────────────
+//
+// A server in a repository's .trcode/mcp.json is a command that repository
+// wants run on this machine, and it used to start the moment `trc` opened the
+// folder — a cloned project could execute anything, and mark its own tools
+// `approval: "auto"` on top. Now it waits for /mcp trust, and the approval
+// covers that exact config: an edit to the command, its args or env is a new
+// server as far as trust is concerned.
+
+function fingerprint(id: string, cfg: McpServerConfig): string {
+  return createHash("sha256").update(JSON.stringify([id, cfg])).digest("hex").slice(0, 16);
+}
+
+/** Project servers that would start but have not been approved for this folder. */
+export function untrustedProjectServers(cwd: string): string[] {
+  const trusted = new Set(loadConfig().mcpTrusted?.[projectKey(cwd)] ?? []);
+  return Object.entries(projectMcpConfigs(cwd))
+    .filter(([, cfg]) => cfg && cfg.enabled !== false && (cfg.command || cfg.url))
+    .filter(([id, cfg]) => !trusted.has(fingerprint(id, cfg)))
+    .map(([id]) => id);
+}
+
+/** Approves the project's servers exactly as they are configured now. */
+export function trustProjectServers(cwd: string): string[] {
+  const project = projectMcpConfigs(cwd);
+  const prints = Object.entries(project).map(([id, cfg]) => fingerprint(id, cfg));
+  saveConfig({ mcpTrusted: { [projectKey(cwd)]: prints } });
+  return Object.keys(project);
+}
+
+/** What a project server would run, for the line that asks to trust it. */
+export function describeServer(cfg: McpServerConfig): string {
+  if (cfg.url) return cfg.url;
+  return [cfg.command, ...(cfg.args ?? [])].filter(Boolean).join(" ");
 }
 
 /**
@@ -733,11 +789,14 @@ export function mcpSettled(timeoutMs = 15_000, signal?: AbortSignal): Promise<vo
  * registry there.
  */
 export function connectMcpServers(cwd: string, onSettled: (client: McpClient) => void): void {
+  const untrusted = new Set(untrustedProjectServers(cwd));
   for (const [id, cfg] of Object.entries(mcpServerConfigs(cwd))) {
     if (clients.has(id)) continue;
     if (cfg?.enabled === false) continue;
     if (!cfg?.command && !cfg?.url) continue;
+    if (untrusted.has(id)) continue;
     const client = new McpClient(id, cfg);
+    client.root = cwd;
     cwds.set(id, cwd);
     clients.set(id, client);
     client.onCatalogChanged = (c) => {
@@ -768,6 +827,7 @@ export async function restartMcpServer(id: string): Promise<McpClient | null> {
   clients.delete(id);
   await old?.close();
   const client = new McpClient(id, cfg);
+  client.root = cwd;
   clients.set(id, client);
   client.onCatalogChanged = (c) => {
     for (const listener of listeners) listener(c);
@@ -1009,6 +1069,17 @@ function mcpName(server: string, tool: string): string {
   if (name.length <= 64 && sanitize(server) === server && sanitize(tool) === tool) return name;
   const hash = createHash("sha256").update(JSON.stringify([server, tool])).digest("hex").slice(0, 12);
   return `${name.slice(0, 51)}_${hash}`;
+}
+
+/** True when `text` is the serialisation of `value`, whatever its whitespace. */
+function sameJson(text: string, value: unknown): boolean {
+  const trimmed = text.trim();
+  if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) return false;
+  try {
+    return JSON.stringify(JSON.parse(trimmed)) === JSON.stringify(value);
+  } catch {
+    return false;
+  }
 }
 
 function truncate(text: string, max: number): string {

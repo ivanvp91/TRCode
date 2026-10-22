@@ -9,9 +9,9 @@
  * is for the times you do not remember which word it was.
  */
 import { t } from "../i18n.js";
-import { c, clipAnsi, cursor, width } from "./ansi.js";
+import { c, clipAnsi, cursor, esc, width } from "./ansi.js";
 import { contentWidth, indent } from "./layout.js";
-import { line, out } from "./render.js";
+import { line, out, paintFrame } from "./render.js";
 import { pushConsumer } from "./stdin.js";
 import {
   innerWidth,
@@ -236,20 +236,27 @@ export function openModal(
 
     const clear = () => {
       if (!rendered) return;
-      cursor.up(rendered);
-      cursor.toColumn(0);
-      cursor.clearDown();
+      paintFrame(esc.toColumn(1) + esc.up(rendered) + esc.clearDown);
       rendered = 0;
     };
 
     const draw = () => {
-      clear();
+      // The new frame goes over the old one in a single synchronized write.
+      // Erasing first and printing row by row left a moment with no panel on
+      // screen at every keypress — an arrow walking the list made it blink —
+      // and printing through line() filed every redraw in the transcript's row
+      // log and scroll count, as if the panel were conversation.
+      const back = rendered ? esc.toColumn(1) + esc.up(rendered) : "";
       const rows = visible();
       syncIndex(rows);
       const w = contentWidth();
       const inner = innerWidth(w);
       const buf: string[] = [];
 
+      // A blank row first: the panel replaces the line above rather than
+      // continuing it. It is part of the frame, so closing the panel takes it
+      // away again and a reopened panel does not stack gaps.
+      buf.push("");
       buf.push(modalTop(w, opts.title));
       buf.push(modalRow(w));
       if (opts.subtitle) {
@@ -375,7 +382,15 @@ export function openModal(
       buf.push(modalFooter(w, keys, position));
       buf.push(modalBottom(w));
 
-      for (const l of buf) line(indent + l);
+      // Each row is wiped as it is written, and whatever a taller frame left
+      // below the new one goes with the final clear.
+      paintFrame(
+        esc.hide +
+          back +
+          buf.map((l) => esc.toColumn(1) + esc.clearRight + indent + l).join("\n") +
+          "\n" +
+          esc.clearDown,
+      );
       rendered = buf.length;
     };
 

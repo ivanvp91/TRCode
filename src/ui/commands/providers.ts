@@ -354,7 +354,12 @@ export function setAutoCompact(app: App, arg: string): void {
  * Update from inside a session. The check runs here rather than through the
  * startup cache, so the answer is always current.
  */
-export async function runUpdate(app: App): Promise<void> {
+export async function runUpdate(app: App, rest = ""): Promise<void> {
+  const args = rest.trim().split(/\s+/).filter(Boolean);
+  if (args.some((arg) => arg !== "--check")) {
+    error(tr("Usage: /update [--check]", "Использование: /update [--check]"));
+    return;
+  }
   await app.exclusiveInput(async () => {
     line();
     info(tr("Checking github.com/ivanvp91/TRCode releases…", "Проверяю релизы на github.com/ivanvp91/TRCode…"));
@@ -375,8 +380,12 @@ export async function runUpdate(app: App): Promise<void> {
         `  Доступна новая версия: ${c.bold(rel.version)} ${c.gray(`(текущая: ${VERSION})`)}`,
       ),
     );
+    if (args.includes("--check")) {
+      if (rel.url) hint(rel.url);
+      return;
+    }
     try {
-      await applyUpdate(rel);
+      await applyUpdate(rel, { onStep: (msg) => info(msg) });
       success(
         tr(
           `Updated to ${rel.version}. Restart the terminal to run the new build.`,
@@ -387,8 +396,8 @@ export async function runUpdate(app: App): Promise<void> {
     } catch (err) {
       error(
         tr(
-          `Update failed: ${(err as Error).message} — the previous install is untouched.`,
-          `Не удалось обновиться: ${(err as Error).message} — прежняя сборка не тронута.`,
+          `Update failed: ${(err as Error).message}`,
+          `Не удалось обновиться: ${(err as Error).message}`,
         ),
       );
     }

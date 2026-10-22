@@ -67,6 +67,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const key = async (s) => { stdin.emit("data", Buffer.from(s, "utf8")); await sleep(20); };
 const strip = (s) => s.replace(new RegExp(ESC + "\\[[0-9;]*[A-Za-z]", "g"), "");
 const count = (hay, needle) => hay.split(needle).length - 1;
+// The bar's input row: the band that replaced the old box, marked by the same
+// arrow a sent message is echoed with.
+const inputRows = (hay) => count(hay, "›");
+const inputAt = (hay) => hay.lastIndexOf("›");
 
 let passed = 0;
 let failed = 0;
@@ -86,9 +90,9 @@ bar.start();
 await sleep(30);
 {
   const t = strip(screen.text());
-  check("the frame is on screen while the turn runs", /╭─+╮/.test(t) && /│ ❯/.test(t), t);
-  check("the spinner line is above the frame", t.indexOf("thinking") < t.indexOf("╭"), t);
-  check("the status rows are below the frame", t.lastIndexOf("context:") > t.lastIndexOf("╯"), t);
+  check("the input line is on screen while the turn runs", inputRows(t) === 1, t);
+  check("the spinner line is above the input", t.indexOf("thinking") < inputAt(t), t);
+  check("the status rows are below the input", t.lastIndexOf("context:") > inputAt(t), t);
 }
 
 // Transcript output must scroll above the bar, not through it.
@@ -97,8 +101,8 @@ line("   ⏺ grep(TurnBar)");
 await sleep(20);
 {
   const t = strip(screen.text());
-  check("output lands above the bar", t.indexOf("read(src/index.ts)") < t.indexOf("╭"), t);
-  check("only one frame is on screen", count(t, "╭") === 1, t);
+  check("output lands above the bar", t.indexOf("read(src/index.ts)") < inputAt(t), t);
+  check("only one input row is on screen", inputRows(t) === 1, t);
   check("earlier output is not overwritten", /read\(src\/index\.ts\)/.test(t) && /grep\(TurnBar\)/.test(t), t);
 }
 
@@ -106,18 +110,18 @@ await sleep(20);
 for (const ch of "and what about tests") await key(ch);
 {
   const t = strip(screen.text());
-  check("typed text shows in the frame", /│ ❯ and what about tests/.test(t), t);
-  check("typing does not duplicate the frame", count(t, "╭") === 1, t);
+  check("typed text shows in the band", /› and what about tests/.test(t), t);
+  check("typing does not duplicate the band", inputRows(t) === 1, t);
 }
 
 await key("\x7f"); // backspace
-check("backspace works", /│ ❯ and what about test\s+│/.test(strip(screen.text())), strip(screen.text()));
+check("backspace works", /› and what about test$/m.test(strip(screen.text())), strip(screen.text()));
 
 await key("\r"); // queue it
 {
   const t = strip(screen.text());
   check("a queued message is listed", /queued: and what about test/.test(t), t);
-  check("the frame is empty again", /│ ❯\s+│/.test(t), t);
+  check("the input band is empty again", /›$/m.test(t), t);
   // The queued row makes the bar one taller, and the row it takes must not be
   // the last line of the transcript.
   check("queueing does not eat the line above the bar", /grep\(TurnBar\)/.test(t), t);
@@ -137,7 +141,7 @@ check("stop hands back the unsent draft", draft === "half typed", draft);
 line("   after the turn");
 {
   const t = strip(screen.text());
-  check("the bar is gone once the turn ends", !/╭─+╮/.test(t), t);
+  check("the bar is gone once the turn ends", !/›/.test(t), t);
   check("output continues normally", /after the turn/.test(t), t);
 }
 
@@ -154,20 +158,160 @@ line("   after the turn");
   line("   Allow write to src/index.ts?");
   {
     const t = strip(screen.text());
-    check("pause takes the bar down", !/╭─+╮/.test(t), t);
+    check("pause takes the bar down", !/›/.test(t), t);
     check("the prompt is not fighting the bar", /Allow write/.test(t), t);
   }
   second.resume();
   await sleep(20);
   {
     const t = strip(screen.text());
-    check("resume brings it back once", count(t, "╭") === 1, t);
-    check("the prompt stays above it", t.indexOf("Allow write") < t.indexOf("╭"), t);
+    check("resume brings it back once", inputRows(t) === 1, t);
+    check("the prompt stays above it", t.indexOf("Allow write") < inputAt(t), t);
   }
   second.stop();
   second.resume(); // must not resurrect a stopped bar
   await sleep(20);
-  check("a stopped bar stays down", !/╭─+╮/.test(strip(screen.text())), strip(screen.text()));
+  check("a stopped bar stays down", !/›/.test(strip(screen.text())), strip(screen.text()));
+}
+
+// Enter steers the running turn; Tab is the other half of it and holds the
+// line for after the turn. The steered rows stay in the bar until the turn
+// picks them up — an input box that just empties reads as the line vanishing.
+{
+  const steered = [];
+  const steers = new TurnBar({
+    status: () => ({ left: "model", hint: "esc to interrupt", context: "context: 1%" }),
+    onInterrupt: () => {},
+    onSteer: (text) => steered.push(text),
+  });
+  screen.reset();
+  steers.start();
+  await sleep(20);
+  for (const ch of "not that file") await key(ch);
+  await key("\r");
+  {
+    const t = strip(screen.text());
+    check("Enter hands the line to the running turn", steered.length === 1 && steered[0] === "not that file", JSON.stringify(steered));
+    check("and shows it as steering, not as queued", /steering: not that file/.test(t) && !/queued: not that file/.test(t), t);
+    check("the band is empty again", /›$/m.test(t), t);
+  }
+  // The turn takes it at its next step, and its row goes with it.
+  steers.markSteered();
+  await sleep(20);
+  check("a delivered line leaves the bar", !/steering: not that file/.test(strip(screen.text())), strip(screen.text()));
+
+  for (const ch of "after this") await key(ch);
+  await key("\t");
+  {
+    const t = strip(screen.text());
+    check("Tab queues instead of steering", steered.length === 1 && /queued: after this/.test(t), t);
+  }
+  for (const ch of "one more") await key(ch);
+  await key("\r");
+  const { queued } = steers.stop();
+  check(
+    "stop hands back both kinds in the order typed",
+    JSON.stringify(queued) === JSON.stringify(["after this", "one more"]),
+    JSON.stringify(queued),
+  );
+}
+
+// The command dropdown is the same list under the band as under the idle
+// composer: a `/model` reached for while the model is working is that command,
+// not a line to be retyped afterwards.
+{
+  const { commandSuggestions } = await import("../dist/ui/commands.js");
+  const bar = new TurnBar({
+    status: () => ({ left: "model", hint: "esc to interrupt", context: "context: 1%" }),
+    onInterrupt: () => {},
+    onSteer: () => {},
+    suggest: (buffer) => commandSuggestions(buffer),
+    suggestRows: 4,
+  });
+  screen.reset();
+  bar.start();
+  await sleep(20);
+  await key("/");
+  {
+    const t = strip(screen.text());
+    check("a slash opens the command list mid-turn", /\(\d+\/\d+\)/.test(t) && /→ \/model/.test(t), t);
+    check("the list sits above the band, not under it", t.indexOf("(1/") < t.indexOf("› /"), t);
+  }
+  for (const ch of "upd") await key(ch);
+  {
+    const t = strip(screen.text());
+    check("typing narrows it to the matching command", /→ \/update/.test(t), t);
+    check("and the rest are gone", !/\/model/.test(t), t);
+  }
+  await key("\r");
+  {
+    const t = strip(screen.text());
+    check("enter puts the command in the line", /› \/update/.test(t), t);
+    check("the list closes with it", !/\(\d+\/\d+\)/.test(t), t);
+  }
+  const { queued } = bar.stop();
+  check("picking a command sends nothing", queued.length === 0, JSON.stringify(queued));
+
+  // Arrows walk the list; enter takes the row they are on.
+  const arrows = new TurnBar({
+    status: () => ({ left: "model", hint: "esc to interrupt", context: "context: 1%" }),
+    onInterrupt: () => {},
+    onSteer: () => {},
+    suggest: (buffer) => (buffer.startsWith("/") ? [{ value: "/one", hint: "first" }, { value: "/two", hint: "second" }] : []),
+    suggestRows: 2,
+  });
+  screen.reset();
+  arrows.start();
+  await sleep(20);
+  await key("/");
+  await key(ESC + "[B");
+  {
+    const t = strip(screen.text());
+    check("down moves the highlight", /→ \/two/.test(t) && !/→ \/one/.test(t), t);
+  }
+  await key("\r");
+  check("enter takes the highlighted row", /› \/two/.test(strip(screen.text())), strip(screen.text()));
+  arrows.stop();
+
+  // Esc with the list open puts the list away and nothing else: it used to
+  // cancel the whole turn, and the list stayed painted where the bar had been.
+  let stops = 0;
+  const esc = new TurnBar({
+    status: () => ({ left: "model", hint: "esc to interrupt", context: "context: 1%" }),
+    onInterrupt: () => stops++,
+    onSteer: () => {},
+    suggest: (buffer) => (buffer.startsWith("/") ? [{ value: "/one", hint: "first" }, { value: "/two", hint: "second" }] : []),
+    suggestRows: 2,
+  });
+  screen.reset();
+  esc.start();
+  await sleep(20);
+  await key("/");
+  check("the list advertises esc as closing it", /esc to close the list/.test(strip(screen.text())), strip(screen.text()));
+  await key(ESC);
+  await sleep(80); // past the hold that tells a bare Esc from a cursor key
+  {
+    const t = strip(screen.text());
+    check("esc with the list open does not stop the turn", stops === 0, String(stops));
+    check("it closes the list", !/\(\d+\/\d+\)/.test(t), t);
+    check("and keeps the draft", /› \//.test(t), t);
+  }
+  await key(ESC);
+  await sleep(80);
+  check("a second esc, with no list, stops the turn", stops === 1, String(stops));
+  esc.stop();
+
+  // Ctrl+C is never a menu key.
+  stops = 0;
+  esc.start();
+  await sleep(20);
+  await key("/x");
+  await key("\x03");
+  check("ctrl+c with the list open still stops the turn", stops === 1, String(stops));
+  esc.stop();
+  // Two Ctrl+C within 1.5s are the stdin safety net's hard exit; the next
+  // block presses it again.
+  await sleep(1600);
 }
 
 // ── the caret stays out of the way for the whole turn ───────────────────────
@@ -253,7 +397,7 @@ line("   after the turn");
   check("the echoed message survives the bar growing over it", /✦ последнее сообщение/.test(t), t);
   check("no transcript line is painted over", shown.filter((l) => /^transcript /.test(l)).length === 8, t);
   check("the bar still ends at the bottom of the screen", shown.slice(-6).join("\n") === rows.join("\n"), t);
-  check("the input frame is still on screen after reasoning arrives", /╭────╮/.test(t) && /│ ❯/.test(t), t);
+  check("the input row is still on screen after reasoning arrives", /╭────╮/.test(t) && /│ ❯/.test(t), t);
   setFooter(null);
 }
 
@@ -270,8 +414,8 @@ line("   after the turn");
   tight.setThinking(Array.from({ length: 12 }, (_, i) => `reason line ${i}`));
   await sleep(20);
   const shown = strip(screen.text());
-  const frameAt = shown.lastIndexOf("╭");
-  check("a long reasoning preview still shows the frame", frameAt !== -1, shown);
+  const frameAt = shown.lastIndexOf("›");
+  check("a long reasoning preview still shows the input", frameAt !== -1, shown);
   check(
     "the preview is clipped so the frame fits",
     (shown.match(/reason line/g) || []).length < 12 && /reason line 11/.test(shown),
@@ -342,8 +486,8 @@ line("   after the turn");
   {
     const t = strip(screen.text());
     check("ctrl+o prints the shortened block mid-turn", t.includes("длинный блок целиком"), t.slice(-400));
-    check("the frame survives the expansion", count(t, "╭") === 1, t);
-    check("the block landed above the frame", t.indexOf("длинный блок целиком") < t.indexOf("╭"), t);
+    check("the input band survives the expansion", inputRows(t) === 1, t);
+    check("the block landed above the input", t.indexOf("длинный блок целиком") < inputAt(t), t);
   }
 
   // Caret steering inside a wrapped, multi-line draft.
@@ -355,7 +499,7 @@ line("   after the turn");
   await key("X");
   {
     const t = strip(screen.text());
-    check("left moves the caret before inserting", /│   вторXая\s+│/.test(t), t);
+    check("left moves the caret before inserting", /^ {5}вторXая$/m.test(t), t);
   }
   withHistory.stop();
 
@@ -372,18 +516,18 @@ line("   after the turn");
   await key(ESC + "[A"); // up — out of the draft into the history
   {
     const t = strip(screen.text());
-    check("up recalls history mid-turn", /│ ❯ что было раньше\s+│/.test(t), t);
+    check("up recalls history mid-turn", /› что было раньше$/m.test(t), t);
   }
   await key(ESC + "[B"); // down — back to newest, i.e. the held draft
   {
     const t = strip(screen.text());
-    check("down returns to the draft", /│ ❯ черновик\s+│/.test(t), t);
+    check("down returns to the draft", /› черновик$/m.test(t), t);
   }
   await key(ESC + "[A"); // up again…
   await key("!"); // …and an edit lands in the recalled line
   {
     const t = strip(screen.text());
-    check("an edit lands in the recalled line", /│ ❯ что было раньше!\s+│/.test(t), t);
+    check("an edit lands in the recalled line", /› что было раньше!$/m.test(t), t);
   }
   third.stop();
 }

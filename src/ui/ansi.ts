@@ -31,14 +31,28 @@ export const c = {
   brightBlue: wrap(94, 39),
   brightMagenta: wrap(95, 39),
   brightCyan: wrap(96, 39),
+  brightWhite: wrap(97, 39),
   bgRed: wrap(41, 49),
   bgGreen: wrap(42, 49),
   bgGray: wrap(100, 49),
-  // Diff bands. The plain bgRed/bgGreen are far too loud behind a whole line of
-  // code; these are the dark 256-colour pair every diff viewer settles on.
-  // Gated like every other colour — NO_COLOR has to mean no colour.
-  bgDel: (s: string) => (noColor ? s : `\x1b[48;5;52m${s}\x1b[49m`),
-  bgAdd: (s: string) => (noColor ? s : `\x1b[48;5;22m${s}\x1b[49m`),
+  // Diff bands, in Codex's muted pair: a vivid terminal red or green behind a
+  // whole line shouts louder than the change it points at. Truecolor, because
+  // the 256-colour cube has no desaturated dark red or green to fall back on.
+  bgDel: (s: string) => (noColor ? s : `\x1b[48;2;74;34;29m${s}\x1b[49m`),
+  bgAdd: (s: string) => (noColor ? s : `\x1b[48;2;33;58;43m${s}\x1b[49m`),
+  // The line number and the ± on that band, muted along with it.
+  fgDel: (s: string) => (noColor ? s : `\x1b[38;2;216;132;125m${s}\x1b[39m`),
+  fgAdd: (s: string) => (noColor ? s : `\x1b[38;2;139;190;142m${s}\x1b[39m`),
+  // The band a message the user wrote sits on, and the one under the input:
+  // the light blue-grey of a composer, a clear step up from the terminal
+  // without turning into a highlight. Truecolor — the 256-colour cube's greys
+  // are either nearly the background or a dirty olive against a blue theme.
+  bgUser: (s: string) => (noColor ? s : `\x1b[48;2;74;77;84m${s}\x1b[49m`),
+  // Ink of the same grey, for the chrome drawn in the input band's colour.
+  fgUser: (s: string) => (noColor ? s : `\x1b[38;2;74;77;84m${s}\x1b[39m`),
+  // A panel over the conversation: a shade off the terminal's own background,
+  // enough to separate the menu from the text behind it and no more.
+  bgModal: (s: string) => (noColor ? s : `\x1b[48;2;38;40;46m${s}\x1b[49m`),
 };
 
 export const hasColor = !noColor;
@@ -160,12 +174,18 @@ export const esc = {
   // CSI 0 A means "move 1 line" to a terminal, so a zero move must be skipped.
   up: (n = 1) => (n > 0 ? `\x1b[${n}A` : ""),
   down: (n = 1) => (n > 0 ? `\x1b[${n}B` : ""),
+  /** Shift visible rows down, discarding only the cleared rows at the bottom. */
+  scrollDown: (n: number) => (n > 0 ? `\x1b[${n}T` : ""),
   toColumn: (n = 0) => `\x1b[${n}G`,
   clearLine: "\x1b[2K",
   /** From the cursor to the end of the row — the rest of a shortened line. */
   clearRight: "\x1b[K",
   clearDown: "\x1b[0J",
   clearScreen: "\x1b[2J\x1b[H",
+  /** Move to a given row, first column — 1-based, like the terminal counts. */
+  toRow: (n: number) => `\x1b[${Math.max(1, n)};1H`,
+  /** "Where is the cursor?" — the terminal answers with ESC[row;colR. */
+  position: "\x1b[6n",
   /**
    * Synchronized output: a terminal that honours the pair shows the frame
    * between them all at once, never half-drawn. Unknown private modes are

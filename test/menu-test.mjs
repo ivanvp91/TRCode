@@ -40,6 +40,8 @@ class Screen {
     }
   }
   lines() { return this.grid.slice(0, this.maxRow + 1).map(r => r.join("").replace(/\s+$/, "")); }
+  /** A fresh board: frames from an earlier interaction must not leak into this one. */
+  reset() { this.grid = []; this.row = 0; this.col = 0; this.maxRow = 0; }
 }
 
 const screen = new Screen(100);
@@ -65,42 +67,24 @@ stdin.emit("data", Buffer.from("\r"));
 stdin.emit("data", Buffer.from(String.fromCharCode(13))); // второй Enter отправляет выбранное
 const picked = await p;
 
-// Закрытое меню делает рамку ниже. Перерисовка идёт поверх прежних строк, так
-// что лишние обязана убрать за собой — иначе от списка остаются призраки.
-const sleep = ms => new Promise(r => setTimeout(r, ms));
-const p2 = ed.read();
-stdin.emit("data", Buffer.from("/"));
-const withMenu = screen.lines().map(strip);
-stdin.emit("data", Buffer.from(ESC)); // закрыть меню
-await sleep(60); // Esc разрешается только после окна на распознавание
-const afterEsc = screen.lines().map(strip);
-stdin.emit("data", Buffer.from("\r"));
-await p2;
+// Список живёт поверх разговора над композером: его строки идут ВЫШЕ строки
+// ввода, фрейм от него не растёт. Сами перекрытия и их восстановление проверяет
+// pin-test — там эмулятор экрана с высотой и прокруткой, а не растущая доска.
+const inputRow = snapSlash.filter(l => /^\s*›/.test(l)).pop() ?? "";
 
 process.stdout.write = realWrite;
-
-// Экран здесь накапливает все кадры подряд — очистка в этом эмуляторе не
-// двигает maxRow. Значит смотреть надо на последний кадр: от верхней границы
-// последней рамки и ниже.
-const lastFrame = ls => ls.slice(ls.map(l => /╭/.test(l)).lastIndexOf(true)).filter(l => l.trim());
-const menuRow = l => /Enter to pick|Enter — выбрать/.test(l);
-const menuGone = lastFrame(withMenu).some(menuRow) && !lastFrame(afterEsc).some(menuRow);
-// Что осталось: три строки рамки и две статусные, ничего от списка.
-const noGhosts = lastFrame(afterEsc).length === 5;
 
 console.log("--- экран при вводе «/» ---");
 for (const l of snapSlash) console.log(l);
 
-const frame = snapSlash.filter(l => /^\s*[╭│╰]/.test(l));
-console.log("\n--- ширины строк рамки ---");
-const widths = frame.map(l => [...l].length);
-frame.forEach((l, i) => console.log(String(widths[i]).padStart(4), l.slice(0, 12) + "…" + l.slice(-3)));
-const same = new Set(widths).size === 1;
-console.log("\nвсе строки рамки одинаковой ширины:", same ? "ДА" : "НЕТ -> " + [...new Set(widths)].join(", "));
+console.log("\n--- строка ввода ---");
+console.log(inputRow);
+// Строка ввода стоит на поле чата, а не у края терминала: лента начинается
+// левее, а сам текст — там же, где текст транскрипта.
+const aligned = /^ {3}› \//.test(inputRow);
+console.log("\nстрока ввода на поле чата:", aligned ? "ДА" : "НЕТ -> " + JSON.stringify(inputRow));
 // Ожидание берётся из самого списка: проверяется навигация, а не то, какая
 // команда сегодня стоит второй — иначе тест ломает любое пополнение меню.
 const expected = commandSuggestions("/")[1].value + " ";
 console.log("Enter на втором пункте выбрал:", JSON.stringify(picked), picked === expected ? "OK" : `ПРОВАЛ, ждали ${JSON.stringify(expected)}`);
-console.log("после Esc список меню убран:", menuGone ? "ДА" : "НЕТ");
-console.log("после Esc рамка стала ниже, призраков нет:", noGhosts ? "ДА" : "НЕТ -> " + JSON.stringify(afterEsc.filter(l => l.trim())));
-process.exit(same && picked === expected && menuGone && noGhosts ? 0 : 1);
+process.exit(aligned && picked === expected ? 0 : 1);

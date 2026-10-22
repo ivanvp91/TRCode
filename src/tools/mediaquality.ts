@@ -1,7 +1,8 @@
-import sharp from "sharp";
+import { loadSharp } from "./sharp.js";
 
 /** Decode the image and compare machine-checkable requested constraints. */
 export async function inspectGeneratedImage(bytes: Buffer, args: Record<string, any>): Promise<{ format?: string; width?: number; height?: number; hasAlpha?: boolean; decoded: boolean; warnings: string[] }> {
+  const sharp = await loadSharp();
   const image = sharp(bytes, { limitInputPixels: 64_000_000, failOn: "warning" });
   const meta = await image.metadata();
   const stats = await image.stats();

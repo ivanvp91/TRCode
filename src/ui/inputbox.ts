@@ -1,6 +1,6 @@
 /** Composition of the two status rows drawn under the input frame. */
-import { c, clipAnsi, width } from "./ansi.js";
-import { contentWidth } from "./layout.js";
+import { c, clipAnsi, stripAnsi, width } from "./ansi.js";
+import { statusWidth } from "./layout.js";
 import { fmtTokens } from "../usage.js";
 import { wireModelId } from "../provider/registry.js";
 import { t } from "../i18n.js";
@@ -23,6 +23,7 @@ export interface StatusInfo {
    */
   effortIgnored?: boolean;
   cwdLabel: string;
+  sessionTitle?: string;
   contextUsed: number;
   contextWindow: number;
   /** Shown when the window size is a guess rather than reported. */
@@ -60,8 +61,8 @@ export function composeStatus(s: StatusInfo): EditorStatus {
 
   // Esc has nothing to interrupt while the input is idle; the mode toggle is
   // the thing worth advertising here, since it has no other signpost.
-  const w = contentWidth();
-  let hint = c.dim(s.hint ?? t("/ for commands · Shift+Tab for auto-approve · Ctrl+Enter for newline", "/ — команды · Shift+Tab — без подтверждений · Ctrl+Enter — перенос строки"));
+  const w = statusWidth();
+  let hint = c.dim(s.hint ?? t("/ for commands · ! for a shell command · Shift+Tab for auto-approve · Ctrl+Enter for newline", "/ — команды · ! — команда оболочки · Shift+Tab — без подтверждений · Ctrl+Enter — перенос строки"));
 
   // A long model id plus the full hint can be wider than the row they share —
   // and a status row that does not fit wraps, which costs the frame above it
@@ -70,7 +71,12 @@ export function composeStatus(s: StatusInfo): EditorStatus {
   // A hint the caller passed is theirs, and is left alone.
   const fits = (h: string) => width(head) + width(h) + 2 <= w;
   if (s.hint === undefined) {
+    // The rows give way in the order of what is hardest to discover: the full
+    // line first, then the shell prefix (the one thing here no key press
+    // reveals), then the key reminders, longest to shortest.
+    if (!fits(hint)) hint = c.dim(t("/ for commands · ! for a shell command · Shift+Tab for auto-approve", "/ — команды · ! — команда оболочки · Shift+Tab — без подтверждений"));
     if (!fits(hint)) hint = c.dim(t("/ for commands · Shift+Tab for auto-approve", "/ — команды · Shift+Tab — без подтверждений"));
+    if (!fits(hint)) hint = c.dim(t("/ for commands · Shift+Tab", "/ — команды · Shift+Tab"));
     if (!fits(hint)) hint = c.dim(t("/ for commands", "/ — команды"));
     // Even the short form does not fit: the model id is that long. The hint
     // goes rather than the name of the model the turn will be billed to.
@@ -91,5 +97,17 @@ export function composeStatus(s: StatusInfo): EditorStatus {
     left: cwdText ? head + "  " + c.dim(cwdText) : head,
     hint,
     context,
+    session: s.sessionTitle
+      ? c.brightYellow(stripAnsi(s.sessionTitle).replace(/\p{Cc}/gu, " ").replace(/\s+/g, " ").trim())
+      : undefined,
   };
+}
+
+/** Session name immediately before context; the whole group is right-aligned. */
+export function contextRow(status: EditorStatus, columns = statusWidth()): string {
+  const context = clipAnsi(status.context, columns);
+  const room = Math.max(0, columns - width(context) - 2);
+  const session = room > 0 ? clipAnsi(status.session ?? "", room) : "";
+  const group = session ? session + "  " + context : context;
+  return " ".repeat(Math.max(0, columns - width(group))) + group;
 }

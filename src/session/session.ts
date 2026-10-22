@@ -95,6 +95,11 @@ export class Session {
     return path.join(sessionsDir(this.cwd), `${this.id}.json`);
   }
 
+  /** The saved title, or a name derived from the first user message. */
+  get displayTitle(): string {
+    return this.title || deriveTitle(this);
+  }
+
   /** Renames the session; an empty title falls back to the derived one. */
   rename(title: string): void {
     this.title = title.trim().slice(0, 120);

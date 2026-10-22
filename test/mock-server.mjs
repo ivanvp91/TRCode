@@ -37,6 +37,9 @@ const MODELS = [
   { id: "mock-fixedtemp", owned_by: "mock", context_window: 64000 },
   // Streams reasoning forever and never finishes: the hung turn Esc must cut.
   { id: "mock-slow", owned_by: "mock", context_window: 64000 },
+  // Holds its first answer back, then asks for a tool: the window in which a
+  // user can type into the bar and have the turn take the message with it.
+  { id: "mock-steer", owned_by: "mock", context_window: 64000 },
   // Thinking mode with tools: DeepSeek refuses any later step whose assistant
   // turns do not carry back the reasoning that came with the tool call.
   { id: "mock-thinking", owned_by: "mock", context_window: 64000 },
@@ -262,6 +265,56 @@ const server = http.createServer((req, res) => {
         clearInterval(tick);
         log(`SLOW model=mock-slow closed\n`);
       });
+      return;
+    }
+
+    // A turn the user can steer. The first answer is held back for a moment
+    // and asks for a tool, so the turn goes on and the text typed into the bar
+    // in the meantime has a step boundary to land on. The second request says
+    // whether it did.
+    if (payload.model === "mock-steer") {
+      // The answer is due once the tool has answered — or once a steering line
+      // landed right after the tool result, which is what a steered turn sends.
+      const last = messages.at(-1)?.role;
+      const answerTime = last === "tool" || (last === "user" && messages.at(-2)?.role === "tool");
+      if (!answerTime) {
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+          sse(res, chunk({ role: "assistant", content: "" }));
+          sse(
+            res,
+            chunk({
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "call_s",
+                  type: "function",
+                  function: { name: "read", arguments: JSON.stringify({ path: "package.json" }) },
+                },
+              ],
+            }),
+          );
+          sse(res, chunk({}, "tool_calls"));
+          sse(res, { ...chunk({}), usage: { prompt_tokens: 100, completion_tokens: 5, total_tokens: 105 } });
+          res.write("data: [DONE]\n\n");
+          res.end();
+        }, 700);
+        return;
+      }
+      // After the last tool result, not "anywhere in the history": a second
+      // turn on the same session must be told apart from the first.
+      const lastTool = messages.map((m) => m.role).lastIndexOf("tool");
+      const steered = messages.filter(
+        (m, i) => i > lastTool && m.role === "user" && String(m.content).includes("STEERCORRECTION"),
+      ).length;
+      log(`STEER model=mock-steer delivered=${steered}\n`);
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      sse(res, chunk({ role: "assistant", content: "" }));
+      sse(res, chunk({ content: "Понял поправку." }));
+      sse(res, chunk({}, "stop"));
+      sse(res, { ...chunk({}), usage: { prompt_tokens: 1500, completion_tokens: 10, total_tokens: 1510 } });
+      res.write("data: [DONE]\n\n");
+      res.end();
       return;
     }
 

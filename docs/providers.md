@@ -155,7 +155,7 @@ input, where the routing prefix is dropped as redundant:
    yolo  Kimi  k3  thinking: high                    context: 3% (23k/1M)
 ```
 
-The header box at the top states them too. A box already on screen is output, not a live
+The header at the top states them too. A header already on screen is output, not a live
 region, so it cannot be edited — instead switching the provider, the model or the
 reasoning budget **repaints the screen** and prints the header again, which is the only
 way for it to stay true. The transcript remains in the terminal's scrollback, and `/clear`

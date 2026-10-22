@@ -27,9 +27,20 @@ import { runOrchestration, orchestrationStatus } from "../agent/orchestrator.js"
 import { createSkill } from "../skills/loader.js";
 import { memoryPath, memoryCount } from "../tools/memory.js";
 import { resetPromptSnapshots } from "../agent/prompt.js";
-import { connectMcpServers, mcpClients, mcpServerConfigs, restartMcpServer, stopMcpServers } from "../mcp/client.js";
+import {
+  connectMcpServers,
+  describeServer,
+  mcpClients,
+  mcpServerConfigs,
+  projectMcpConfigs,
+  restartMcpServer,
+  stopMcpServers,
+  trustProjectServers,
+  untrustedProjectServers,
+} from "../mcp/client.js";
 import { t, count } from "../i18n.js";
 import { deleteEntry } from "../ui-library/store.js";
+import { allTipIds } from "./tips.js";
 import type { App } from "./repl.js";
 import { GROUP_ORDER, groupLabel, effortHint, txt, type Command, parseTokens, currentProviderId, setModel, warnIfIncompatible } from "./commands/shared.js";
 import { goalCommand } from "./commands/goal.js";
@@ -852,12 +863,24 @@ const COMMANDS: Command[] = [
   {
     name: "/mcp",
     group: "session",
-    args: () => "[reload | restart <id> | stop | logs <id>]",
+    args: () => "[reload | restart <id> | stop | logs <id> | trust]",
     help: () => t("MCP servers: status, tools, resources", "MCP-серверы: статус, инструменты, ресурсы"),
     async run(app, rest) {
       const parts = rest.trim().split(/\s+/).filter(Boolean);
       const cmd = (parts[0] ?? "").toLowerCase();
       const target = parts[1];
+
+      if (cmd === "trust") {
+        const waiting = untrustedProjectServers(app.cwd);
+        if (!waiting.length) return info(t("Every MCP server of this project is already trusted.", "Все MCP-серверы проекта уже одобрены."));
+        trustProjectServers(app.cwd);
+        connectMcpServers(app.cwd, (client) => {
+          app.rebuildTools();
+          if (client.state === "ready") info(t(`MCP ${client.id}: ${client.tools.length} tools connected.`, `MCP ${client.id}: подключено инструментов: ${client.tools.length}.`));
+          else warn(t(`MCP ${client.id} failed: ${client.detail}`, `MCP ${client.id} не подключился: ${client.detail}`));
+        });
+        return info(t(`Trusted for this folder: ${waiting.join(", ")}. Starting…`, `Одобрено для этой папки: ${waiting.join(", ")}. Запускаю…`));
+      }
 
       if (cmd === "reload") {
         stopMcpServers();
@@ -903,7 +926,8 @@ const COMMANDS: Command[] = [
       }
 
       const clients = mcpClients();
-      if (!clients.length) {
+      const waiting = untrustedProjectServers(app.cwd);
+      if (!clients.length && !waiting.length) {
         info(t("No MCP servers configured.", "MCP-серверы не настроены."));
         hint(
           t(
@@ -952,6 +976,14 @@ const COMMANDS: Command[] = [
       for (const [id, cfg] of disabled) {
         padded(`${id.padEnd(20)} ${c.gray(t("disabled", "выключен"))}${cfg.required ? c.gray(" · required") : ""}`);
       }
+      // What the repository would run, in full: this is the line the user
+      // decides on before typing /mcp trust.
+      const project = projectMcpConfigs(app.cwd);
+      for (const id of waiting) {
+        padded(`${id.padEnd(20)} ${c.yellow(t("not trusted", "не одобрен"))}${c.gray(" · .trcode/mcp.json")}`);
+        padded(c.dim("  " + truncate(describeServer(project[id]), contentWidth() - 4)));
+      }
+      if (waiting.length) hint(t("/mcp trust starts the project's servers in this folder.", "/mcp trust запустит серверы проекта в этой папке."));
       const total = clients.reduce((n, cl) => n + (cl.state === "ready" ? cl.tools.length : 0), 0);
       if (total > 20) {
         hint(
@@ -961,7 +993,7 @@ const COMMANDS: Command[] = [
           ),
         );
       }
-      hint(t("restart <id> · stop · logs <id> · reload", "restart <id> · stop · logs <id> · reload"));
+      hint(t("restart <id> · stop · logs <id> · reload · trust", "restart <id> · stop · logs <id> · reload · trust"));
       line();
     },
   },
@@ -1098,9 +1130,10 @@ const COMMANDS: Command[] = [
   {
     name: "/update",
     group: "settings",
+    args: "[--check]",
     help: () => t("update to the latest GitHub release", "обновиться до последнего релиза с GitHub"),
-    async run(app) {
-      await runUpdate(app);
+    async run(app, rest) {
+      await runUpdate(app, rest);
     },
   },
   {
@@ -1319,6 +1352,40 @@ const COMMANDS: Command[] = [
     },
   },
   {
+    name: "/tips",
+    group: "other",
+    args: () => t("[on | off | reset]", "[on | off | reset]"),
+    help: () => t("one-line hints about features this session has not used", "подсказки об одном неиспробованном приёме за раз"),
+    async run(app, rest) {
+      const sub = rest.trim().toLowerCase();
+      const cfg = loadConfig();
+      if (!sub) {
+        const left = allTipIds().filter((id) => !(cfg.tipsSeen ?? []).includes(id)).length;
+        info(
+          cfg.tips === false
+            ? t(`Hints are off. /tips on brings them back; ${left} unseen.`, `Подсказки выключены. /tips on вернёт их; не показывали ${left}.`)
+            : t(`Hints are on — one every few turns, never the same twice. ${left} unseen.`, `Подсказки включены — одна раз в несколько ходов, и никогда та же дважды. Не показывали ${left}.`),
+        );
+        return;
+      }
+      if (sub === "reset") {
+        app.cfg = saveConfig({ tipsSeen: [] }, { replace: ["tipsSeen"] });
+        success(t("Every hint will be offered again.", "Все подсказки снова доступны."));
+        return;
+      }
+      if (sub === "on" || sub === "off") {
+        app.cfg = saveConfig({ tips: sub === "on" });
+        success(
+          sub === "on"
+            ? t("Hints on.", "Подсказки включены.")
+            : t("Hints off. /tips on brings them back.", "Подсказки выключены. /tips on вернёт их."),
+        );
+        return;
+      }
+      error(t("Use: /tips on | off | reset", "Использование: /tips on | off | reset"));
+    },
+  },
+  {
     name: "/memory",
     group: "other",
     args: () => t("[on | off | show]", "[on | off | показать]"),
@@ -1487,6 +1554,15 @@ export function commandSuggestions(buffer: string): { value: string; hint: strin
 
 export function isCommand(text: string): boolean {
   return text.startsWith("/");
+}
+
+/**
+ * A line the shell runs instead of the model. "!" alone is not enough — it is
+ * how a message asks to skip the prompt rewrite, and a lone bang is a typo, not
+ * something to hand to a shell.
+ */
+export function isShellLine(text: string): boolean {
+  return text.startsWith("!") && text.slice(1).trim().length > 0;
 }
 
 /** Compact grouped listing shown when the user types just "/". */

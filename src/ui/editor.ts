@@ -9,10 +9,27 @@
  */
 import { appendFileSync } from "node:fs";
 import { stashPaste, takeCollapsed } from "./paste.js";
+import { panelRows } from "./panel.js";
 import { pushConsumer } from "./stdin.js";
-import { c, clipAnsi, cursor, esc, width } from "./ansi.js";
-import { contentWidth, fullWidth, indent, PAD_LEFT } from "./layout.js";
-import { expandedBlock, line, padded, paintFrame } from "./render.js";
+import { c, clipAnsi, cursor, esc, hasColor, width } from "./ansi.js";
+import { t } from "../i18n.js";
+import { bandTextWidth, contentWidth, fullWidth, indent, PAD_LEFT, statusWidth } from "./layout.js";
+import { contextRow } from "./inputbox.js";
+import {
+  expandedBlock,
+  bandRow,
+  bottomDrawn,
+  bottomGap,
+  bottomPinned,
+  takeFooterSlack,
+  tailRows,
+  screenHeight,
+  noteBlankRows,
+  sealBlankRows,
+  line,
+  padded,
+  paintFrame,
+} from "./render.js";
 
 const CTRL_A = String.fromCharCode(1);
 const CTRL_C = String.fromCharCode(3);
@@ -121,11 +138,56 @@ export interface EditorStatus {
   hint: string;
   /** Right-aligned second status row. */
   context: string;
+  /** Session name immediately before context on the second status row. */
+  session?: string;
 }
 
 export interface Suggestion {
   value: string;
   hint: string;
+}
+
+/**
+ * The command dropdown, drawn identically under the idle composer and under
+ * the turn bar — the same list, the same keys, wherever the line is typed.
+ *
+ * `room` is the height it keeps while the filter narrows it down: a block at
+ * the bottom of the screen that changes height has to give rows back
+ * somewhere, and either place leaves a hole next to the input.
+ */
+export function suggestionLines(
+  menu: Suggestion[],
+  menuIdx: number,
+  w: number,
+  room = 6,
+  keys = "  ↑↓ · Enter to pick · Esc to dismiss",
+  /** Fill the block out to `room` rows — the composer's own layout needs that. */
+  pad = true,
+): string[] {
+  if (!menu.length) return [];
+  const visible = Math.min(room, menu.length);
+  const half = Math.floor(visible / 2);
+  const start = Math.max(0, Math.min(menuIdx - half, menu.length - visible));
+  const nameWidth = Math.min(22, Math.max(...menu.map((m) => m.value.length)) + 1);
+
+  const rows: string[] = [];
+  for (let i = start; i < start + visible; i++) {
+    const item = menu[i];
+    const active = i === menuIdx;
+    const marker = active ? c.brightCyan("→ ") : "  ";
+    const name = active ? c.bold(c.brightCyan(item.value.padEnd(nameWidth))) : item.value.padEnd(nameWidth);
+    const hintRoom = Math.max(10, w - nameWidth - 8);
+    const hint = c.dim(item.hint.length > hintRoom ? item.hint.slice(0, hintRoom - 1) + "…" : item.hint);
+    rows.push(indent + "  " + marker + name + " " + hint);
+  }
+  if (!pad) {
+    // An overlay: just the list, plus the one row that says what the keys do.
+    rows.push(indent + "    " + c.gray(`(${menuIdx + 1}/${menu.length})`) + c.dim(keys));
+    return rows;
+  }
+  for (let i = visible; i < room; i++) rows.push("");
+  rows.push(indent + "    " + c.gray(`(${menuIdx + 1}/${menu.length})`) + c.dim(keys));
+  return rows;
 }
 
 export interface EditorOptions {
@@ -141,6 +203,13 @@ export interface EditorOptions {
   suggestRows?: number;
   /** Shift+Tab: cycles the confirmation mode without leaving the input. */
   onToggleMode?(): void;
+  /**
+   * The first keystroke of a read. The welcome animation paints cells at fixed
+   * screen coordinates; from the moment the frame starts growing, scrolling or
+   * the menu overlay can move the rows under it, and those coordinates stop
+   * pointing at the logo.
+   */
+  onFirstKey?(): void;
 }
 
 /**
@@ -177,13 +246,6 @@ function logKeys(label: string, s: string): void {
 }
 
 /** Strips terminal noise from a pasted chunk while keeping newlines. */
-/**
- * The cells of a frame row the text itself gets: the row is
- * "│" + space + "❯ " + text + "│" — five cells of chrome around it.
- */
-function innerWidth(): number {
-  return Math.max(10, contentWidth() - 5);
-}
 
 export function cleanPaste(s: string): string {
   return s
@@ -195,41 +257,64 @@ export function cleanPaste(s: string): string {
 /**
  * Wraps a buffer into rows that fit inside the frame. Shared with the turn
  * bar, whose input must look and steer exactly like this one.
+ *
+ * The break goes at the last space that still fits, and only a run with no
+ * space in it — a path, base64, minified JSON — is cut by force. A terminal
+ * splits words down the middle; an editor does not, and reading your own
+ * sentence back with a word sawn in half is the difference.
  */
 export function wrapBuf(buf: string, inner: number): string[] {
-  const rows: string[] = [];
-  for (const para of buf.split("\n")) {
-    if (!para.length) {
-      rows.push("");
-      continue;
-    }
-    for (let i = 0; i < para.length; i += inner) rows.push(para.slice(i, i + inner));
-  }
-  return rows.length ? rows : [""];
+  return rowSpansOf(buf, inner).map((r) => buf.slice(r.start, r.start + r.len));
 }
 
 /** Buffer index → (row, column) inside the wrapped text. */
 export function locatePos(buf: string, pos: number, inner: number): { row: number; col: number } {
-  let remaining = pos;
-  let row = 0;
-  for (const para of buf.split("\n")) {
-    const lines = para.length ? Math.ceil(para.length / inner) : 1;
-    if (remaining <= para.length) {
-      return { row: row + Math.floor(remaining / inner), col: remaining % inner };
-    }
-    remaining -= para.length + 1; // +1 for the newline itself
-    row += lines;
-  }
-  return { row: Math.max(0, row - 1), col: 0 };
+  const rows = rowSpansOf(buf, inner);
+  const clamped = Math.max(0, Math.min(pos, buf.length));
+  const at = clampToRows(rows, clamped);
+  return { row: at, col: Math.min(clamped - rows[at].start, rows[at].len) };
+}
+
+/**
+ * The row a buffer index falls on: the last one starting at or before it. On a
+ * wrap boundary that is the row below, which is where the next character —
+ * and the caret — are.
+ */
+function clampToRows(rows: { start: number; len: number }[], pos: number): number {
+  let at = 0;
+  while (at + 1 < rows.length && rows[at + 1].start <= pos) at++;
+  return at;
 }
 
 /** Where each wrapped row starts in the buffer, and how long it is. */
 export function rowSpansOf(buf: string, inner: number): { start: number; len: number }[] {
+  const width = Math.max(1, inner);
   const rows: { start: number; len: number }[] = [];
   let at = 0;
   for (const para of buf.split("\n")) {
-    if (!para.length) rows.push({ start: at, len: 0 });
-    else for (let i = 0; i < para.length; i += inner) rows.push({ start: at + i, len: Math.min(inner, para.length - i) });
+    if (!para.length) {
+      rows.push({ start: at, len: 0 });
+    } else {
+      let i = 0;
+      while (i < para.length) {
+        // A row never opens on the space the previous row broke at: that space
+        // is the break, not the first character of a line.
+        if (i > 0) while (i < para.length && para[i] === " ") i++;
+        if (i >= para.length) break;
+        const room = Math.min(width, para.length - i);
+        if (room === para.length - i) {
+          rows.push({ start: at + i, len: room });
+          break;
+        }
+        // Break after the last space that still fits, and only cut inside a run
+        // when there is no space to break at at all — a path, base64, minified
+        // JSON. The space rides at the end of the row; the band pads it anyway.
+        const space = para.lastIndexOf(" ", i + room - 1);
+        const len = space > i ? space - i + 1 : room;
+        rows.push({ start: at + i, len });
+        i += len;
+      }
+    }
     at += para.length + 1; // +1 for the newline itself
   }
   return rows.length ? rows : [{ start: 0, len: 0 }];
@@ -240,6 +325,9 @@ export class InputEditor {
   private pos = 0;
   private renderedRows = 0;
   private cursorRow = 0;
+  /** Rows of the conversation the menu overlay is covering, and what was there. */
+  private overlayCount = 0;
+  private overlaySaved: string[] = [];
   private historyIdx = -1;
   private draft = "";
   private menu: Suggestion[] = [];
@@ -402,8 +490,15 @@ export class InputEditor {
       // Lets the REPL unwind this read from the outside, e.g. on Ctrl+C.
       this.abortRead = () => finish(null);
 
+      let firstKey = false;
       const handle = (s: string, final: boolean): void => {
         logKeys(final ? "flush" : "chunk", s);
+        // The welcome animation paints at fixed coordinates, and from here on
+        // the screen can move under it. One keystroke is all the signal needed.
+        if (!firstKey && s.length) {
+          firstKey = true;
+          this.opts.onFirstKey?.();
+        }
         // An escape sequence can be split across chunks; a half-read one must
         // not be treated as text, or stray "[" characters land in the buffer.
         if (!final && isPartialEscape(s)) {
@@ -617,7 +712,7 @@ export class InputEditor {
    */
   private moveLine(dir: -1 | 1): boolean {
     if (this.historyIdx !== -1) return false;
-    const rows = rowSpansOf(this.buf, innerWidth());
+    const rows = rowSpansOf(this.buf, bandTextWidth());
     // The caret sits on the last row starting at or before it; on a wrap
     // boundary that is the row below, which is where draw() parks it too.
     let at = 0;
@@ -690,28 +785,26 @@ export class InputEditor {
     process.stdout.write(esc.toColumn(1) + esc.up(this.cursorRow) + esc.clearDown);
     this.renderedRows = 0;
     this.cursorRow = 0;
+    // What is printed next starts at the frame's old top, under the blank rows
+    // it dropped over — they are history now, not a gap above the input.
+    sealBlankRows();
   }
 
-  /** Dropdown rows drawn between the frame and the status lines. */
-  private menuLines(w: number): string[] {
+  /**
+   * The dropdown rows, drawn over the conversation above the composer rather
+   * than inside its frame. A menu that is part of the frame makes the frame
+   * grow and shrink, and a block on the bottom edge cannot give rows back
+   * without either a hole under the status or a scroll — on an empty session
+   * the hole has nothing to fill it. Overlaid, the composer never moves.
+   *
+   * The rows come back wrapped in a panel: a grey border in the composer's own
+   * ink, and a background a shade off the terminal's, so the list reads as a
+   * thing floating over the text instead of a few lines of it.
+   */
+  private menuRows(w: number): string[] {
     if (!this.menu.length) return [];
-    const visible = Math.min(this.opts.suggestRows ?? 6, this.menu.length);
-    const half = Math.floor(visible / 2);
-    const start = Math.max(0, Math.min(this.menuIdx - half, this.menu.length - visible));
-    const nameWidth = Math.min(22, Math.max(...this.menu.map((m) => m.value.length)) + 1);
-
-    const rows: string[] = [];
-    for (let i = start; i < start + visible; i++) {
-      const item = this.menu[i];
-      const active = i === this.menuIdx;
-      const marker = active ? c.brightCyan("→ ") : "  ";
-      const name = active ? c.bold(c.brightCyan(item.value.padEnd(nameWidth))) : item.value.padEnd(nameWidth);
-      const hintRoom = Math.max(10, w - nameWidth - 8);
-      const hint = c.dim(item.hint.length > hintRoom ? item.hint.slice(0, hintRoom - 1) + "…" : item.hint);
-      rows.push(indent + "  " + marker + name + " " + hint);
-    }
-    rows.push(indent + "    " + c.gray(`(${this.menuIdx + 1}/${this.menu.length})`) + c.dim("  ↑↓ · Enter to pick · Esc to dismiss"));
-    return rows;
+    const body = suggestionLines(this.menu, this.menuIdx, w, this.opts.suggestRows ?? 6, undefined, false);
+    return panelRows(body);
   }
 
   private syncMenu(): void {
@@ -727,23 +820,47 @@ export class InputEditor {
     this.syncMenu();
 
     const w = contentWidth();
-    const inner = innerWidth();
+    const inner = bandTextWidth();
     const rows = this.wrap(inner);
     const st = this.opts.status();
+    // A line that starts with "!" is a shell command, not a message. Say it
+    // where the keys are advertised — the moment before Enter is the only time
+    // the difference can still change what happens.
+    if (this.buf.startsWith("!") && this.buf.slice(1).trim()) {
+      st.hint = c.dim(t("↵ runs it in the shell · the model never sees it", "↵ выполнит в оболочке · модели это не уйдёт"));
+    }
 
     const lines: string[] = [];
-    lines.push(indent + c.gray("╭" + "─".repeat(w - 2) + "╮"));
+    // The composer is the band the message will become once it is sent —
+    // nothing frames it: a box around an input reads as a dialog, and this is
+    // the conversation itself. The band keeps a row of its own colour above
+    // and below the text, so the line has height instead of a hairline, and a
+    // dark row separates it from whatever was printed above.
+    lines.push("");
+    lines.push(bandRow());
+    // The first row the draft itself occupies: the caret is parked relative
+    // to it, and a row added above the band must not move the caret with it.
+    const textTop = lines.length;
     for (const [i, r] of rows.entries()) {
-      const marker = i === 0 ? c.brightCyan("❯ ") : c.gray("  ");
-      lines.push(indent + c.gray("│") + " " + marker + r.padEnd(inner) + c.gray("│"));
+      const marker = i === 0 ? c.brightCyan("› ") : "  ";
+      lines.push(bandRow(indent + marker + c.brightWhite(r.padEnd(inner))));
     }
-    lines.push(indent + c.gray("╰" + "─".repeat(w - 2) + "╯"));
+    lines.push(bandRow());
 
-    for (const l of this.menuLines(w)) lines.push(l);
+    // The command menu is not part of the frame any more: it is painted over
+    // the rows above the composer (see paintOverlay). A block that grew to hold
+    // it would drag the composer up the screen and leave a hole under the
+    // status when it closed — on an empty session, a hole with nothing to fill
+    // it. The frame's height is now the same whether the menu is open or not.
+    const menu = this.opts.suggest ? this.menuRows(w) : [];
 
-    const gap = Math.max(2, w - width(st.left) - width(st.hint));
+    // A dark row between the band and the status: the band is the conversation,
+    // the status is chrome, and without the gap the two read as one block.
+    lines.push("");
+
+    const gap = Math.max(2, statusWidth() - width(st.left) - width(st.hint));
     lines.push(indent + st.left + " ".repeat(gap) + st.hint);
-    lines.push(indent + " ".repeat(Math.max(0, w - width(st.context))) + st.context);
+    lines.push(indent + contextRow(st, statusWidth()));
 
     // Every row below is counted as one, and the walk back up on the next
     // repaint counts the same way. A row wider than the terminal breaks that:
@@ -751,6 +868,7 @@ export class InputEditor {
     // lands below the old frame instead of over it — one ghost frame per
     // keystroke. Clipping is what keeps a rendered line worth exactly one row.
     const room = fullWidth();
+
     for (const [i, l] of lines.entries()) if (width(l) > room) lines[i] = clipAnsi(l, room);
 
     // The whole repaint goes out as one write. Clearing the old box first and
@@ -759,24 +877,88 @@ export class InputEditor {
     // instead means no frame ever shows the box missing. The caret is hidden
     // for the walk: otherwise it reads as jumping a line up and snapping back.
     const prev = this.renderedRows;
+    const reclaimed = prev ? 0 : takeFooterSlack(lines.length);
+    const shrink = Math.max(0, prev - lines.length);
+    // Return rows freed by a shorter draft immediately. Shifting the visible
+    // transcript down keeps it adjacent to the input while the status stays
+    // at the bottom, without accumulating padding during history navigation.
+    const returned = bottomPinned() ? shrink : 0;
+    // A taller window (or the first draw under a banner) opens rows below the
+    // prompt, and the prompt follows them down: the composer belongs on the
+    // last line of the screen, not wherever the frame happened to be left.
+    // Rows reclaimed from a bar that came off the screen have already moved it
+    // there — asking for a drop on top of that move would open a gap under the
+    // stats, which is exactly the strip the reclaim exists to avoid.
+    const drop = reclaimed ? 0 : bottomGap(lines.length);
+    // The overlay puts back what it covers from the row log, so the blank rows
+    // that hold the composer away from the transcript have to be in it: a menu
+    // over a gap must restore a gap, not the last lines of the conversation.
+    if (drop > 0) noteBlankRows(drop);
     let frame = esc.hide;
     if (prev) frame += esc.toColumn(1) + esc.up(this.cursorRow);
+    // Only cleared footer rows are discarded. Moving the transcript with the
+    // composer avoids converting the live spinner/preview height into a gap.
+    const freed = reclaimed + returned;
+    if (freed) frame += esc.clearDown + esc.scrollDown(freed) + esc.down(freed);
+    if (drop) frame += esc.clearDown + "\n".repeat(drop);
     // Column 1 first, then wipe the row: what a shortened line used to occupy
     // has to go, and the emulators in the tests model K the same way.
     frame += lines.map((l) => esc.toColumn(1) + esc.clearRight + l).join("\n");
-    // The box shrank — a closed suggestion menu, a deleted line. The row below
-    // exists, so stepping onto it to clear downwards cannot scroll the screen.
-    if (prev > lines.length) frame += "\n" + esc.clearDown + esc.up(1);
+    if (!drop && shrink > 0 && !returned) frame += "\n" + esc.clearDown + esc.up(1);
 
     // Park the cursor inside the frame, on the row the caret belongs to.
     const { row, col } = this.locate(inner);
     const lastRow = lines.length - 1;
-    const targetRow = 1 + row;
-    frame += esc.up(lastRow - targetRow) + esc.toColumn(PAD_LEFT + 4 + col + 1) + esc.show;
+    const targetRow = textTop + row;
+    const caretCol = PAD_LEFT + 2 + col + 1;
+    frame += esc.up(lastRow - targetRow) + esc.toColumn(caretCol) + esc.show;
     paintFrame(frame);
 
+    bottomDrawn(lines.length, drop > 0 || reclaimed > 0);
+    this.paintOverlay(menu, targetRow, caretCol);
     this.renderedRows = lines.length;
     this.cursorRow = targetRow;
+  }
+
+  /**
+   * Draws the menu over the rows above the frame, and puts back what it covered
+   * when it shrinks or closes.
+   *
+   * The caret is at `caretRow` (0-based, inside the frame) when this runs, so
+   * the rows the menu needs are `caretRow + menu.length` steps up from here.
+   * The screen cannot be read back, so what stood there is remembered in
+   * `saved` when the menu is first painted and written back when it goes away.
+   * Every row it writes ends in a newline, which leaves the cursor in column 1:
+   * `caretCol` puts it back after the text, or the block cursor sits in the
+   * margin to the left of the "›".
+   */
+  private paintOverlay(menu: string[], caretRow: number, caretCol: number): void {
+    if (!process.stdout.isTTY) return;
+    // Never above the top of the screen: a frame that starts on row 0 has no
+    // room for any of it, and a menu drawn past the edge would clobber the
+    // composer instead of covering the conversation.
+    const above = Math.max(0, screenHeight() - this.renderedRows);
+    const count = Math.min(menu.length, above);
+    const restore = this.overlayCount;
+    if (!count && !restore) return;
+    let seq = esc.hide;
+    if (restore) {
+      seq += esc.up(caretRow + restore);
+      seq += this.overlaySaved.map((l) => esc.toColumn(1) + esc.clearRight + l).join("\n") + "\n";
+      seq += esc.down(caretRow);
+      this.overlaySaved = [];
+      this.overlayCount = 0;
+    }
+    if (count) {
+      // What is there now, before anything of the menu covers it.
+      this.overlaySaved = tailRows(count);
+      this.overlayCount = count;
+      seq += esc.up(caretRow + count);
+      seq += menu.map((l) => esc.toColumn(1) + esc.clearRight + l).join("\n") + "\n";
+      seq += esc.down(caretRow);
+    }
+    seq += esc.toColumn(caretCol) + esc.show;
+    process.stdout.write(seq);
   }
 }
 

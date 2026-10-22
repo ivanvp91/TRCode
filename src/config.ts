@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 import type { SubagentRole } from "./agent/roles.js";
 
-export const VERSION = "0.1.9";
+export const VERSION = "0.2.0";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";
@@ -299,6 +299,13 @@ export interface Config {
    */
   mcpServers: Record<string, McpServerConfig>;
   /**
+   * Project MCP servers the user has allowed to start, keyed by projectKey():
+   * fingerprints of `id + config`. A server in a repository's .trcode/mcp.json
+   * is a command that repository wants run on this machine — it starts only
+   * once approved (/mcp trust), and again only after any edit is approved too.
+   */
+  mcpTrusted: Record<string, string[]>;
+  /**
    * Expose MCP tools through a `find_mcp_tools` search instead of sending every
    * server's schemas with every request. Off by default: the search costs a
    * step, and only pays on servers with a dozen tools or a fat schema.
@@ -318,6 +325,14 @@ export interface Config {
    * explicit /uilib pick.
    */
   uilibAuto: boolean;
+  /**
+   * Occasional one-line hints about features the session has not used yet —
+   * one at a time, never twice, and only when the conversation has settled.
+   * `/tips off` turns them off for good.
+   */
+  tips: boolean;
+  /** Tips already shown, so a restart does not repeat them. */
+  tipsSeen: string[];
   /**
    * Whether skills take part in requests at all. Off by default: the <skills>
    * block and the `skill` tool cost ~1-2k tokens on every request, and most
@@ -415,6 +430,7 @@ const DEFAULTS: Config = {
   effortForm: {},
   providerState: {},
   projectState: {},
+  mcpTrusted: {},
   permissions: { read: "allow", write: "ask", shell: "ask", network: "ask", agent: "allow", paidMedia: "ask" },
   newlineKeys: [],
   shell: "auto",
@@ -475,6 +491,8 @@ const DEFAULTS: Config = {
   lang: "en",
   skillAuto: true,
   uilibAuto: true,
+  tips: true,
+  tipsSeen: [],
   // Off, as the comment on the field says: the block and the tool cost tokens
   // on every request, and a project that never uses a skill pays them anyway.
   skillsEnabled: false,
@@ -535,6 +553,7 @@ export function loadConfig(): Config {
     providerState: { ...DEFAULTS.providerState, ...(file.providerState || {}) },
     projectState: { ...DEFAULTS.projectState, ...(file.projectState || {}) },
     mcpServers: { ...DEFAULTS.mcpServers, ...(file.mcpServers || {}) },
+    mcpTrusted: { ...DEFAULTS.mcpTrusted, ...(file.mcpTrusted || {}) },
     statusFields: { ...DEFAULTS.statusFields, ...(file.statusFields || {}) },
     // A favoriteModels corrupted by an older save (an object-shaped spread)
     // must not crash every model panel — salvage what looks like an array.
@@ -595,10 +614,12 @@ export function saveConfig(patch: Partial<Config>, opts: { replace?: (keyof Conf
     providerState: merge("providerState", current.providerState, patch.providerState),
     projectState: merge("projectState", current.projectState, patch.projectState),
     mcpServers: merge("mcpServers", current.mcpServers, patch.mcpServers),
+    mcpTrusted: merge("mcpTrusted", current.mcpTrusted, patch.mcpTrusted),
     statusFields: merge("statusFields", current.statusFields, patch.statusFields),
     brainModels: mergeList("brainModels", current.brainModels, patch.brainModels),
     swarmModels: mergeList("swarmModels", current.swarmModels, patch.swarmModels),
     favoriteModels: mergeList("favoriteModels", current.favoriteModels, patch.favoriteModels),
+    tipsSeen: mergeList("tipsSeen", current.tipsSeen, patch.tipsSeen),
   };
   ensureDir(configDir());
   fs.writeFileSync(configPath(), JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });

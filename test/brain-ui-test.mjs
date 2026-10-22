@@ -65,6 +65,8 @@ Object.assign(app, {
   // model writes the final answer", which is what this panel exercises.
   cfg: {},
   pending: [],
+  // finishTurn empties the steering list on the way out (v0.1.10).
+  steerQueue: [],
   editor: null,
   effortOverride: undefined,
   status: () => ({ model: "mock-fast", cwdLabel: ".", contextUsed: 0, contextWindow: 128000 }),

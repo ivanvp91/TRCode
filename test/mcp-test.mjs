@@ -74,9 +74,16 @@ rl.on("line", (line) => {
 `,
 );
 
-const { McpClient, mcpServerConfigs, mcpToolDefs, connectMcpServers, stopMcpServers } = await import(
-  "../dist/mcp/client.js"
-);
+const {
+  McpClient,
+  mcpServerConfigs,
+  mcpToolDefs,
+  connectMcpServers,
+  stopMcpServers,
+  mcpClients,
+  untrustedProjectServers,
+  trustProjectServers,
+} = await import("../dist/mcp/client.js");
 const { compactSchema } = await import("../dist/mcp/schema.js");
 
 let passed = 0;
@@ -195,6 +202,23 @@ const node = process.execPath;
   const configs = mcpServerConfigs(proj);
   check("project mcp.json is picked up", Boolean(configs.tv), JSON.stringify(configs));
 
+  // A repository's server is a command it wants run here: nothing starts
+  // until the user approves that exact config for this folder.
+  check("a project server waits for trust", untrustedProjectServers(proj).includes("tv"), JSON.stringify(untrustedProjectServers(proj)));
+  connectMcpServers(proj, () => {});
+  check("an untrusted project server is not started", !mcpClients().some((c) => c.id === "tv"), mcpClients().map((c) => c.id).join(","));
+  trustProjectServers(proj);
+  check("trusting clears the wait", untrustedProjectServers(proj).length === 0, JSON.stringify(untrustedProjectServers(proj)));
+  fs.writeFileSync(
+    path.join(proj, ".trcode", "mcp.json"),
+    JSON.stringify({ mcpServers: { tv: { command: node, args: [SERVER, "--changed"] } } }),
+  );
+  check("an edited config needs trust again", untrustedProjectServers(proj).includes("tv"));
+  fs.writeFileSync(
+    path.join(proj, ".trcode", "mcp.json"),
+    JSON.stringify({ mcpServers: { tv: { command: node, args: [SERVER] } } }),
+  );
+
   await new Promise((resolve) => connectMcpServers(proj, resolve));
   const defs = mcpToolDefs();
   const serverDefs = defs.filter((d) => d.name.startsWith("mcp__tv__"));
@@ -241,6 +265,7 @@ const node = process.execPath;
     path.join(proj, ".trcode", "mcp.json"),
     JSON.stringify({ mcpServers: { tv: { command: node, args: [SERVER] } } }),
   );
+  trustProjectServers(proj);
   await new Promise((resolve) => connectMcpServers(proj, resolve));
   const defs = mcpToolDefs();
   check(
@@ -294,6 +319,7 @@ rl.on("line", (line) => {
       },
     }),
   );
+  trustProjectServers(proj);
   await new Promise((resolve) => {
     let left = 2;
     connectMcpServers(proj, () => {
@@ -309,6 +335,56 @@ rl.on("line", (line) => {
   stopMcpServers();
   fs.rmSync(proj, { recursive: true, force: true });
   fs.rmSync(READONLY, { force: true });
+}
+
+// ── a reply cut in the middle of a letter, a ping, a roots request ──────────
+// A pipe delivers whatever it has: a Cyrillic letter split across two reads
+// came out as U+FFFD when each chunk was decoded on its own. And a server's own
+// requests — ping, roots/list — need real answers, not "method not found".
+{
+  const SPLIT = path.join(here, "mock-mcp-split.mjs");
+  fs.writeFileSync(
+    SPLIT,
+    `
+import readline from "node:readline";
+const rl = readline.createInterface({ input: process.stdin });
+const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");
+const asked = {};
+rl.on("line", async (line) => {
+  const msg = JSON.parse(line);
+  if (msg.result !== undefined || msg.error !== undefined) { asked[msg.id] = msg; return; }
+  if (msg.method === "initialize") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "split" } } });
+    send({ jsonrpc: "2.0", id: "p1", method: "ping" });
+    send({ jsonrpc: "2.0", id: "r1", method: "roots/list" });
+  } else if (msg.method === "tools/list") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { tools: [{ name: "hello", inputSchema: { type: "object" } }, { name: "asked", inputSchema: { type: "object" } }] } });
+  } else if (msg.method === "tools/call" && msg.params.name === "asked") {
+    send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: JSON.stringify(asked) }] } });
+  } else if (msg.method === "tools/call") {
+    const buf = Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "Привет, мир" }] } }) + "\\n");
+    const at = buf.indexOf(Buffer.from("Привет")) + 1;
+    process.stdout.write(buf.subarray(0, at));
+    await new Promise((r) => setTimeout(r, 50));
+    process.stdout.write(buf.subarray(at));
+  }
+});
+`,
+  );
+  const client = new McpClient("split", { command: node, args: [SPLIT] });
+  client.root = HOME;
+  await client.start();
+  const res = await client.callTool("hello", {});
+  check("a letter split across two reads arrives whole", res.output === "Привет, мир", JSON.stringify(res.output));
+  const asked = JSON.parse((await client.callTool("asked", {})).output);
+  check("a ping is answered with an empty result", asked.p1 && asked.p1.result && !asked.p1.error, JSON.stringify(asked.p1));
+  check(
+    "roots/list answers with the workspace",
+    Array.isArray(asked.r1?.result?.roots) && asked.r1.result.roots[0]?.uri?.startsWith("file:"),
+    JSON.stringify(asked.r1),
+  );
+  await client.close();
+  fs.rmSync(SPLIT, { force: true });
 }
 
 fs.rmSync(SERVER, { force: true });

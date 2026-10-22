@@ -76,3 +76,41 @@ export function releaseStdin(): void {
   process.stdin.pause();
   attached = false;
 }
+
+/**
+ * Asks the terminal which row the cursor is on, 1-based, or null when it does
+ * not answer in time. The reply comes back on the input stream, so it is read
+ * through a consumer of its own; anything typed before the prompt is up would
+ * have been dropped anyway, and it still is.
+ *
+ * The stream is already in raw mode by the time the question is written:
+ * attaching a consumer does that, and the mode stays on for the rest of the
+ * session. It must not be switched back here — a console that has been handed
+ * back its line mode stops reporting arrow keys and echoes what is typed, which
+ * looks like a dead history and a lost input band.
+ */
+export function queryCursorRow(timeoutMs = 200): Promise<number | null> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return Promise.resolve(null);
+  return new Promise((resolve) => {
+    let seen = "";
+    let settled = false;
+    const finish = (row: number | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      release();
+      resolve(row);
+    };
+    // The reply can arrive split across two reads, so the buffer grows until
+    // the whole CSI sequence is in it.
+    const release = pushConsumer((chunk) => {
+      seen += chunk.toString("utf8");
+      const m = /\x1b\[(\d+);(\d+)R/.exec(seen);
+      if (m) finish(Number(m[1]));
+      else if (seen.length > 32) finish(null);
+    });
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    timer.unref?.();
+    process.stdout.write("\x1b[6n");
+  });
+}

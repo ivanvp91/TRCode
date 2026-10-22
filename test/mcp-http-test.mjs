@@ -73,6 +73,13 @@ function makeServer(options = {}) {
         return reply({ supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, serverInfo: { name: "http-modern" } });
       }
       if (msg.method === "initialize") {
+        // The SDK's stateful servers refuse an initialize that names a session
+        // they do not have — the spec says a client re-initialises without one.
+        if (options.strictInit && session && session !== st.validSession) {
+          res.writeHead(404);
+          res.end("session not found");
+          return;
+        }
         st.inits++;
         st.validSession = `sess-${st.inits}`;
         return reply(
@@ -162,6 +169,19 @@ const last = (st, method) => [...st.seen].reverse().find((m) => m.method === met
   const res = await client.callTool("echo", { text: "EXPIRE" });
   check("a 404 session is re-established and the call replayed", res.output === "echo:EXPIRE" && !res.isError, res.output);
   check("the handshake ran twice", st.inits === 2, String(st.inits));
+  await client.close();
+  await close(server);
+}
+
+// The same against a server that refuses a re-initialise carrying the dead id.
+{
+  const { server, st, url } = await makeServer({ strictInit: true });
+  const client = new McpClient("http", { url });
+  await client.start();
+  const res = await client.callTool("echo", { text: "EXPIRE" });
+  check("the new session is asked for without the dead id", res.output === "echo:EXPIRE" && !res.isError, res.output);
+  const reinit = st.seen.filter((s) => s.method === "initialize")[1];
+  check("the re-initialise carries no session header", reinit && !reinit.headers["mcp-session-id"], JSON.stringify(reinit?.headers ?? {}));
   await client.close();
   await close(server);
 }

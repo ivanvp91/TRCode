@@ -69,11 +69,10 @@ class Screen {
   lines() {
     return this.grid.slice(0, this.maxRow + 1).map((r) => r.join("").replace(/\s+$/, ""));
   }
-  countTopBorders() {
-    return this.lines().filter((l) => l.includes("╭")).length;
-  }
+  // The composer is a band now, not a box: the arrow on its first row is what
+  // a row of input looks like.
   countPrompts() {
-    return this.lines().filter((l) => l.includes("❯")).length;
+    return this.lines().filter((l) => /^\s*›/.test(l)).length;
   }
 }
 
@@ -110,25 +109,25 @@ const ok = (name, cond, detail = "") => results.push({ name, ok: Boolean(cond), 
 // Esc repeatedly: the frame must stay single.
 const p = ed.read();
 send("текст");
-const afterType = screen.countTopBorders();
+const afterType = screen.countPrompts();
 for (let i = 0; i < 5; i++) {
   send(ESC);
   await wait(60); // Esc resolves only after the disambiguation window
 }
-const afterEsc = screen.countTopBorders();
-ok("Esc не размножает рамку", afterEsc === afterType, `${afterType} → ${afterEsc}`);
-ok("одна строка ввода на экране", screen.countPrompts() === 1, `строк с ❯: ${screen.countPrompts()}`);
+const afterEsc = screen.countPrompts();
+ok("Esc не размножает строку ввода", afterEsc === afterType, `${afterType} → ${afterEsc}`);
+ok("одна строка ввода на экране", screen.countPrompts() === 1, `строк с ›: ${screen.countPrompts()}`);
 
 for (let i = 0; i < 5; i++) send(CTRL_L);
-ok("Ctrl+L не размножает рамку", screen.countTopBorders() === afterType, `${screen.countTopBorders()}`);
+ok("Ctrl+L не размножает строку ввода", screen.countPrompts() === afterType, `${screen.countPrompts()}`);
 
 // Multi-line input grows the frame but still leaves exactly one.
 send(LF, "вторая", LF, "третья");
-ok("многострочный ввод — одна рамка", screen.countTopBorders() === 1, `${screen.countTopBorders()}`);
+ok("многострочный ввод — одна строка ввода", screen.countPrompts() === 1, `${screen.countPrompts()}`);
 
 send(CR);
 await p;
-ok("после отправки рамка убрана", screen.countTopBorders() === 0, `${screen.countTopBorders()}`);
+ok("после отправки строки ввода нет", screen.countPrompts() === 0, `${screen.countPrompts()}`);
 
 // Мерцание — это кадр, пойманный терминалом на полпути: рамка стёрта, новая ещё
 // не написана. Значит нажатие клавиши обязано быть одной записью, и стирать
@@ -181,8 +180,8 @@ ok("после отправки рамка убрана", screen.countTopBorders
   const browsing = long.read();
   send("x");
   for (let i = 0; i < 6; i++) send(ESC + "[A");
-  ok("листание истории не копит рамки", wide.countTopBorders() === 1, `рамок: ${wide.countTopBorders()}`);
-  ok("одна строка ввода после листания", wide.countPrompts() === 1, `строк с ❯: ${wide.countPrompts()}`);
+  ok("листание истории не копит строки ввода", wide.countPrompts() === 1, `строк с ›: ${wide.countPrompts()}`);
+  ok("одна строка ввода после листания", wide.countPrompts() === 1, `строк с ›: ${wide.countPrompts()}`);
   ok(
     "статусная строка не переносится",
     wide.lines().filter((l) => l.includes("контекст:")).length === 1,
@@ -214,6 +213,15 @@ ok("после отправки рамка убрана", screen.countTopBorders
   ok("статус влезает в строку", width(st.left) + width(st.hint) + 2 <= w, `${width(st.left)} + ${width(st.hint)} + 2 > ${w}`);
   ok("модель в статусе уцелела", st.left.includes("nemotron-3.5-lightning"), st.left);
   ok("подсказка не обрезана многоточием", !st.hint.includes("…"), st.hint);
+
+  // Строки статуса принадлежат полосе ввода, а не тексту чата: правый край у
+  // них общий с набранным текстом, иначе бар «висит» в восьми клетках от края.
+  const { statusWidth, fullWidth: full, PAD_LEFT } = await import("../dist/ui/layout.js");
+  const { contextRow } = await import("../dist/ui/inputbox.js");
+  const sw = statusWidth();
+  ok("статус шире гуттера чата", sw > w, `${sw} vs ${w}`);
+  ok("и его правый край — край текста в полосе", PAD_LEFT + sw === full() - 3, `${PAD_LEFT + sw} vs ${full() - 3}`);
+  ok("вторая строка прижата к тому же краю", width(contextRow(st, sw)) === sw, `${width(contextRow(st, sw))} vs ${sw}`);
 
   // Место для полной подсказки появляется только на широком терминале —
   // на восьмидесяти колонках её конец всё равно нечем показать.

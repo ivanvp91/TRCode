@@ -391,6 +391,56 @@ function check(name, cond, detail = "") {
   await done;
 }
 
+// ── 7b. /sessions marks a run and deletes it in one stroke ──────────────────
+{
+  const app = makeApp();
+  const made = ["bulk one", "bulk two"].map((title) => {
+    const s = new Session({ cwd: CWD, model: "moonshotai/kimi-k3", title });
+    s.add({ role: "user", content: `the ${title} prompt` });
+    s.save();
+    return s;
+  });
+
+  screen.reset();
+  const done = runCommand(app, "/sessions");
+  await sleep(60);
+  const rows = screen.lines().map(strip);
+  const list = rows.join("\n");
+  check("the panel opens under one blank line", rows[0].trim() === "" && /╭─/.test(rows[1] ?? ""), JSON.stringify(rows.slice(0, 3)));
+  check("every row carries a checkbox", (list.match(/\[ \]/g) ?? []).length >= 3, list);
+  check("select all sits along the foot", /Select all/.test(list), list);
+  check("so does a delete button", /Delete marked/.test(list), list);
+
+  // The button is live even with nothing marked: a greyed-out bulk delete
+  // reads as broken, and the marks only exist inside the panel anyway.
+  screen.reset();
+  await key(ESC + "d");
+  await sleep(40);
+  const empty = screen.lines().map(strip).join("\n");
+  check("delete with nothing marked says so", /Nothing marked/.test(empty), empty);
+  check("and removes nothing", made.every((s) => fs.existsSync(path.join(sessionsDir(CWD), `${s.id}.json`))));
+
+  screen.reset();
+  await key(ESC + "a"); // alt+a: Select all
+  const marked = screen.lines().map(strip).join("\n");
+  check("select all ticks every row", /\[x\]/.test(marked) && !/\[ \]/.test(marked), marked);
+  check("the button turns into clear", /Clear marks/.test(marked), marked);
+
+  await key(ESC + "d"); // alt+d: Delete marked
+  await sleep(40);
+  const confirm = screen.lines().map(strip).join("\n");
+  check("bulk delete asks first", /Keep them/.test(confirm) && /Delete \d+ sessions?/.test(confirm), confirm);
+
+  await key(ESC + "[C"); // → delete
+  await key("\r");
+  await sleep(60);
+  check("both sessions are gone", made.every((s) => !fs.existsSync(path.join(sessionsDir(CWD), `${s.id}.json`))));
+  check("the current session is kept", app.session.id !== made[0].id && app.session.id !== made[1].id);
+
+  await key(ESC); // leave the list
+  await done;
+}
+
 // ── 8. wide characters do not shift columns ─────────────────────────────────
 {
   check("an emoji counts as two cells", width("⭐") === 2, String(width("⭐")));

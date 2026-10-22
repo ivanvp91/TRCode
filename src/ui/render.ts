@@ -1,9 +1,11 @@
 /** Transcript rendering: markdown-ish streaming, banners, spinners, diffs. */
-import { c, cursor, cutToWidth, esc, stripAnsi, width, wrapAnsi } from "./ansi.js";
+import { c, cursor, cutToWidth, esc, hasColor, stripAnsi, width, wrapAnsi } from "./ansi.js";
 import { PAD_LEFT, contentWidth, fmtDuration, fullWidth, indent, pad } from "./layout.js";
 import { t, count } from "../i18n.js";
 import { rememberCollapsed } from "./paste.js";
 import { highlight, langOf } from "./highlight.js";
+import { animateLogo, logoFrame, LOGO_MIN_WIDTH, LOGO_MIN_HEIGHT, LOGO_HEIGHT, type LogoAnimation } from "./logo.js";
+import { queryCursorRow } from "./stdin.js";
 
 // ── sticky footer ───────────────────────────────────────────────────────────
 
@@ -18,6 +20,19 @@ type FooterFn = () => string[];
 type FooterCaretFn = () => { row: number; col: number } | null;
 let footerFn: FooterFn | null = null;
 let footerCaretFn: FooterCaretFn | null = null;
+/**
+ * How many of the footer's rows are borrowed rather than owned: drawn over the
+ * transcript rows above the bar instead of pushing them up, and handed back
+ * from the row log when they go. The turn bar's command list is such a block —
+ * it lives for a few keystrokes, and a bar that grew for it and shrank again
+ * left a ten-row hole above itself for the rest of the turn.
+ */
+type FooterCoverFn = () => number;
+let footerCoverFn: FooterCoverFn | null = null;
+/** Borrowed rows at the top of the frame on screen. */
+let footerCover = 0;
+/** Borrowed rows of the frame footerFrame() just built. */
+let frameCover = 0;
 let footerRows = 0;
 /** The row the cursor was parked on after the last draw, for the next erase. */
 let footerCursorRow = 0;
@@ -31,6 +46,146 @@ if (process.stdout.isTTY) {
 
 /** The frame drawn last, so a repaint that would change nothing is skipped. */
 let lastFrame: string[] | null = null;
+
+// ── the block sits on the last line of the screen ───────────────────────────
+//
+// A terminal has no way to hold a block at the bottom: everything is a stream.
+// So the block is dropped there once — the rows it leaves above itself are
+// blank, and as the transcript grows they fill in — and after that it keeps its
+// place by scrolling, because every line written above it is one row of scroll.
+// A window that grows opens rows below the block, and the block drops again by
+// exactly that much.
+
+/** The row the cursor stood on when the session started, if the terminal said. */
+let startRow: number | null = null;
+/** True once the block ends on the last line of the screen. */
+let pinned = false;
+/** Rows the block still has to open below itself to get back down there. */
+let pendingDrop = 0;
+/** Height of the block that was just taken off the screen. */
+let slackRows = 0;
+/** A fresh cursor probe after that block was removed, when available. */
+let slackCursorRow: number | null = null;
+/** Screen height when that block was removed. */
+let slackScreenRows = 0;
+/** Rows written by the transcript when that block came down. */
+let slackMark = 0;
+/** Rows the transcript has moved the cursor down since setStartRow(). */
+let rowsMoved = 0;
+/** Blank rows the bar owes at its own top after a shrink — see footerFrame(). */
+let footerPad = 0;
+/** The pad the frame on screen was built with, for the caret. */
+let framePad = 0;
+let lastScreenRows = 0;
+
+function screenRows(): number {
+  return Math.max(10, process.stdout.rows || 24);
+}
+
+/** Tells the bar where the prompt is about to be drawn, so it can reach the bottom. */
+export function setStartRow(row: number | null, preserveFooterSlack = false): void {
+  startRow = row;
+  // A re-measure after a footer came off the screen keeps the fact that the
+  // block was at the bottom: the rows it owes are still owed, only the row
+  // they are counted from is fresher.
+  if (!preserveFooterSlack) pinned = false;
+  pendingDrop = 0;
+  rowsMoved = 0;
+  footerPad = 0;
+  if (preserveFooterSlack) slackCursorRow = row;
+  else {
+    slackCursorRow = null;
+    if (row !== null) slackRows = 0;
+  }
+  lastScreenRows = screenRows();
+}
+
+/**
+ * Follows the transcript down the screen.
+ *
+ * Where the session started is not enough to tell whether the block is at the
+ * bottom: a session that opened near the top of a tall window scrolls there
+ * after a few screens of answer, and from then on every block is bottom-bound
+ * whatever `startRow` says. Counting the rows that went through here is a lower
+ * bound — a long line wraps into more rows than it has newlines — so a screen
+ * that has not scrolled yet is never mistaken for one that has.
+ */
+function movedRows(text: string): void {
+  let n = 0;
+  // A wrapped line moves the cursor down without a newline of its own, and the
+  // rows it takes are the ones the block below owes: a turn's stats line that
+  // wraps into two rows used to count as one, which left the composer a row low.
+  const cols = Math.max(20, (process.stdout.columns || 80) - 1);
+  for (const seg of text.split("\n")) {
+    const w = width(seg);
+    if (w > cols) n += Math.floor(w / cols);
+  }
+  for (let i = text.indexOf("\n"); i !== -1; i = text.indexOf("\n", i + 1)) n++;
+  if (!n) return;
+  rowsMoved += n;
+  // The transcript eats the air the bar is holding above itself, one row per
+  // line: that is what puts the bar back on the conversation instead of leaving
+  // a gap between the two.
+  if (footerPad) footerPad = Math.max(0, footerPad - n);
+  // A cursor that never answered the startup probe sat somewhere on the first
+  // line, so that is the highest it can have started from.
+  if (!pinned && (startRow ?? 1) - 1 + rowsMoved >= screenRows()) pinned = true;
+}
+
+/**
+ * Rows to open under the block, so its last line lands on the screen's last
+ * line.
+ *
+ * The composer is glued to the bottom from the first frame: the transcript
+ * grows into the empty rows above it, and the window never shows a strip of
+ * nothing between the input and the status. Rows are owed once the block is
+ * drawn (a terminal that never reported the cursor keeps it where it is) and
+ * again whenever a taller window opens rows underneath.
+ */
+export function bottomGap(rows: number): number {
+  if (pinned) return pendingDrop;
+  if (startRow === null) return 0;
+  return Math.max(0, screenRows() - startRow - rows + 1);
+}
+
+/** Records where the block ended up: from here on it is the bottom of the screen. */
+export function bottomDrawn(rows: number, dropped = false): void {
+  // Pinned means "the last row of the block is the last row of the screen".
+  // That is true after a drop, and true when the block was drawn low enough
+  // that it reached the edge by itself.
+  const reached = dropped || (startRow !== null && startRow > Math.floor(screenRows() / 2));
+  if (rows > 0 && reached) pinned = true;
+  pendingDrop = 0;
+  lastScreenRows = screenRows();
+}
+
+/** True when the block's last row is the last row of the screen. */
+export function bottomPinned(): boolean {
+  return pinned;
+}
+
+/** Rows the terminal can hold — the overlay must never wrap above the top. */
+export function screenHeight(): number {
+  return screenRows();
+}
+
+
+/** Rows the transcript has written since the block took the bottom edge. */
+export function writtenRows(): number {
+  return rowsMoved;
+}
+
+if (process.stdout.isTTY) {
+  process.stdout.on("resize", () => {
+    const rows = screenRows();
+    // Only growth matters: a taller window opens rows under the block, and it
+    // has to follow them down. A shorter one takes rows off the bottom, which
+    // the next scroll already handles.
+    if (pinned) pendingDrop += Math.max(0, rows - lastScreenRows);
+    lastScreenRows = rows;
+    lastFrame = null;
+  });
+}
 
 // A terminal is free to repaint between two writes, and it does: split a frame
 // across several of them and it gets caught half-drawn — the footer erased, its
@@ -63,12 +218,26 @@ export function paintFrame(frame: string): void {
 function eraseSeq(): string {
   if (!footerRows) return "";
   const from = footerCursorRow;
+  const cover = footerCover;
   footerRows = 0;
   footerCursorRow = 0;
+  footerCover = 0;
   lastFrame = null;
   // Hidden before it moves — a visible cursor walking to the erase point reads
-  // as the caret jumping around the screen.
-  return esc.hide + esc.toColumn(1) + esc.up(from) + esc.clearDown;
+  // as the caret jumping around the screen. Borrowed rows get their transcript
+  // back, and the cursor ends where the bar's own rows began: that is where
+  // the transcript continues.
+  return esc.hide + esc.toColumn(1) + esc.up(from) + uncoverSeq(cover) + esc.clearDown;
+}
+
+/**
+ * Writes back the transcript rows that the top `n` rows of the frame were
+ * drawn over, from the cursor down, and leaves the cursor on the row under
+ * them. The screen cannot be read back; the row log is what stood there.
+ */
+function uncoverSeq(n: number): string {
+  if (n <= 0) return "";
+  return tailRows(n).map((l) => CLEAR_LINE + l).join("\n") + "\n";
 }
 
 /**
@@ -78,9 +247,10 @@ function eraseSeq(): string {
  */
 function caretSeq(lines: string[]): string {
   const caret = footerCaretFn?.() ?? null;
-  if (caret && caret.row >= 0 && caret.row < lines.length) {
-    footerCursorRow = caret.row;
-    return esc.up(lines.length - 1 - caret.row) + esc.toColumn(caret.col + 1) + esc.show;
+  const row = caret ? caret.row + framePad : -1;
+  if (caret && row >= 0 && row < lines.length) {
+    footerCursorRow = row;
+    return esc.up(lines.length - 1 - row) + esc.toColumn(caret.col + 1) + esc.show;
   }
   footerCursorRow = lines.length - 1;
   return esc.hide;
@@ -88,9 +258,20 @@ function caretSeq(lines: string[]): string {
 
 /** Writes the footer where the cursor stands — for a screen without one. */
 function drawSeq(lines: string[]): string {
-  const body = esc.hide + lines.map((l) => CLEAR_LINE + l).join("\n");
+  // The rows opened here are the ones that put the bar's last line on the last
+  // line of the screen; after this draw the bar keeps its place by scrolling.
+  // Borrowed rows are not owed: they go over the transcript above the cursor.
+  const owned = lines.length - frameCover;
+  const drop = bottomGap(owned);
+  const body =
+    esc.hide +
+    (drop ? "\n".repeat(drop) : "") +
+    esc.up(frameCover) +
+    lines.map((l) => CLEAR_LINE + l).join("\n");
   footerRows = lines.length;
+  footerCover = frameCover;
   lastFrame = lines;
+  bottomDrawn(owned, drop > 0);
   return body + caretSeq(lines);
 }
 
@@ -111,16 +292,31 @@ function repaintSeq(lines: string[]): string {
   // The rows are opened at the bottom instead: newlines on the last row scroll
   // the screen, which moves the transcript up into the scrollback rather than
   // erasing it, and the bar still ends where it ended before — at the bottom.
-  const grow = Math.max(0, lines.length - prev);
-  let body = esc.hide + esc.toColumn(1);
-  body += grow
-    ? esc.down(prev - 1 - footerCursorRow) + "\n".repeat(grow) + esc.up(lines.length - 1)
-    : esc.up(footerCursorRow);
+  //
+  // Only the rows the bar owns grow this way. Borrowed ones (see footerCover)
+  // go over the transcript above, and come back off it from the row log.
+  const prevOwned = prev - footerCover;
+  const owned = lines.length - frameCover;
+  const grow = Math.max(0, owned - prevOwned);
+  let body = esc.hide + esc.toColumn(1) + esc.up(footerCursorRow);
+  if (grow || frameCover !== footerCover) {
+    // From the old frame's top: hand the borrowed rows back, which leaves the
+    // cursor on the first row the bar owns, and build the new frame from there.
+    body += uncoverSeq(footerCover);
+    body += grow
+      ? esc.down(prevOwned - 1) + "\n".repeat(grow) + esc.up(lines.length - 1)
+      : esc.up(frameCover);
+  }
   body += lines.map((l) => CLEAR_LINE + l).join("\n");
-  // A shorter bar leaves rows of the taller one below it. That row exists, so
-  // stepping onto it to clear downwards cannot scroll the transcript.
-  if (lines.length < prev) body += "\n" + esc.clearDown + esc.up(1);
+  // A shorter bar leaves rows of the taller one below it. Clearing them where
+  // they stand leaves blanks under the bar; sliding the bar down over them
+  // would leave them inside the conversation instead, and a gap between two
+  // messages is the worse of the two. The step-down is skipped at the bottom
+  // of the screen, where that row does not exist and stepping onto it scrolls
+  // the whole transcript by a line.
+  if (owned < prevOwned) body += pinned ? esc.clearDown : "\n" + esc.clearDown + esc.up(1);
   footerRows = lines.length;
+  footerCover = frameCover;
   lastFrame = lines;
   return body + caretSeq(lines);
 }
@@ -129,10 +325,44 @@ function eraseFooter(): void {
   paint(eraseSeq());
 }
 
+/**
+ * The frame to draw: the block with the rows it owes held above it.
+ *
+ * A block that got shorter and kept its top would lift its bottom off the last
+ * line of the screen and leave those rows blank under the status — the strip
+ * that opens up the moment the reasoning preview collapses. So the rows it gave
+ * up stay at the top of its own frame: the transcript lines that follow are
+ * written into them, and until one arrives they read as air above the bar
+ * rather than a hole under it.
+ */
+function footerFrame(block: string[]): string[] {
+  // Borrowing needs the bar on the bottom edge: only then is everything above
+  // it transcript, the rows the log remembers.
+  const want = pinned && footerCoverFn ? Math.max(0, Math.min(footerCoverFn(), block.length)) : 0;
+  const own = block.length - want;
+  const height = footerPad + own;
+  if (footerRows) {
+    const prevOwned = footerRows - footerCover;
+    if (height < prevOwned) footerPad += prevOwned - height;
+    else if (height > prevOwned) footerPad = Math.max(0, footerPad - (height - prevOwned));
+  }
+  // Never above the top of the screen: what does not fit is grown, as before.
+  frameCover = Math.min(want, Math.max(0, screenRows() - (footerPad + own) - 1));
+  framePad = footerPad;
+  return footerPad ? [...Array(footerPad).fill(""), ...block] : block;
+}
+
 function drawFooter(): void {
   if (!footerFn || !process.stdout.isTTY) return;
-  const lines = footerFn();
-  if (!lines.length) return;
+  const block = footerFn();
+  if (!block.length) return;
+  const lines = footerFrame(block);
+  // A resize moved the last line of the screen: the bar has to come down to it,
+  // and only a full redraw from above can do that.
+  if (footerRows && pendingDrop > 0) {
+    paint(eraseSeq());
+    footerRows = 0;
+  }
   paint(footerRows ? repaintSeq(lines) : drawSeq(lines));
 }
 
@@ -149,16 +379,64 @@ function sameFrame(lines: string[]): boolean {
  * works. Ownership sits here rather than in the spinner: the spinner stops on
  * the first token of the answer, and the bar outlives it by the whole turn.
  */
-export function setFooter(fn: FooterFn | null, caret?: FooterCaretFn | null): void {
-  if (footerRows) eraseFooter();
+export function setFooter(fn: FooterFn | null, caret?: FooterCaretFn | null, cover?: FooterCoverFn | null): void {
+  const had = footerRows > 0;
+  if (!fn && had) {
+    // Remember the cleared rows for the idle composer. It can reclaim them
+    // without leaving an empty strip above the input or below the status.
+    // Borrowed rows go back to the transcript, so they are not owed.
+    slackRows = footerRows - footerCover;
+    slackMark = rowsMoved;
+    slackCursorRow = null;
+    slackScreenRows = screenRows();
+    footerPad = 0;
+  }
   footerFn = fn;
   footerCaretFn = fn ? (caret ?? null) : null;
-  if (fn) {
-    cursor.hide();
-    drawFooter();
-  } else {
+  footerCoverFn = fn ? (cover ?? null) : null;
+  if (fn) { slackRows = 0; slackCursorRow = null; footerPad = 0; }
+  if (!fn) {
+    // Stopping: take the bar off the screen and leave the cursor visible.
+    if (had) eraseFooter();
+    footerRows = 0;
+    lastFrame = null;
     cursor.show();
+    return;
   }
+  cursor.hide();
+  // A new footer replaces the old one in place. Erasing first and drawing
+  // again at the same row is what made a shorter bar leave a hole under itself,
+  // and at the bottom of the screen that hole is exactly the empty strip the
+  // eye catches: the new bar has to take the old one's place, not its top.
+  drawFooter();
+}
+
+/** True while a block that came off the screen still owes rows to the next one. */
+export function bottomSlackPending(): boolean {
+  return slackRows > 0;
+}
+
+/**
+ * Cleared rows below the transcript that the idle composer can reclaim by
+ * moving the screen down. The transcript follows it, preserving one separator
+ * above the input while the status still ends on the last row.
+ */
+export function takeFooterSlack(rows: number): number {
+  if (!slackRows) return 0;
+  const printed = rowsMoved - slackMark;
+  // The rows are owed because a footer came off the screen — that is enough
+  // evidence that the block below it can come down. `pinned` is not asked:
+  // the slack probe deliberately re-measures the position, which clears it.
+  const slack = slackCursorRow !== null
+    ? Math.max(0, screenRows() - slackCursorRow - rows + 1)
+    : Math.max(0, slackRows - printed - rows + screenRows() - slackScreenRows);
+  slackRows = 0;
+  slackCursorRow = null;
+  if (slack) {
+    pinned = true;
+    pendingDrop = 0;
+  }
+  return slack;
 }
 
 /** Redraws the bar in place — for the spinner tick and status updates. */
@@ -170,12 +448,19 @@ export function refreshFooter(): void {
     batchWantsFooter = true;
     return;
   }
-  const lines = footerFn();
-  if (!lines.length) return;
+  const block = footerFn();
+  if (!block.length) return;
+  const lines = footerFrame(block);
   // Several callers can ask for the same frame between two spinner ticks
   // (a label change, a queued line, the tick itself). Drawing it twice costs
   // a repaint the eye can catch, and changes nothing.
-  if (footerRows && sameFrame(lines)) return;
+  if (footerRows && pendingDrop <= 0 && sameFrame(lines)) return;
+  // A resize moved the last line of the screen: the bar has to come down to it,
+  // and only a full redraw from above can do that.
+  if (footerRows && pendingDrop > 0) {
+    paint(eraseSeq());
+    footerRows = 0;
+  }
   paint(footerRows ? repaintSeq(lines) : drawSeq(lines));
 }
 
@@ -210,19 +495,88 @@ export function batch<T>(fn: () => T): T {
   }
 }
 
+/**
+ * The last rows the transcript printed, oldest first.
+ *
+ * An overlay — the command menu drawn above the composer — covers rows of the
+ * conversation. The screen cannot be read back, so the way to lift it again is
+ * to remember what stood there: this is that memory. Only transcript writes go
+ * in; frames and the composer are not part of it.
+ */
+const rowLog: string[] = [];
+const ROW_LOG_MAX = 80;
+/** The row being written: it is not on the screen as a row until it is closed. */
+let rowPending = "";
+/** Blank rows held between the transcript and the composer, at the log's tail. */
+let gapRows = 0;
+
+function trimLog(): void {
+  if (rowLog.length > ROW_LOG_MAX) rowLog.splice(0, rowLog.length - ROW_LOG_MAX);
+}
+
+/**
+ * Printed rows go in *before* the gap: on screen the composer is separated from
+ * the transcript by those blank rows, so a new line of the conversation lands
+ * above them, not between them and the input.
+ */
+function logRows(s: string): void {
+  const parts = (rowPending + s).split("\n");
+  rowPending = parts.pop() ?? "";
+  if (!parts.length) return;
+  rowLog.splice(Math.max(0, rowLog.length - gapRows), 0, ...parts);
+  trimLog();
+}
+
+/** The transcript's last `n` rows, oldest first; short rows pad with blanks. */
+export function tailRows(n: number): string[] {
+  const taken = rowLog.slice(Math.max(0, rowLog.length - n));
+  while (taken.length < n) taken.unshift("");
+  return taken;
+}
+
+/**
+ * Rows of blank screen between the last printed line and the composer.
+ *
+ * They are part of what stands above the frame — an overlay that covers them
+ * has to put blanks back, not the last lines of the transcript — so they are
+ * recorded as rows, the same way printed lines are.
+ */
+export function noteBlankRows(n: number): void {
+  if (n <= 0) return;
+  gapRows += n;
+  for (let i = 0; i < n; i++) rowLog.push("");
+  trimLog();
+}
+
+/**
+ * The composer that held the gap has left the screen. Its blank rows stay
+ * where they are, and whatever is printed next lands *under* them, from the
+ * frame's old top — so from here on they are ordinary rows of the log.
+ *
+ * Left open, the gap stayed at the log's tail for the rest of the session and
+ * every later line was filed above it: anything restored from the log — the
+ * command list closing — painted blanks over the last lines of the answer.
+ */
+export function sealBlankRows(): void {
+  gapRows = 0;
+}
+
 function writeFrame(s: string): void {
   if (!s) return;
+  logRows(s);
   if (!footerFn || !process.stdout.isTTY) {
     process.stdout.write(s);
     return;
   }
   // A partial line would put the bar on the same row as the text; leave the
-  // redraw to the write that finishes the line.
-  paint(eraseSeq() + s + (s.endsWith("\n") ? drawSeq(footerFn()) : ""));
+  // redraw to the write that finishes the line. The bar is taken down first,
+  // so the text lands in the rows it held, and drawn back under it.
+  paint(eraseSeq() + s + drawSeq(footerFrame(footerFn())));
 }
 
 export function out(s = ""): void {
   if (s) lastBlank = /\n[ \t]*\n$/.test(s);
+  if (s) movedRows(s);
   if (batched) {
     batched.push(s);
     return;
@@ -296,26 +650,18 @@ export interface BannerInfo {
    * update waits for a restart". Absent when there is nothing to say.
    */
   versionNote?: string;
-  /** Rendered under the box; nudges toward a better setup when one exists. */
+  /** Rendered under the fields; nudges toward a better setup when one exists. */
   tip?: { title: string; detail: string };
 }
 
-const LOGO = [
-  " ████████╗██████╗",
-  " ╚══██╔══╝██╔══██╗",
-  "    ██║   ██████╔╝",
-  "    ██║   ██╔══██╗",
-  "    ██║   ██║  ██║",
-  "    ╚═╝   ╚═╝  ╚═╝",
-];
-
 /**
- * The header box. It cannot be edited once printed, so whoever changes what it
- * states prints it again — see App.repaintHeader. `compact` is the reprint:
- * the fields alone, without the logo and welcome that belong to the startup.
+ * The header, as text. A boxed frame cost two rows of chrome and two columns of
+ * every line; the working area is what the screen is for, so the fields are
+ * plain lines under the greeting. It cannot be edited once printed, so whoever
+ * changes what it states prints it again — see App.repaintHeader. `compact` is
+ * the reprint: the fields alone, no greeting, which belongs to the startup.
  */
 export function banner(info: BannerInfo & { compact?: boolean }): void {
-  const inner = contentWidth() - 2;
   // The header states the same three switchable things as the status row, and a
   // budget the model never receives is not one of them.
   const modelValue =
@@ -324,56 +670,54 @@ export function banner(info: BannerInfo & { compact?: boolean }): void {
       ? ""
       : c.gray(t("  thinking: ", "  мышление: ")) + c.brightMagenta(info.effort));
 
-  /** One framed row, padded to the box width. */
-  const row = (content = "") => {
-    const gap = Math.max(0, inner - width(content));
-    padded(c.brightBlue("│") + content + " ".repeat(gap) + c.brightBlue("│"));
-  };
-
   const fields: [string, string][] = [
     [t("Directory:", "Каталог:"), info.cwdLabel],
-    [t("Session:", "Сессия:"), info.sessionId],
     [t("Provider:", "Поставщик:"), c.brightBlue(info.provider)],
     [t("Model:", "Модель:"), modelValue],
     [t("Version:", "Версия:"), info.version + (info.versionNote ? c.gray(`  ·  ${info.versionNote}`) : "")],
   ];
 
-  if (info.compact) {
-    // A mid-session reprint must not look like a restart: no logo, no welcome —
-    // the fields alone, top and bottom borders, done.
-    line();
-    padded(c.brightBlue("╭" + "─".repeat(inner) + "╮"));
-    for (const [label, value] of fields) {
-      row("   " + c.gray(label.padEnd(12)) + c.bold(value));
-    }
-    padded(c.brightBlue("╰" + "─".repeat(inner) + "╯"));
-    line();
-    return;
-  }
-
   line();
-  padded(c.brightBlue("╭" + "─".repeat(inner) + "╮"));
-  row();
-  const aside = [
-    c.bold(c.brightBlue(t("Welcome to TRCode!", "TRCode — добро пожаловать!"))),
-    "",
-  ];
-  for (const [label, value] of fields) aside.push(c.gray(label.padEnd(12)) + c.bold(value));
-  aside.push("", c.gray(t("Send ", "Наберите ")) + c.bold("/help") + c.gray(t(" for help, ", " для справки, ")) + c.bold("/") + c.gray(t(" for the command list", " для списка команд")));
-  const logoTop = Math.floor((aside.length - LOGO.length) / 2);
-  aside.forEach((text, i) => {
-    const art = c.brightCyan((LOGO[i - logoTop] ?? "").padEnd(19));
-    row("   " + art + (text ? "  " : "") + text);
-  });
-  row();
-  padded(c.brightBlue("╰" + "─".repeat(inner) + "╯"));
+  if (!info.compact) {
+    padded(c.bold(c.brightBlue(t("Welcome to TRCode!", "TRCode — добро пожаловать!"))));
+    line();
+  }
+  for (const [label, value] of fields) padded(c.gray(label.padEnd(12)) + c.bold(value));
 
   if (info.tip) {
     line();
-    padded(c.brightYellow("✦ ") + c.brightBlue(info.tip.title));
-    padded("  " + c.gray(info.tip.detail));
+    padded(c.brightBlue(info.tip.title));
+    padded(c.gray(info.tip.detail));
   }
   line();
+}
+
+/** Draw once, then start motion after the editor owns stdin. */
+export async function logoIntro(opts: { animate?: boolean } = {}): Promise<LogoAnimation | undefined> {
+  if (!process.stdout.isTTY) return;
+  if (fullWidth() < LOGO_MIN_WIDTH + 2 || !hasColor) {
+    padded(c.gray("TRCode"));
+    return;
+  }
+  const row = await queryCursorRow();
+  // The composer and its two status rows stay clear of the logo.
+  const available = row === null ? LOGO_MIN_HEIGHT : screenRows() - row - 7;
+  if (available < LOGO_MIN_HEIGHT) {
+    padded(c.gray("TRCode"));
+    return;
+  }
+  const columns = Math.min(96, fullWidth() - 6);
+  // The block is the art itself, with no padding rows inside it: `gap` is then
+  // the real distance to the header and to the input, so the wordmark sits in
+  // the middle of the free area instead of high up with its space pooling
+  // between it and the composer.
+  const height = available >= LOGO_HEIGHT ? LOGO_HEIGHT : LOGO_MIN_HEIGHT;
+  const left = Math.max(0, Math.floor((fullWidth() - columns) / 2));
+  const gap = row === null ? 0 : Math.max(0, Math.floor((available - height) / 2));
+  for (let i = 0; i < gap; i++) line();
+  for (const art of logoFrame(columns, height)) line(" ".repeat(left) + art);
+  if (row === null || opts.animate === false || process.env.TRCODE_NO_SPLASH || !process.stdin.isTTY) return;
+  return animateLogo(row + gap, left, columns, height);
 }
 
 /**
@@ -383,33 +727,61 @@ export function banner(info: BannerInfo & { compact?: boolean }): void {
  */
 const ECHO_LINES = 5;
 
+/**
+ * One row of the band that marks text the user owns — the echoed message and
+ * the input line share it, so what is typed and what was sent read alike.
+ * Filled to the edge: a band that stops short reads as a selection.
+ */
+export function bandRow(content = ""): string {
+  const w = fullWidth() - 1;
+  return c.bgUser(content + " ".repeat(Math.max(0, w - width(content))));
+}
+
 export function userEcho(text: string): void {
   line();
-  const all = wrapText(text, contentWidth() - 2);
+  // The message sits on a band the full width of the terminal: a request and
+  // the answer under it are the two halves of a turn, and without the band the
+  // eye has to find where one stopped and the other began.
+  const left = PAD_LEFT + 2;
+  // The band is one column narrower than the terminal, and the text keeps two
+  // of those cells clear on the right: a line that ends on the band's edge
+  // looks cut off rather than wrapped.
+  const all = wrapText(text, fullWidth() - left - 3);
   // Two lines over the limit is not worth a handle; a screenful is.
   const cut = all.length > ECHO_LINES + 2;
   const shown = cut ? all.slice(0, ECHO_LINES) : all;
-  // The star marks the turn, not every line of it.
+  // The band carries a row of its own colour above and below the text: a
+  // one-row strip reads as a hairline rather than as a block you wrote.
+  line(bandRow());
+  // The arrow marks the turn, not every line of it.
   for (const [i, l] of shown.entries()) {
-    line(pad((i === 0 ? c.brightYellow("✦ ") : "  ") + c.bold(l)));
+    line(bandRow(indent + (i === 0 ? c.gray("› ") : "  ") + c.bold(c.brightWhite(l))));
   }
   if (cut) {
     rememberCollapsed(text);
     const rest = all.length - shown.length;
     line(
-      pad(
-        "  " +
+      bandRow(
+        " ".repeat(left) +
           c.gray(
             t(`… ${rest} more lines · ctrl+o to see all of it`, `… ещё строк: ${rest} · ctrl+o — показать целиком`),
           ),
       ),
     );
   }
+  line(bandRow());
   line();
 }
 
 export function assistantPrefix(model: string): void {
   padded(c.brightMagenta("●") + " " + c.dim(model));
+}
+
+/** A compact boundary between the model's work and its response. */
+export function responseDivider(): void {
+  ensureBlank();
+  rule(t("Response", "Ответ"));
+  line();
 }
 
 /**
@@ -428,7 +800,7 @@ const TOOL_INDENT = SUB;
  * are identifiers, like the command and the path beside them.
  */
 const TOOL_VERB: Record<string, string> = {
-  shell: "Bash",
+  shell: "Ran",
   edit: "Edit",
   write: "Write",
   read: "Read",
@@ -451,18 +823,27 @@ const TOOL_LINES = 5;
 
 export function toolStart(name: string, summary: string): void {
   const verb = TOOL_VERB[name] ?? name;
+  const w = contentWidth();
+  // A shell command is code, and it is coloured the way the code it touches is
+  // coloured: the tool name carries the weight, the command keeps its syntax.
+  // Everything else names its target in plain bold.
+  const shell = name === "shell";
+  const close = shell ? "" : c.gray(")");
+  const head = c.green("•") + " " + c.bold(verb) + (shell ? " " : c.gray("("));
+  const hang = width(head);
   // Two lines' worth: a real command — a cd, a pipe and a grep — does not fit
   // on one, and cutting it at the pipe hides the half that explains the
   // output underneath it.
-  const w = contentWidth();
-  const rows = wrapAnsi(
-    c.brightGreen("● ") + c.bold(verb) + c.gray("(") + c.bold(truncate(summary, w * 2 - 14)) + c.gray(")"),
-    w,
-  );
-  padded(rows[0]);
-  // A command that runs onto a second line hangs under the first, the way its
-  // output does — flush left it would read as another call.
-  for (const l of rows.slice(1)) padded("  " + l);
+  const clipped = truncate(summary, (w - hang) * 2 - 1);
+  // A path too wide for one row is cut, not split: a path broken across two
+  // rows reads as two different paths.
+  const plain = fitTokens(clipped, w - hang);
+  const body = shell ? highlight(plain, "bash") : c.bold(plain);
+  const rows = wrapAnsi(body + close, w - hang);
+  padded(head + rows[0]);
+  // A command that runs onto a second line hangs under the command itself, the
+  // way its output does — flush left it would read as another call.
+  for (const l of rows.slice(1)) padded(" ".repeat(hang) + l);
 }
 
 /**
@@ -487,6 +868,9 @@ export function toolDone(ok: boolean | null, detail: string, kind: "text" | "dif
           ),
       );
     }
+    // A block of code ends the thought it belongs to: the call under it reads
+    // as part of the code without a row of air between them.
+    ensureBlank();
     return;
   }
   const mark = ok === null ? c.gray("└ ") : ok ? c.green("└ ") : c.red("└ ");
@@ -565,6 +949,19 @@ export function truncate(s: string, max: number): string {
   if (max <= 1) return "";
   const flat = s.replace(/\s+/g, " ").trim();
   return flat.length <= max ? flat : flat.slice(0, max - 1) + "…";
+}
+
+/**
+ * A single token — usually a path — wider than the row it has is cut rather
+ * than wrapped: a path broken across two rows reads as two paths. Whatever
+ * followed it goes too, since the rest would start mid-argument.
+ */
+function fitTokens(s: string, row: number): string {
+  const words = s.split(" ");
+  for (let i = 0; i < words.length; i++) {
+    if (width(words[i]) > row) return [...words.slice(0, i), clip(words[i], row)].join(" ");
+  }
+  return s;
 }
 
 /** Cuts a line to width without collapsing its leading indentation. */
@@ -739,6 +1136,9 @@ export class MarkdownStream {
   }
 
   private emitLine(l: string): void {
+    // Providers may start the answer with several empty lines after reasoning.
+    // They are transport whitespace, not paragraphs before the first sentence.
+    if (!this.wroteAny && !l.trim()) return;
     this.wroteAny = true;
     const w = contentWidth();
     if (/^\s*```/.test(l)) {
@@ -983,7 +1383,8 @@ export class Spinner {
       indent +
         c.brightMagenta(FRAMES[this.i++ % FRAMES.length]) +
         " " +
-        c.dim(this.label) +
+        // Same colour as the turn bar's label — see TurnBar.spinnerLine.
+        c.brightCyan(this.label) +
         c.gray(` (${elapsed}${counts}${tps})`) +
         (this.cancelable ? c.gray("  esc to interrupt") : ""),
     );
@@ -1115,7 +1516,7 @@ function diffRow(row: { no: number; mark: " " | "-" | "+"; text: string }, gutte
   // The band has to reach the edge, so the line is padded inside the colour.
   const gap = Math.max(0, room - width(code));
   return (row.mark === "+" ? c.bgAdd : c.bgDel)(
-    (row.mark === "+" ? c.green(head) : c.red(head)) + code + " ".repeat(gap),
+    (row.mark === "+" ? c.fgAdd(head) : c.fgDel(head)) + code + " ".repeat(gap),
   );
 }
 

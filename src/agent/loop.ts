@@ -33,6 +33,8 @@ export interface AgentEvents {
   onTrim?(savedTokens: number, count: number): void;
   /** The connection died; the step is being resent. `hadText`: part of the answer had already been streamed. */
   onReconnect?(reason: string, attempt: number, of: number, hadText?: boolean): void;
+  /** The user steered the running turn: the text has just joined the history. */
+  onSteer?(text: string): void;
   /** The history was compacted mid-turn, between a tool round and the next request. */
   onCompacted?(): void;
   /** Mid-turn compaction failed; the turn continues on the history as it stands. */
@@ -78,6 +80,13 @@ export interface RunOptions {
    * reached (see shouldAutoCompact). Returns true when it compacted.
    */
   midTurnCompact?: () => Promise<boolean>;
+  /**
+   * Lines the user typed while the turn was running. Drained at the same step
+   * boundaries as `interject`, and each one becomes a user message inside the
+   * turn — steering, not a new turn: the model reads it before its next
+   * request and adjusts, keeping whatever it has already done.
+   */
+  steer?: () => string[];
   /**
    * When set, every request appends a projection record — what the model was
    * actually sent, by component — to the session's .proj.jsonl. Absent for
@@ -297,6 +306,21 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // the user interrupts it, or the host refuses.
   const cap = opts.maxSteps > 0 ? opts.maxSteps : Infinity;
 
+  /**
+   * Puts whatever was typed into the bar during the turn into this turn's
+   * history. Called after the tool results, never before them: a user message
+   * between an assistant's tool_calls and their answers is a history most
+   * hosts refuse.
+   */
+  const takeSteering = (): void => {
+    for (const raw of opts.steer?.() ?? []) {
+      const text = raw.trim();
+      if (!text) continue;
+      messages.push({ role: "user", content: text });
+      events?.onSteer?.(text);
+    }
+  };
+
   for (; step < cap; step++) {
     if (opts.signal.aborted) return { finalText, steps: step, stoppedBecause: "aborted" };
     events?.onStep?.(step);
@@ -448,6 +472,8 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     if (repeats >= LOOP_REFUSE_AT) {
       messages.push(...loopBreakResults(toolCalls, repeats + 1));
       if (repeats >= LOOP_ABORT_AT) return { finalText, steps: step + 1, stoppedBecause: "looping" };
+      // A model going in circles is exactly who a correction is for.
+      takeSteering();
       continue;
     }
 
@@ -494,6 +520,9 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
     // will read it last, which is where an instruction is actually followed.
     const spliced = opts.interject?.(assistantMsg, toolCalls);
     if (spliced) messages.push(spliced);
+    // The user's own words go last of all: the next request reads them last,
+    // which is where a correction is actually followed.
+    takeSteering();
   }
 
   return { finalText, steps: step, stoppedBecause: "max_steps" };

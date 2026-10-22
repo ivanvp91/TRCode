@@ -383,6 +383,14 @@ export function callbackServer(
     const failure = got.searchParams.get("error");
     const returned = got.searchParams.get("code");
     const seen = got.searchParams.get("state");
+    // A hit on the path that carries neither a code nor an error is not the
+    // redirect — a browser re-request, a prefetch, a reload of an old tab. It
+    // used to settle the login as "state mismatch" and lose the real redirect
+    // that came right after.
+    if (!failure && !returned) {
+      res.writeHead(400, { "Content-Type": "text/html; charset=utf-8" }).end(resultPage(false, null));
+      return;
+    }
     const ok = !failure && Boolean(returned) && seen === state;
     res
       .writeHead(ok ? 200 : 400, { "Content-Type": "text/html; charset=utf-8" })

@@ -70,9 +70,19 @@ export class StdioTransport implements McpTransport {
       this.proc!.once("close", done);
     });
 
-    this.proc.stdout?.on("data", (b: Buffer) => this.onData(b.toString("utf8")));
-    this.proc.stderr?.on("data", (b: Buffer) => {
-      for (const line of b.toString("utf8").split("\n")) {
+    // Decoded by the stream, not chunk by chunk: a pipe cuts wherever it likes,
+    // and a Cyrillic letter or an emoji split across two reads came out as
+    // U+FFFD in the middle of a tool result.
+    this.proc.stdout?.setEncoding("utf8");
+    this.proc.stderr?.setEncoding("utf8");
+    this.proc.stdout?.on("data", (s: string) => this.onData(s));
+    // A log line can arrive in pieces too; only finished lines are reported.
+    let errBuf = "";
+    this.proc.stderr?.on("data", (s: string) => {
+      errBuf += s;
+      const lines = errBuf.split("\n");
+      errBuf = (lines.pop() ?? "").slice(-4096);
+      for (const line of lines) {
         const trimmed = line.trim();
         if (trimmed) this.onStderr?.(trimmed);
       }
@@ -156,9 +166,15 @@ export function isDirectlySpawnable(command: string): boolean {
   return false;
 }
 
-/** cmd.exe quoting for the one shape that breaks in practice: embedded spaces. */
+/**
+ * cmd.exe quoting. Spaces are not the only thing that breaks: `&`, `|`, `<`,
+ * `>`, `^` and parentheses are cmd's own syntax, and `npx mcp-remote
+ * https://host/sse?a=1&b=2` ran `b=2` as a second command. Inside double
+ * quotes cmd takes all of them literally.
+ */
 export function quoteWin(s: string): string {
-  if (!/[\s"]/.test(s)) return s;
+  if (s === "") return '""';
+  if (!/[\s"&|<>^()]/.test(s)) return s;
   return `"${s.replace(/"/g, '\\"')}"`;
 }
 

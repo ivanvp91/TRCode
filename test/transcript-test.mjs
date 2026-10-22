@@ -20,7 +20,7 @@ const realWrite = process.stdout.write.bind(process.stdout);
 process.stdout.write = (chunk) => { captured += String(chunk); return true; };
 const say = (s = "") => realWrite(s + "\n");
 
-const { userEcho, toolStart, toolDone, assistantPrefix, ensureBlank, line, padded, MarkdownStream } =
+const { userEcho, toolStart, toolDone, assistantPrefix, responseDivider, ensureBlank, line, padded, MarkdownStream } =
   await import("../dist/ui/render.js");
 
 const strip = (s) => s.replace(new RegExp(ESC + "\\[[0-9;]*[A-Za-z]", "g"), "");
@@ -39,11 +39,11 @@ function check(name, cond, detail = "") {
   else { failed++; say("  FAIL " + name + "\n" + detail); }
 }
 
-// ── the ✦ marks the message, not every line of it ───────────────────────────
+// ── the › marks the message, not every line of it ───────────────────────────
 {
   userEcho("first paragraph of the request\nsecond line after Ctrl+Enter");
   const lines = take();
-  const marked = lines.filter((l) => l.includes("✦"));
+  const marked = lines.filter((l) => l.includes("›"));
   check("only the first line carries the marker", marked.length === 1, lines.join("\n"));
   check(
     "continuation lines are indented to the marker",
@@ -56,7 +56,18 @@ function check(name, cond, detail = "") {
   // A long single line wraps; the wrapped rows must not repeat the marker.
   userEcho("раз ".repeat(60).trim());
   const lines = take();
-  check("a wrapped message keeps one marker", lines.filter((l) => l.includes("✦")).length === 1, lines.join("\n"));
+  check("a wrapped message keeps one marker", lines.filter((l) => l.includes("›")).length === 1, lines.join("\n"));
+}
+
+{
+  // The band runs one cell short of the terminal edge, and the text stops two
+  // cells before the band's end: a glyph sitting on the edge reads as clipped.
+  // An unbroken run of letters fills every row to its limit, which is the case
+  // a word-wrapped sentence can miss by a cell.
+  userEcho("аб".repeat(300));
+  const rows = take().filter((l) => l.trim() !== "");
+  const widest = Math.max(...rows.map((l) => l.trimEnd().length));
+  check("wrapped text keeps two clear cells at the band's edge", widest === 97, String(widest));
 }
 
 // ── a tool call reads as an action, its result hangs under it ───────────────
@@ -72,7 +83,7 @@ function check(name, cond, detail = "") {
   const lines = take().filter((l) => l !== "");
 
   const answer = lines.find((l) => l.includes("Логика"));
-  // The header names the tool: "Edit(…)", "Bash(…)" — the same word in every
+  // The header names the tool: "Edit(…)", "Ran …" — the same word in every
   // language, because it stands for a tool and not for a verb.
   const tool = lines.find((l) => l.includes("Edit("));
   const detail = lines.find((l) => l.includes("└"));
@@ -80,8 +91,8 @@ function check(name, cond, detail = "") {
   const toolIndent = tool.length - tool.trimStart().length;
   const detailIndent = detail.length - detail.trimStart().length;
 
-  check("a tool call is named by its tool", /● Edit\(/.test(tool), JSON.stringify(tool));
-  check("shell reads as Bash", lines.some((l) => /● Bash\(/.test(l)), JSON.stringify(lines));
+  check("a tool call is named by its tool", /• Edit\(/.test(tool), JSON.stringify(tool));
+  check("a command reads as Ran", lines.some((l) => /• Ran /.test(l)), JSON.stringify(lines));
   // Same margin as the answer: both are things the agent did this turn.
   check("tool calls sit at the answer's margin", toolIndent === answerIndent, JSON.stringify(lines));
   check("the result hangs under its call", detailIndent > toolIndent, JSON.stringify(lines));
@@ -97,7 +108,7 @@ function check(name, cond, detail = "") {
   toolStart("shell", "{}");
   toolStart("read", "{}");
   const lines = take();
-  const isTool = (l) => /● (Edit|Bash|Read)\(/.test(l);
+  const isTool = (l) => /• (Edit|Ran|Read)/.test(l);
   const firstTool = lines.findIndex(isTool);
   check("a blank line opens the group", lines[firstTool - 1].trim() === "", JSON.stringify(lines));
   check(
@@ -116,6 +127,36 @@ function check(name, cond, detail = "") {
   toolStart("read", "{}");
   const lines = take();
   check("ensureBlank never doubles up", lines.filter((l) => l === "").length === 1, JSON.stringify(lines));
+}
+
+// Providers sometimes put multiple blank chunks before the first answer line.
+// Keep the transcript separator and one blank row under the labelled rule.
+{
+  captured = "";
+  padded("reasoning finished");
+  responseDivider();
+  const md = new MarkdownStream();
+  md.push("\n  \n");
+  md.push("\n\nDone.\n\nSecond paragraph.");
+  md.end();
+  const lines = take();
+  const divider = lines.findIndex((l) => /─+ Response ─+/.test(l));
+  check("a labelled rule separates reasoning from the response", divider === 2, JSON.stringify(lines));
+  check("exactly one blank row separates the rule from the answer", lines[divider + 1]?.trim() === "" && lines[divider + 2]?.trim() === "Done.", JSON.stringify(lines));
+  check("blank lines inside the answer remain paragraphs", lines[divider + 3]?.trim() === "" && lines[divider + 4]?.trim() === "Second paragraph.", JSON.stringify(lines));
+}
+
+{
+  const { saveConfig } = await import("../dist/config.js");
+  saveConfig({ lang: "ru" });
+  responseDivider();
+  check("the response divider uses the UI language", take().some((l) => /─+ Ответ ─+/.test(l)));
+  saveConfig({ lang: "en" });
+  const md = new MarkdownStream();
+  md.push("\n```text\n\n  indented\n```\n");
+  md.end();
+  const lines = take();
+  check("leading whitespace cleanup preserves blank lines inside code", lines[0]?.includes("```text") && lines[1]?.trim() === "" && lines[2]?.includes("  indented"), JSON.stringify(lines));
 }
 
 // ── a streamed table is aligned, not left as raw pipes ─────────────────────

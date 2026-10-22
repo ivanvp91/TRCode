@@ -888,9 +888,16 @@ async function freshCredentials(def: ProviderDef, force = false): Promise<Creden
   const refreshId = `${def.id}:${creds.clientId ?? ""}`;
   const pending = refreshing.get(refreshId);
   if (pending) return pending;
+  const tried = creds;
   const job = (def.id === "openai" ? refreshChatgpt(creds, force) : refreshToken(def.oauth, creds))
     .then((next) => def.id === "openai" ? next : writeCredentials(def.id, next))
     .catch((err) => {
+      // Another trc process may have renewed first: a host that rotates
+      // refresh tokens then refuses ours as reused, while the fresh pair is
+      // already on disk. Take it rather than send the user to log in again.
+      // (ChatGPT does this under its own profile lock in refreshChatgpt.)
+      const now = readCredentials(def.id);
+      if (now?.mode === "oauth" && now.accessToken !== tried.accessToken && !isStale(now)) return now;
       throw new Error(
         `Could not refresh the ${def.label} token: ${(err as Error).message}. Run: trc auth login --provider ${def.id}`,
       );

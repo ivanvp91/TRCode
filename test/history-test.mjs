@@ -89,10 +89,10 @@ async function draft(keys) {
   return p;
 }
 
-// 90 columns leaves 73 inside the frame, so this is two rows: 73 + 27.
+// 90 columns leaves 82 inside the input band, so this is two rows: 82 + 18.
 const LONG = "а".repeat(100);
 const upInWrap = await draft([LONG, UP, "X", CR]);
-ok("↑ идёт по перенесённой строке, а не в историю", upInWrap.indexOf("X") === 27, upInWrap.slice(0, 40));
+ok("↑ идёт по перенесённой строке, а не в историю", upInWrap.indexOf("X") === 18, upInWrap.slice(0, 40));
 
 const backDown = await draft([LONG, UP, DOWN, "X", CR]);
 ok("↓ возвращает на нижний ряд", backDown.indexOf("X") === 100, backDown.slice(0, 40));

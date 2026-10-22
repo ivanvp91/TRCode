@@ -60,11 +60,15 @@ await run("Enter по-прежнему отправляет", ["готово", C
 await run("обратный слеш всё ещё работает", ["ab\\", CR, "cd", CR], "ab\ncd");
 await run("три строки подряд", ["1", LF, "2", LF, "3", CR], "1\n2\n3");
 
-// The frame has to grow with the text instead of overwriting its own border.
+// The composer has to grow with the text instead of overwriting its own rows.
 frames = "";
 const p = ed.read();
 send("одна", LF, "две", LF, "три");
-const rows = frames.split("\n").filter((l) => l.includes("│")).length;
+// One repaint is all this needs to count: the last one holds the whole draft.
+frames = "";
+send("!");
+const plain = frames.replace(new RegExp(ESC + "\\[[0-9;]*[A-Za-z]", "g"), "");
+const rows = plain.split("\n").filter((l) => l.includes("›") || /^ {5}\S/.test(l)).length;
 send(CR);
 await p;
 ok("рамка растёт под несколько строк", rows >= 3, `строк ввода в рамке: ${rows}`);

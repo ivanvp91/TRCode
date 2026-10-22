@@ -14,8 +14,8 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
-import sharp from "sharp";
 import type { ToolDef, ToolResult } from "../types.js";
+import { loadSharp } from "./sharp.js";
 
 /** ~1600 KB of PNG is ~2.2 MB of base64; enough for any screenshot. */
 const MAX_IMAGE_BYTES = 1_600_000;
@@ -105,6 +105,7 @@ export const readImageTool: ToolDef = {
     } finally { await handle.close(); }
     let dims = imageDimensions(buf);
     try {
+      const sharp = await loadSharp();
       const meta = await sharp(abs, { limitInputPixels: 64_000_000 }).metadata();
       if (meta.width && meta.height) dims = { width: meta.width, height: meta.height };
     } catch (err) {
@@ -121,6 +122,7 @@ export const readImageTool: ToolDef = {
     try {
       let max = args.max_dimension ?? 1600;
       if (!Number.isInteger(max) || max < 128 || max > 2048) throw new Error("max_dimension must be 128..2048");
+      const sharp = await loadSharp();
       const pipeline = () => {
         let image = sharp(buf, { limitInputPixels: 64_000_000, failOn: "warning" });
         if (args.crop) {

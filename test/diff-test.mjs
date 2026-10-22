@@ -22,8 +22,10 @@ Object.defineProperty(process.stdout, "columns", { value: 100, configurable: tru
 
 const ESC = String.fromCharCode(27);
 const strip = (s) => s.replace(new RegExp(ESC + "\\[[0-9;]*m", "g"), "");
-const ADD_BAND = ESC + "[48;5;22m";
-const DEL_BAND = ESC + "[48;5;52m";
+// Codex's muted pair: a dark desaturated green and red, not the vivid ones the
+// 256-colour cube offers.
+const ADD_BAND = ESC + "[48;2;33;58;43m";
+const DEL_BAND = ESC + "[48;2;74;34;29m";
 
 const { saveConfig } = await import("../dist/config.js");
 const { renderDiff, toolStart, toolDone } = await import("../dist/ui/render.js");
@@ -152,7 +154,7 @@ ok("подсветка не меняет текст", strip(highlight('const s =
   toolDone(true, out, "diff");
   process.stdout.write = real;
   const p = strip(printed);
-  ok("заголовок — имя инструмента", /● Edit\(src\/a\.ts\)/.test(p), p.split("\n")[0]);
+  ok("заголовок — имя инструмента", /• Edit\(src\/a\.ts\)/.test(p), p.split("\n")[0]);
   // Printing a diff through the plain path would dim and clip it.
   ok("дифф напечатан как есть", printed.includes(ADD_BAND), "полоса потерялась");
 }

@@ -107,6 +107,13 @@ the same shape. Stdio is the default; `url` selects Streamable HTTP:
 }
 ```
 
+A server in a project's `.trcode/mcp.json` is a command that repository wants run on your
+machine, so it does not start until you allow it: `trc` names the waiting servers at
+startup, `/mcp` shows exactly what each would run, and `/mcp trust` starts them. The
+approval covers this folder and this exact config — any edit to the command, its
+arguments or environment has to be approved again. Servers in your own
+`~/.trcode/config.json` start without asking.
+
 Servers start in the background at session start; their tools appear in the registry as
 `mcp__<id>__<tool>` when each one is ready. Names that require sanitizing or truncating
 receive a hash suffix to avoid collisions. Tools explicitly marked read-only use
@@ -126,7 +133,10 @@ What a server can say and what this client does with it:
 - **Resources** become three tools — `list_mcp_resources`, `read_mcp_resource`,
   `list_mcp_resource_templates` — that appear once a connected server advertises them.
 - **Results** keep text, attach `image` blocks to the model (vision hosts), fold
-  `structuredContent` into a JSON block, and cut at `outputLimit` characters.
+  `structuredContent` into a JSON block (unless a text block already carries the same
+  JSON), and cut at `outputLimit` characters.
+- **Server requests**: `ping` is answered, `roots/list` returns the project folder;
+  sampling and elicitation are refused.
 - **Progress** (`notifications/progress`) is printed in the transcript; **images** and
   **resource links** are no longer replaced by `[content omitted]`.
 - **Transport failures** are retried three times (250 ms, 1 s) for the handshake and
@@ -185,9 +195,11 @@ Three ways to distribute agent work, using the same worker execution policy, plu
   tools, no file changes — see [A panel of models](#a-panel-of-models).
 
 Chat, `/orchestrate`, `/swarm` and `/brain` keep the input frame and status line visible
-while running. Esc or a single Ctrl+C stops the active task. Enter queues a message for
-the next turn; it does not change the assignment already running. After an interrupt,
-queued messages and the draft return to the editor and are not automatically sent.
+while running. Esc or a single Ctrl+C stops the active task. In chat, Enter steers the
+running turn — the message joins it at the next step, after the tool results and before
+the next request — and Tab queues it for a turn of its own. Commands and panels have no
+step boundary to steer, so Enter there always queues. After an interrupt, queued messages
+and the draft return to the editor and are not automatically sent.
 The `toolConcurrency` setting bounds worker fan-out in chat, orchestration and swarm;
 orchestration steps that change files still run one at a time.
 

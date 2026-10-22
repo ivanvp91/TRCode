@@ -55,7 +55,7 @@ insert, Esc to dismiss. `/help` prints the full reference.
 system prompt, tool schemas, history after trim, injections — the projection behind
 [Token spend](models-and-costs.md#token-spend))
 
-**Settings** — `/lang [en\|ru]`, `/default [name]`, `/aliases`, `/permissions`, `/login [provider] [url]`, `/settings`, `/update [--check]`, `/config`, `/cwd`
+**Settings** — `/lang [en\|ru]`, `/default [name]`, `/aliases`, `/permissions`, `/login [provider] [url]`, `/settings`, `/tips [on\|off\|reset]`, `/update [--check]`, `/config`, `/cwd`
 (the catalog lives in `/model` — the panel lists the current provider by type and vendor,
 `/model all` every provider, and its Refresh button re-reads it past the cache; `/login`
 connects the one in use unless another is named, and takes a host for the providers whose
@@ -81,7 +81,7 @@ details in [Writing the prompt](tools-and-workflows.md#writing-the-prompt))
 
 `/lang` sets three things at once and saves the choice as the default: the language the
 agent answers in, the one skills describe themselves in, and the interface itself — the
-header box, the status line, the command list and its help, the pickers, the permission
+header, the status line, the command list and its help, the pickers, the permission
 prompts and the messages commands print. Switching repaints the header, so the screen is
 in the new language immediately.
 
@@ -128,8 +128,14 @@ trc update --check   # only report what is out there
 ```
 
 Same inside a session: `/update`. The tarball comes from
-`github.com/ivanvp91/TRCode/releases`, is unpacked with the system `tar`, and the swap
-keeps the old `dist` around until the new one is in place. `"updateCheck": false` (or
+`github.com/ivanvp91/TRCode/releases` and is unpacked with the system `tar`. The updater
+prepares the new `dist` on the install's filesystem. Missing or incompatible dependency
+versions are installed with npm in a separate copy of `node_modules`; an npm failure
+aborts before the live installation changes. The updater replaces the prepared directories
+with renames and keeps backups until the restart marker is written. If replacement fails,
+it restores the old build and dependencies; if a locked file also blocks restoration, the
+error names the preserved backup directory. `/update --check` only checks for a release.
+`"updateCheck": false` (or
 `TRCODE_NO_UPDATE_CHECK`) turns the passive startup check off; `/update` keeps working.
 
 ### Keys
@@ -152,18 +158,56 @@ under xterm's modifyOtherKeys and the kitty keyboard protocol as well as plain b
 its first (or last) line — the history persists across restarts, separately per project.
 **Esc** interrupts the current turn, **Ctrl+C** exits, **Ctrl+L** repaints the frame.
 
+**!** at the start of a line runs the rest in your shell instead of sending it to the
+model — `!git status`, `!npm test`, `!grep -rn TODO src`. It goes through the same tool
+the agent uses, so confirmations, timeouts and Esc work exactly as they do in a turn;
+the output is printed in the transcript as a tool call. The command and what it printed
+then join the history as a user message, so the next turn already knows what you found
+out — but the message is marked hidden, so replaying the session does not echo it twice.
+A lone `!` is still plain text.
+
 ## The interface
+
+An empty interactive session opens with a monochrome dotted TR monogram and a small
+TRCODE wordmark. Braille characters draw the dots directly in the terminal; a quiet
+breathing effect changes the whole mark's grey tone together. Smaller windows use a
+compact version. Only changed cells are redrawn, and animation pauses while terminal
+output drains. Motion stops on the first
+key or a window resize, leaving the input ready throughout. The first submitted message
+or command removes the logo and its empty space; the conversation starts under the
+header. Set `TRCODE_NO_SPLASH=1` for a static logo. Small windows
+and terminals without colour show a compact name; resumed sessions, initial prompts
+and redirected output skip the splash.
 
 Below the input sits a status line: mode, provider, model, reasoning budget, directory and
 how full the context window is. The directory is the elastic part — it shrinks from the
 left and is dropped first when the row runs out of room.
 
+Now and then a finished answer is followed by a single line of the form `tip — …`, naming
+one thing this session has not used yet: `/brain`, `/uilib add`, `/swarm`, `/goal`,
+`/rewind`, `/fork`, `/trace`, `/preset minimal`, `/stat`, `/subagents`, `/compact` or the
+`!` shell prefix. The rules that keep it from turning into a brochure: one hint per turn
+at most, never before the third turn, never during a goal, never the same one twice
+(shown ids are remembered in the config), and never a tip whose subject is already in
+use. `/tips off` silences them, `/tips on` brings them back, `/tips reset` forgets what
+was shown.
+
 ```
-   ╭────────────────────────────────────────────────────────────────╮
-   │ ❯                                                              │
-   ╰────────────────────────────────────────────────────────────────╯
+   › what the pricing page needs
    yolo  TokenRouter  moonshotai/kimi-k3  thinking: high  ~/proj   context: 3% (23k/1M)
 ```
+
+The input sits on a band across the width of the terminal, and a sent message is echoed
+on the same band: one band means "yours", and the answer under it is plainly not.
+
+The band and its status line sit on the last line of the screen, like a composer in a chat
+window: the banner stays at the top, the transcript fills the space between them, and a
+window that grows brings the input down with its new bottom edge.
+
+Long messages wrap on words, not on cells: the break goes at the last space that still
+fits, and only a run with no space in it — a path, a base64 blob — is ever cut in the
+middle. The arrows walk the rows the band actually draws, so a wrapped draft is one text,
+not several lines.
 
 The `yolo` marker appears when confirmations are off (`--yolo` at launch, or `/yolo`).
 
@@ -211,12 +255,10 @@ reads as one thing:
        Use it with: /model kimi   (alias for kimi:k3)
 ```
 
-Typing `/` opens the command list right under the frame:
+Typing `/` opens the command list right under the input:
 
 ```
-   ╭──────────────────────────────────────────────────────────────╮
-   │ ❯ /                                                          │
-   ╰──────────────────────────────────────────────────────────────╯
+   › /
      → /model     [name|alias]  —  switch model
        /provider  [name] | default [name] | logout <name>
        /effort    [off|minimal|low|medium|high] [save]
@@ -229,27 +271,35 @@ which walks the cursor between the transcript and the bar — visible, that read
 caret flying around the screen. It is restored when the bar comes down, and on process
 exit, so a crash cannot leave the shell without one.
 
-While the model works, the input frame stays where it is: the spinner sits above it and
+While the model works, the input line stays where it is: the spinner sits above it and
 the transcript scrolls above that. A ten-minute run never leaves you looking at a bare
 spinner wondering whether the prompt is coming back.
 
 ```
    ⏺ read(src/index.ts)
      └ 45 of 45 lines
-   ⠹ reasoning (6m 33s · ↑ 18k ↓ 11.4k)  esc to interrupt · type to queue a message
-     ⎿ queued: and check the tests too
-   ╭────────────────────────────────────────────────────────────────╮
-   │ ❯                                                              │
-   ╰────────────────────────────────────────────────────────────────╯
+   ⠹ reasoning (6m 33s · ↑ 18k ↓ 11.4k)  esc to interrupt · type to steer
+     ⎿ steering: and check the tests too
+   ›
    moonshotai/kimi-k3  thinking: high  ~/proj      context: 3% (23k/1M)
 ```
 
-You can type while the model is busy. **Enter** queues the message and it is sent as soon
-as the current turn finishes; anything left unsent stays in the box for editing.
+You can type while the model is busy. **Enter** hands the line to the running turn: it
+joins the history at the next step — after the tool results, before the next request — so
+the model reads it and adjusts, keeping whatever it has already done. The line stays in
+the bar as `⎿ steering:` until the turn takes it. **Tab** queues instead: the message goes
+out as a turn of its own once this one finishes. A panel or a long command has no step
+boundary to steer, so Enter there queues as it always did.
+
+Commands and messages are two different things, and the bar knows it: a line starting
+with `/` is queued rather than steered, because the model would read `/model k3` as prose.
+The command list opens under the band exactly as it does in the idle composer — `/` lists
+what matches, the arrows walk it, Enter puts the highlighted command in the line (and
+`enter to pick` in the spinner says which of the two Enters is in play).
 
 **Esc** interrupts the turn — the streaming answer, the thinking, a tool that is running,
 a send being held back after a 429, and a permission prompt waiting on you — and hands
-back everything you typed, queued messages included. A tool that ignores its own signal
+back everything you typed, steered and queued lines alike. A tool that ignores its own signal
 cannot hold the turn open either: the results of an interrupted round are discarded, so
 there is nothing to wait for. Nothing is sent on your behalf after an interrupt: sending the queue
 would start a new turn in the same breath, which is indistinguishable from Esc having done
@@ -329,7 +379,7 @@ session shows its digest as a labelled block instead of raw XML:
    ▍ Task
    ▍ Ship the pricing page.
 
-   ✦ analyse the fx monitor pricing
+   › analyse the fx monitor pricing
 
    ● moonshotai/kimi-k3
    Plan    │ $/mo  │ Accounts │ Sync
@@ -353,6 +403,11 @@ Delete · Compact**, Esc to go back:
 
     Continue   [Rename]  [Delete]  [Compact]   ←/→ · Enter to confirm · Esc back to the list
 ```
+
+Every row has a checkbox: Space marks a session and the buttons along the foot act on the
+whole marked set — **Select all** ticks every session but the current one (and turns into
+**Clear marks**), **Delete marked** asks once and removes them all in one stroke. Enter
+keeps its old job of opening the row under the cursor.
 
 Deleting asks for confirmation and refuses to remove the session you are currently in.
 `/rename [title]` renames the open session — without an argument it prompts, prefilled

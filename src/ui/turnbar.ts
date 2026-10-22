@@ -4,16 +4,31 @@
  * Before this, the frame was torn down for the duration of a turn and the
  * spinner was the only thing left on screen — on a ten-minute run the terminal
  * looked like the CLI had forgotten about you. The bar keeps the prompt where
- * it always is, and anything typed into it is queued and sent when the current
- * turn finishes.
+ * it always is. Enter steers the running turn — the text joins it at the next
+ * step, the way a word across the desk redirects someone mid-task — and Tab
+ * queues a message for after it.
  */
 import { c, clipAnsi, width } from "./ansi.js";
-import { contentWidth, indent, PAD_LEFT } from "./layout.js";
+import { bandTextWidth, contentWidth, fullWidth, indent, PAD_LEFT, statusWidth } from "./layout.js";
 import { fmtDuration } from "./layout.js";
-import { expandedBlock, line, padded, refreshFooter, setFooter } from "./render.js";
+import { expandedBlock, bandRow, line, padded, refreshFooter, setFooter } from "./render.js";
 import { pushConsumer } from "./stdin.js";
-import { cleanPaste, isPartialEscape, isNewlineKey, KEY, locatePos, rowSpansOf, SHIFT_TAB, type EditorStatus } from "./editor.js";
+import {
+  cleanPaste,
+  isPartialEscape,
+  isNewlineKey,
+  KEY,
+  locatePos,
+  rowSpansOf,
+  SHIFT_TAB,
+  suggestionLines,
+  wrapBuf,
+  type EditorStatus,
+  type Suggestion,
+} from "./editor.js";
 import { stashPaste, takeCollapsed } from "./paste.js";
+import { panelRows } from "./panel.js";
+import { contextRow } from "./inputbox.js";
 
 const CTRL_C = String.fromCharCode(3);
 const CTRL_U = String.fromCharCode(21);
@@ -178,7 +193,27 @@ export interface TurnBarOptions {
   onToggleMode?: () => void;
   /** Submitted lines, for ↑ recall — the same list the idle editor walks. */
   history?: string[];
+  /**
+   * Enter mid-turn: the text joins the running turn at its next step instead of
+   * waiting for the turn to end. Without it every submitted line is queued.
+   */
+  onSteer?: (text: string) => void;
+  /**
+   * Slash-command rows for the line being typed mid-turn. The bar is where a
+   * command is typed as often as the idle prompt — a `/model` reached for while
+   * the model thinks is the same command — so it gets the same dropdown.
+   */
+  suggest?: (buffer: string) => Suggestion[];
+  /** Rows the dropdown keeps while the filter narrows it down. */
+  suggestRows?: number;
 }
+
+/**
+ * How many rows of reasoning the live bar shows. Capped on purpose: a preview
+ * that grows line by line makes the bar taller every few seconds, and a bar at
+ * the bottom of the screen that changes height has to give rows back somewhere.
+ */
+const PREVIEW_ROWS = 7;
 
 export class TurnBar {
   private timer: NodeJS.Timeout | null = null;
@@ -191,6 +226,8 @@ export class TurnBar {
   private cachedTokens = 0;
   /** Rolling reasoning preview, shown above the spinner while a model thinks. */
   private thinking: string[] = [];
+  /** Once the preview has appeared, its rows stay reserved for the turn. */
+  private previewShown = false;
   /** Where the caret sits inside rows(), so the footer can show it there. */
   private caret = { row: 0, col: 0 };
   private buf = "";
@@ -199,10 +236,19 @@ export class TurnBar {
   /** -1 while typing; walking the history owns the index until an edit. */
   private historyIdx = -1;
   private draft = "";
-  private queued: string[] = [];
+  /** Submitted lines, in the order they were typed; steer marks the ones the running turn takes. */
+  private queued: { text: string; steer: boolean }[] = [];
+  /** Command dropdown under the band, and the row the arrows are on. */
+  private menu: Suggestion[] = [];
+  private menuIdx = 0;
+  /** Escape closed it; typing again opens it. */
+  private menuDismissed = false;
+  private lastMenuBuf: string | null = null;
+  /** Rows the open command list adds to the bar; borrowed from the transcript. */
+  private menuBlockRows = 0;
   private pasting = false;
   private pasteBuf = "";
-  private watch = new InterruptWatcher(() => this.opts.onInterrupt());
+  private watch = new InterruptWatcher(() => this.escape());
   /** The head of an escape sequence whose tail has not arrived yet. */
   private held = "";
 
@@ -211,7 +257,12 @@ export class TurnBar {
   start(): void {
     if (!process.stdout.isTTY || this.timer) return;
     this.started = Date.now();
-    setFooter(() => this.rows(), () => this.caret);
+    this.previewShown = false;
+    this.menu = [];
+    this.menuIdx = 0;
+    this.menuDismissed = false;
+    this.lastMenuBuf = null;
+    setFooter(() => this.rows(), () => this.caret, () => this.menuBlockRows);
     this.timer = setInterval(() => {
       this.frame++;
       refreshFooter();
@@ -233,7 +284,7 @@ export class TurnBar {
 
   resume(): void {
     if (this.timer || !this.started || !process.stdout.isTTY) return;
-    setFooter(() => this.rows(), () => this.caret);
+    setFooter(() => this.rows(), () => this.caret, () => this.menuBlockRows);
     this.timer = setInterval(() => {
       this.frame++;
       refreshFooter();
@@ -258,6 +309,24 @@ export class TurnBar {
 
   setThinking(rows: string[]): void {
     this.thinking = rows;
+    if (rows.length) this.previewShown = true;
+    refreshFooter();
+  }
+
+  /**
+   * The answer has started: the reasoning preview has no more to say, and the
+   * rows it holds are better given back *now* than at the end of the turn.
+   *
+   * Reserved to the end, they cost the composer its place: the bar stays five
+   * rows taller than the idle input, and when the turn closes those rows have
+   * nowhere to go but the gap between the answer and the input. Released while
+   * the answer still streams, each row is handed back to the transcript, which
+   * is writing anyway and takes them one by one.
+   */
+  endReasoning(): void {
+    if (!this.previewShown && !this.thinking.length) return;
+    this.previewShown = false;
+    this.thinking = [];
     refreshFooter();
   }
 
@@ -265,14 +334,45 @@ export class TurnBar {
   stop(): { queued: string[]; draft: string } {
     this.pause();
     this.started = 0;
-    return { queued: this.queued, draft: this.buf.trim() };
+    return { queued: this.queued.map((q) => q.text), draft: this.buf.trim() };
+  }
+
+  /**
+   * The turn took the steered lines: their rows go, and what is left in the
+   * list is only what was queued for after the turn.
+   */
+  markSteered(): void {
+    if (!this.queued.some((q) => q.steer)) return;
+    this.queued = this.queued.filter((q) => !q.steer);
+    refreshFooter();
   }
 
   // ── input ────────────────────────────────────────────────────────────────
 
+  /**
+   * Esc with the command list open closes the list, as it does in the idle
+   * composer. Reaching for Esc to put away a list typed by mistake used to
+   * cancel the whole turn. With no list open it stops the turn, as before.
+   */
+  private escape(): void {
+    if (this.menu.length) {
+      this.menuDismissed = true;
+      this.menu = [];
+      refreshFooter();
+      return;
+    }
+    this.opts.onInterrupt();
+  }
+
   private onData(b: Buffer): void {
     let s = b.toString("utf8");
 
+    // Ctrl+C is never a menu key: it stops the turn whatever is open.
+    if (!this.pasting && s.includes(CTRL_C)) {
+      this.watch.stop();
+      this.opts.onInterrupt();
+      return;
+    }
     // Read before the chunk is treated as text, and told whether a paste is
     // open: escape bytes inside pasted content are data, not a cancel.
     if (this.watch.feed(s, this.pasting)) return;
@@ -312,6 +412,9 @@ export class TurnBar {
 
     if (isNewlineKey(s)) return this.insert("\n");
     if (s === "\r" || s === "\n") return this.submit();
+    // Tab is the other half of Enter: the same message, but held for the next
+    // turn instead of delivered into this one.
+    if (s === "\t") return this.enqueue();
     if (s === CTRL_U) {
       this.buf = this.buf.slice(this.pos);
       this.pos = 0;
@@ -342,6 +445,15 @@ export class TurnBar {
         return refreshFooter();
       case KEY.up:
       case KEY.down: {
+        // With the command dropdown open the arrows are its, as in the idea
+        // composer: choosing a command is what the up key means there.
+        if (this.menu.length) {
+          this.menuIdx =
+            s === KEY.up
+              ? (this.menuIdx - 1 + this.menu.length) % this.menu.length
+              : (this.menuIdx + 1) % this.menu.length;
+          return refreshFooter();
+        }
         // Between the rows of a wrapped draft the arrows steer the caret;
         // from its top (or bottom) they fall through to the history.
         if (this.historyIdx === -1 && this.moveLine(s === KEY.up ? -1 : 1)) return refreshFooter();
@@ -392,6 +504,35 @@ export class TurnBar {
   }
 
   /**
+   * Keeps the dropdown in step with the line being typed. Called from rows(),
+   * which every repaint goes through, so no edit can leave it stale.
+   */
+  private syncMenu(): void {
+    if (!this.opts.suggest) return;
+    if (this.lastMenuBuf !== this.buf) {
+      this.menuDismissed = false;
+      this.lastMenuBuf = this.buf;
+    }
+    const browsing = this.historyIdx !== -1;
+    const next = this.menuDismissed || browsing ? [] : this.opts.suggest(this.buf);
+    if (next.length !== this.menu.length || next[0]?.value !== this.menu[0]?.value) this.menuIdx = 0;
+    this.menu = next;
+    if (this.menuIdx >= this.menu.length) this.menuIdx = Math.max(0, this.menu.length - 1);
+  }
+
+  /** Puts the highlighted command in the line instead of sending it. */
+  private applySuggestion(): boolean {
+    const pick = this.menu[this.menuIdx];
+    if (!pick) return false;
+    if (pick.value === this.buf.trim()) return false;
+    this.buf = pick.value + " ";
+    this.pos = this.buf.length;
+    this.menuDismissed = false;
+    this.syncMenu();
+    return true;
+  }
+
+  /**
    * Editing a recalled line hands the arrows back to the caret, exactly as in
    * the idle editor.
    */
@@ -405,7 +546,7 @@ export class TurnBar {
    * become history.
    */
   private moveLine(dir: -1 | 1): boolean {
-    const rows = rowSpansOf(this.buf, Math.max(10, contentWidth() - 5));
+    const rows = rowSpansOf(this.buf, bandTextWidth());
     let at = 0;
     while (at + 1 < rows.length && rows[at + 1].start <= this.pos) at++;
     const target = at + dir;
@@ -441,7 +582,30 @@ export class TurnBar {
   private submit(): void {
     const text = this.buf.trim();
     if (!text) return;
-    this.queued.push(text);
+    // Enter picks the highlighted command first, exactly as it does in the
+    // composer; the picked line then goes out on the next Enter.
+    if (this.menu.length && this.applySuggestion()) return refreshFooter();
+    // A slash command is not something to say to the model — it is the REPL's,
+    // and steering it into the running turn would have the model read "/model"
+    // as prose. It waits for the turn to end, which is what Tab does.
+    if (this.opts.onSteer && !text.startsWith("/")) {
+      this.queued.push({ text, steer: true });
+      this.opts.onSteer(text);
+    } else {
+      this.queued.push({ text, steer: false });
+    }
+    this.clear();
+  }
+
+  /** Tab: sent when this turn ends, as its own turn. */
+  private enqueue(): void {
+    const text = this.buf.trim();
+    if (!text) return;
+    this.queued.push({ text, steer: false });
+    this.clear();
+  }
+
+  private clear(): void {
     this.buf = "";
     this.pos = 0;
     this.edited();
@@ -452,24 +616,44 @@ export class TurnBar {
 
   private rows(): string[] {
     const w = contentWidth();
-    const inner = Math.max(10, w - 5);
+    const inner = bandTextWidth();
+    this.syncMenu();
     const st = this.opts.status();
-    const queued = this.queued.slice(-2);
-    const bufRows = wrapBuffer(this.buf, inner);
-    // The frame, spinner and status have to fit on screen even while a model
-    // dumps a long reasoning preview: a footer taller than the terminal
-    // scrolls the input box off the bottom, which reads as it having vanished.
+    const queued = this.queued.filter((q) => !q.steer).slice(-2);
+    // Steered lines are still in the bar until the turn picks them up: with a
+    // ten-minute build running, an input box that just emptied is the user's
+    // message vanishing into silence.
+    const steering = this.queued.filter((q) => q.steer).slice(-2);
+    const bufRows = wrapBuf(this.buf, inner);
+    // The preview area keeps its height for the rest of the turn once it has
+    // appeared. A block that grows and shrinks while it sits at the bottom of
+    // the screen cannot stay there: the rows it gives back are either blank
+    // rows inside the conversation or blank rows at the bottom, and a gap
+    // between two messages is the worse of the two.
+    const preview = this.previewShown ? this.thinking.slice(-PREVIEW_ROWS) : [];
+    // The dropdown keeps its height while the filter narrows it down (see
+    // suggestionLines) and sits in a panel, so one number covers it here too:
+    // the list rows, the keys row and the two borders.
+    const menuRows = this.menu.length ? (this.opts.suggestRows ?? 6) + 1 + 2 : 0;
     const chrome =
       1 + // gap above the live block
+      1 + // gap under the preview
       1 + // spinner
       queued.length +
-      1 + // top border
+      steering.length +
+      1 + // gap above the input
+      1 + // band row of its own above the text
       Math.max(1, bufRows.length) +
-      1 + // bottom border
+      1 + // band row of its own below the text
+      (menuRows ? menuRows : 0) +
+      1 + // gap above the status rows
       2; // status
     const termRows = Math.max(10, process.stdout.rows || 24);
-    const thinkRoom = Math.max(0, termRows - chrome - 1);
-    const thinking = this.thinking.slice(-thinkRoom);
+    // A short window keeps the bar on screen: the preview gives rows back first,
+    // because everything under it — the input and the status rows — has to stay
+    // visible, and a bar taller than the screen would push them off it.
+    const previewRows = Math.min(preview.length, Math.max(0, termRows - chrome - 1));
+    const thinking = preview.slice(-previewRows);
 
     const rows: string[] = [];
 
@@ -479,18 +663,42 @@ export class TurnBar {
     for (const tl of thinking) {
       rows.push(indent + "  " + c.dim(clipRow(tl, Math.max(10, w - 4))));
     }
-    // The preview is its own block; without the gap its last line and the
-    // spinner read as one.
-    if (thinking.length) rows.push("");
+    // The area is reserved, so a shorter preview leaves blank rows under the
+    // transcript rather than moving everything below it.
+    for (let i = thinking.length; i < previewRows; i++) rows.push("");
+    // The preview is its own block: without a row between it and the spinner
+    // the reasoning text and the status read as one paragraph.
+    if (previewRows) rows.push("");
     rows.push(indent + clipAnsi(this.spinnerLine(), w));
+    for (const q of steering) {
+      rows.push(indent + c.cyan("  ⎿ steering: ") + c.dim(clipRow(q.text, inner - 12)));
+    }
     for (const q of queued) {
-      rows.push(indent + c.gray("  ⎿ queued: ") + c.dim(clipRow(q, inner - 10)));
+      rows.push(indent + c.gray("  ⎿ queued: ") + c.dim(clipRow(q.text, inner - 10)));
     }
 
-    rows.push(indent + c.gray("╭" + "─".repeat(w - 2) + "╮"));
+    // The command dropdown sits *above* the band, in the same panel the idle
+    // composer draws: a list under the line you type reads as part of the
+    // status bar, and every extra row below the input pushes the status rows
+    // off the screen.
+    const menuBlock = this.menu.length
+      ? panelRows(suggestionLines(this.menu, this.menuIdx, w, this.opts.suggestRows ?? 6))
+      : [];
+    // No gap of its own under the panel: the band's own gap row follows, and
+    // two blank rows there read as the list having nothing to do with the input.
+    for (const l of menuBlock) rows.push(l);
+    // The list is drawn over the transcript rather than pushing it up (see
+    // setFooter's cover): it lives for a few keystrokes, and a bar that grew
+    // for it left that many blank rows above itself once it closed.
+    this.menuBlockRows = menuBlock.length;
+
+    // The band keeps a row of its own colour above and below the text: a
+    // one-row strip reads as a hairline, not as the line you type on.
+    rows.push("");
+    rows.push(bandRow());
     for (const [i, r] of bufRows.entries()) {
-      const marker = i === 0 ? c.brightCyan("❯ ") : c.gray("  ");
-      rows.push(indent + c.gray("│") + " " + marker + r.padEnd(inner) + c.gray("│"));
+      const marker = i === 0 ? c.brightCyan("› ") : "  ";
+      rows.push(bandRow(indent + marker + c.brightWhite(r.padEnd(inner))));
     }
     // The caret follows this.pos through the wrapped draft, the way the idle
     // editor parks it. bufRows end at the current last row, so the first of
@@ -499,13 +707,16 @@ export class TurnBar {
     const firstBufRow = rows.length - bufRows.length;
     this.caret = {
       row: firstBufRow + at.row,
-      col: PAD_LEFT + 4 + at.col,
+      col: PAD_LEFT + 2 + at.col,
     };
-    rows.push(indent + c.gray("╰" + "─".repeat(w - 2) + "╯"));
+    rows.push(bandRow());
+    // A dark row between the band and the status: the band is the conversation,
+    // the status is chrome, and without the gap the two read as one block.
+    rows.push("");
 
-    const gap = Math.max(2, w - width(st.left) - width(st.hint));
+    const gap = Math.max(2, statusWidth() - width(st.left) - width(st.hint));
     rows.push(indent + st.left + " ".repeat(gap) + st.hint);
-    rows.push(indent + " ".repeat(Math.max(0, w - width(st.context))) + st.context);
+    rows.push(indent + contextRow(st, statusWidth()));
     return rows;
   }
 
@@ -524,30 +735,24 @@ export class TurnBar {
       this.outTokens && Date.now() - this.started > 1000
         ? ` · ${fmtCompact(Math.round(this.outTokens / ((Date.now() - this.started) / 1000)))} tok/s`
         : "";
-    const hint = this.buf.trim()
-      ? c.gray("  enter to queue · esc to interrupt")
-      : c.gray("  esc to interrupt · type to queue a message");
+    const command = this.buf.trim().startsWith("/");
+    const hint = this.menu.length
+      ? c.gray("  enter to pick · esc to close the list")
+      : this.buf.trim()
+        ? command && this.opts.onSteer
+          ? c.gray("  enter to queue the command · esc to interrupt")
+          : c.gray(this.opts.onSteer ? "  enter to steer · tab to queue · esc to interrupt" : "  enter to queue · esc to interrupt")
+        : c.gray(this.opts.onSteer ? "  esc to interrupt · type to steer" : "  esc to interrupt · type to queue a message");
     return (
       c.brightMagenta(FRAMES[this.frame % FRAMES.length]) +
       " " +
-      c.dim(this.label) +
+      // The model's own colour in the status rows: what the model is doing
+      // right now reads at a glance, not as one more grey line.
+      c.brightCyan(this.label) +
       c.gray(` (${elapsed}${counts}${tps})`) +
       hint
     );
   }
-}
-
-/** Same wrapping the editor uses, so the frame looks identical mid-turn. */
-function wrapBuffer(buf: string, inner: number): string[] {
-  const rows: string[] = [];
-  for (const para of buf.split("\n")) {
-    if (!para.length) {
-      rows.push("");
-      continue;
-    }
-    for (let i = 0; i < para.length; i += inner) rows.push(para.slice(i, i + inner));
-  }
-  return rows.length ? rows : [""];
 }
 
 function clipRow(s: string, max: number): string {
@@ -560,4 +765,3 @@ function fmtCompact(n: number): string {
   if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0) + "k";
   return (n / 1_000_000).toFixed(2) + "M";
 }
-

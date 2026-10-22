@@ -3,7 +3,7 @@ import path from "node:path";
 import { c } from "../ansi.js";
 import { contentWidth, fmtAgo } from "../layout.js";
 import { error, expandedBlock, hint, info, line, padded, plural, renderMarkdownBlock, Spinner, success, truncate, warn } from "../render.js";
-import { pick, type PickerItem } from "../picker.js";
+import { pick, openModal, type PickerItem } from "../picker.js";
 import { choose } from "../choice.js";
 import { askLine } from "../prompt.js";
 import { contextWindowFor } from "../../provider/models.js";
@@ -103,6 +103,119 @@ export async function openSession(app: App, id: string): Promise<void> {
 }
 
 /**
+ * The manage list: the same rows as `/resume`, with a checkbox each.
+ *
+ * Space marks a session, so a run of them goes in one stroke — the buttons
+ * along the foot act on everything marked. Enter keeps its old job of opening
+ * the row under the cursor, which is why the list answers both ways.
+ */
+async function manageList(app: App): Promise<string | null> {
+  let marked: string[] = [];
+  for (;;) {
+    const metas = Session.list(app.cwd);
+    if (!metas.length) return null;
+    // The session being lived in is never deleted: its file is rewritten on the
+    // next turn, and dropping the transcript buys nothing. It stays unmarked by
+    // "select all" but can still be opened.
+    const deletable = metas.filter((m) => m.id !== app.session.id).map((m) => m.id);
+    const allMarked = deletable.length > 0 && deletable.every((id) => marked.includes(id));
+
+    const res = await openModal({
+      title: "Sessions",
+      subtitle: t(
+        "Space marks a session, Enter opens the row under the cursor, the buttons act on every marked row.",
+        "Пробел отмечает сессию, Enter открывает строку под курсором, кнопки действуют на все отмеченные.",
+      ),
+      items: metas.map((m) => sessionItem(app, m)),
+      initial: app.session.id,
+      multi: true,
+      selected: marked,
+      actions: [
+        {
+          id: "all",
+          label: allMarked ? t("Clear marks", "Снять отметки") : t("Select all", "Выбрать все"),
+          hotkey: "a",
+        },
+        {
+          id: "delete",
+          // Always live: the confirm names the count, and a greyed-out button
+          // reads as "bulk delete is broken", not as "nothing marked yet".
+          label: t("Delete marked", "Удалить отмеченные"),
+          hotkey: "d",
+          tone: "danger",
+        },
+      ],
+    });
+    if (!res) return null;
+
+    if (res.kind === "item") {
+      if (res.values.length > 1) {
+        hint(
+          t(
+            `${res.values.length} marked — the Delete button removes them all, Enter opens one row.`,
+            `Отмечено ${res.values.length} — кнопка «Удалить» снесёт все, Enter открывает одну строку.`,
+          ),
+        );
+        continue;
+      }
+      return res.values[0] ?? null;
+    }
+    if (res.id === "all") {
+      marked = allMarked ? [] : deletable;
+      continue;
+    }
+    if (res.id === "delete") {
+      // The marks live in the panel, not in `marked` — Space inside it is the
+      // freshest answer, and the button carries them back.
+      if (!res.values.length) {
+        hint(t("Nothing marked — Space marks a session.", "Ничего не отмечено — пробел отмечает сессию."));
+        continue;
+      }
+      marked = (await deleteMarked(app, metas, res.values)) ? [] : res.values;
+      continue;
+    }
+  }
+}
+
+/** Removes a whole marked set, after the same "are you sure" as one session. */
+async function deleteMarked(app: App, metas: SessionMeta[], ids: string[]): Promise<boolean> {
+  const targets = ids.filter((id) => id !== app.session.id);
+  if (!targets.length) {
+    warn(t("That is the session you are in — switch with /new first.", "Это текущая сессия — сначала переключитесь через /new."));
+    return false;
+  }
+
+  const msgs = targets.reduce((n, id) => n + (metas.find((m) => m.id === id)?.messageCount ?? 0), 0);
+  const sure = await choose<"yes" | "no">(
+    [
+      { value: "no", label: "Keep them", key: "n" },
+      {
+        value: "yes",
+        label: t(
+          `Delete ${count(targets.length, ["session", "sessions"], ["сессия", "сессии", "сессий"])} · ${count(msgs, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}`,
+          `Удалить ${count(targets.length, ["session", "sessions"], ["сессия", "сессии", "сессий"])} · ${count(msgs, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}`,
+        ),
+        key: "y",
+        tone: "danger",
+      },
+    ],
+    { initial: "no", fallback: "no" },
+  );
+  if (sure !== "yes") return false;
+
+  let done = 0;
+  for (const id of targets) {
+    dropStore(app.cwd, id);
+    dropSessionHistory(app.cwd, id);
+    if (Session.remove(app.cwd, id)) done++;
+  }
+  if (done < targets.length)
+    warn(t(`${targets.length - done} could not be deleted.`, `Не удалось удалить: ${targets.length - done}.`));
+  success(t(`Deleted ${done} ${plural(done, "session", "sessions")}.`, `Удалено ${count(done, ["session", "sessions"], ["сессия", "сессии", "сессий"])}.`));
+  return done > 0;
+}
+
+/**
  * The session list. `resume` mode is about getting back into one; `manage` mode
  * adds renaming and deleting. Both loop, so every "no" lands back on the list
  * instead of dropping the user at the prompt.
@@ -127,11 +240,14 @@ export async function browseSessions(app: App, mode: "resume" | "manage"): Promi
       return;
     }
 
-    const chosen = await pick({
-      title: mode === "manage" ? "Sessions" : "Pick a session",
-      items: metas.map((m) => sessionItem(app, m)),
-      initial: app.session.id,
-    });
+    const chosen =
+      mode === "manage"
+        ? await manageList(app)
+        : await pick({
+            title: "Pick a session",
+            items: metas.map((m) => sessionItem(app, m)),
+            initial: app.session.id,
+          });
     if (!chosen) return;
 
     const loaded = Session.load(app.cwd, chosen);

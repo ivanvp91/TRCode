@@ -3,11 +3,11 @@ import path from "node:path";
 import os from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { c } from "./ansi.js";
+import type { LogoAnimation } from "./logo.js";
 import {
   MarkdownStream,
   Spinner,
   ThinkingStream,
-  assistantPrefix,
   banner,
   ensureBlank,
   error,
@@ -17,6 +17,7 @@ import {
   padded,
   plural,
   renderMarkdownBlock,
+  responseDivider,
   toolDone,
   rule,
   success,
@@ -24,6 +25,9 @@ import {
   truncate,
   userEcho,
   warn,
+  logoIntro,
+  setStartRow,
+  bottomSlackPending,
   wrapText,
 } from "./render.js";
 import { contentWidth, fmtAgo, fmtDuration } from "./layout.js";
@@ -32,6 +36,7 @@ import { t as tr, t, count as nOf } from "../i18n.js";
 import { matchLibrary, designInjection, blendInjection, isDesignRequest } from "../ui-library/match.js";
 import { listEntries, getEntry, type UiEntry } from "../ui-library/store.js";
 import { pickUiEntry, extractEntryForm } from "./commands.js";
+import { nextTip, allTipIds, type TipState } from "./tips.js";
 import { composeStatus, type StatusInfo } from "./inputbox.js";
 import { expandPastes, rememberCollapsed } from "./paste.js";
 import { InputEditor, PipeReader, setExtraNewlineKeys } from "./editor.js";
@@ -41,10 +46,10 @@ import { questionModal } from "./questions.js";
 import type { UserQuestion, UserAnswer } from "../tools/questions.js";
 import { TurnBar, InterruptWatcher } from "./turnbar.js";
 import { OrcaReporter } from "./orca.js";
-import { pushConsumer } from "./stdin.js";
+import { pushConsumer, queryCursorRow } from "./stdin.js";
 import { PermissionBroker } from "./permissions.js";
 import { loadConfig, saveConfig, projectState, VERSION, type Config, type Effort } from "../config.js";
-import { refreshCache, appliedUpdate, versionBadge } from "../update.js";
+import { passiveCheckEnabled, refreshCache, appliedUpdate, versionBadge } from "../update.js";
 import { fetchModels, cachedModels, catalogIsFresh, contextWindowFor, effortFor, usableModels, resolveModelId, findModel, sameModelElsewhere } from "../provider/models.js";
 import { defaultProviderId, hasProvider, modeFor, providerLabel, providerState, splitModelId, wireModelId } from "../provider/registry.js";
 
@@ -77,7 +82,7 @@ import { SubagentRegistry } from "../agent/subagent.js";
 import { buildTools, TodoStore } from "../tools/index.js";
 import { shellTool } from "../tools/shell.js";
 import { createSpillStore, type SpillStore } from "../tools/spill.js";
-import { connectMcpServers, mcpPendingCount, mcpSettled, onMcpCatalogChange } from "../mcp/client.js";
+import { connectMcpServers, mcpPendingCount, mcpSettled, onMcpCatalogChange, untrustedProjectServers } from "../mcp/client.js";
 import { discoverSkills, type Skill } from "../skills/loader.js";
 import { pickSkill, skillInjection, skillInterjector } from "../skills/match.js";
 import { Session } from "../session/session.js";
@@ -97,7 +102,7 @@ import { autoCompactLevel, compactSession, contextPressure, lightCompact } from 
 import { markTurn, pruneOrphanStores, recordWrite } from "../session/checkpoint.js";
 import { UsageTracker, estimateTokens, fmtTokens } from "../usage.js";
 import type { Message, ModelInfo, ToolCall, ToolContext, ToolDef } from "../types.js";
-import { runCommand, isCommand, commandNames, commandSuggestions, printCommandIndex, subagentsModal } from "./commands.js";
+import { runCommand, isCommand, isShellLine, commandNames, commandSuggestions, printCommandIndex, subagentsModal } from "./commands.js";
 
 const ESC = String.fromCharCode(27);
 const CTRL_C = String.fromCharCode(3);
@@ -181,10 +186,14 @@ export class App {
 
   /** The input frame. Commands reach it to seed the next line — see /edit. */
   editor: InputEditor | null = null;
+  /** The terminal has been asked once where the prompt starts from. */
+  promptPinned = false;
   private pipe: PipeReader | null = null;
   private history: string[] = [];
   /** Messages queued from the turn bar while the model was working. */
   private pending: string[] = [];
+  /** Steered into the running turn; drained at each step boundary. */
+  private steerQueue: string[] = [];
   /** Messages waiting to be sent; read by tests, and by nothing else. */
   get pendingCount(): number {
     return this.pending.length;
@@ -202,6 +211,17 @@ export class App {
   private mcpCatalogOff: (() => void) | null = null;
   /** The empty-UI-library notice is said once per session, not per request. */
   private uilibNoticeShown = false;
+  /** One hint per turn at most — see showTip. */
+  private tipsThisTurn = false;
+  /**
+   * Turns that finished normally in this run — the beat the tips keep. Counted
+   * here, not from the history: an auto-loaded skill, a uilib design, a steered
+   * line and /brain all add user messages, and compaction takes them away, so
+   * a count read off the history skipped the beat or stopped it for good.
+   */
+  turnsDone = 0;
+  /** The welcome animation while it runs, so a keystroke can stop it. */
+  private liveLogo: LogoAnimation | undefined;
   /**
    * Set by the uilib capture/blend prompts: when that turn stops, the entry
    * form goes through a confirm / edit / reject gate instead of free text.
@@ -304,6 +324,18 @@ export class App {
         this.notice("warn", tr(`MCP ${client.id} failed: ${client.detail}`, `MCP ${client.id} не подключился: ${client.detail}`));
       }
     });
+    // Servers the repository declares itself wait for the user: each is a
+    // command that would run on this machine the moment the folder opened.
+    const waiting = untrustedProjectServers(this.cwd);
+    if (waiting.length) {
+      this.notice(
+        "warn",
+        tr(
+          `This project's .trcode/mcp.json wants to start MCP servers: ${waiting.join(", ")}. They run commands on this machine — review them with /mcp, start them with /mcp trust.`,
+          `.trcode/mcp.json проекта хочет запустить MCP-серверы: ${waiting.join(", ")}. Они выполняют команды на этой машине — посмотрите их в /mcp, запустите через /mcp trust.`,
+        ),
+      );
+    }
     // A server may add or drop tools while the session runs
     // (`notifications/tools/list_changed`). Joining the registry late rewrites
     // the request prefix, but that is the server's call — the alternative is a
@@ -321,8 +353,11 @@ export class App {
     });
     // The release check rides along in the background: at most one GET every
     // six hours, and when it finds something the header is reprinted with a
-    // starred version — the same way a model switch reaches it.
-    if (this.cfg.updateCheck !== false) {
+    // starred version — the same way a model switch reaches it. This is the only
+    // caller: the CLI used to fire the same check a second time right after
+    // init, and its own copy of the gate was the only one that honoured the
+    // environment switches.
+    if (passiveCheckEnabled(this.cfg)) {
       void refreshCache()
         .then(() => {
           if (versionBadge().text.includes("*")) this.repaintHeader();
@@ -434,12 +469,20 @@ export class App {
     this.editor?.prefill(text);
   }
 
-  /** The same terminal owner for ordinary chat and command-driven work. */
-  private startTurn(): TurnBar {
+  /**
+   * The same terminal owner for ordinary chat and command-driven work.
+   *
+   * `steer` marks a turn that can take a message mid-run: the bar then sends
+   * Enter into the running turn (see RunOptions.steer) instead of holding it
+   * for the next one. A panel or a long command has no loop to steer, so its
+   * input is queued the old way.
+   */
+  private startTurn(steer = false): TurnBar {
     if (this.abort || this.bar) throw new Error("A task is already running.");
     this.abort = new AbortController();
     this.lastAborted = false;
     this.lastTurnFailed = false;
+    this.tipsThisTurn = false;
     this.activityLines = [];
     this.activityActive = 0;
     this.subagentDecision = null;
@@ -448,18 +491,42 @@ export class App {
     this.forbiddenSubagents = false;
     this.usage.beginTurn();
     const bar = new TurnBar({
-      status: () => composeStatus({ ...this.status(), hint: "esc to interrupt · enter to queue" }),
+      status: () =>
+        composeStatus({
+          ...this.status(),
+          hint: steer ? "esc to interrupt · enter to steer" : "esc to interrupt · enter to queue",
+        }),
       onInterrupt: () => this.abort?.abort(),
       onToggleMode: () => this.toggleAutoApprove(),
       history: this.history,
+      onSteer: steer ? (text: string) => this.steerQueue.push(text) : undefined,
+      suggest: (buffer) => commandSuggestions(buffer),
+      suggestRows: 6,
     });
     this.bar = bar;
     bar.start();
     return bar;
   }
 
+  /**
+   * Hands the running turn everything typed into the bar since the last step.
+   * The caller (the agent loop) puts each line into the history, so the model
+   * reads it before its next request; the bar drops the rows it was showing
+   * for them. Anything left when the turn ends goes out as a queued message.
+   */
+  private drainSteer(): string[] {
+    if (!this.steerQueue.length) return [];
+    const texts = this.steerQueue.splice(0, this.steerQueue.length);
+    this.bar?.markSteered();
+    return texts;
+  }
+
   private async finishTurn(typed: { queued: string[]; draft: string }, unsent = ""): Promise<void> {
     this.bar = null;
+    // Whatever the turn did not take is handed back by the bar below. The
+    // drain list is emptied either way: a line still in it would be delivered
+    // a second time by the next turn.
+    this.steerQueue.length = 0;
     const interrupted = Boolean(this.abort?.signal.aborted);
     this.lastAborted = interrupted;
     if (interrupted) {
@@ -617,11 +684,11 @@ export class App {
    *
    * "продолжи", "да", "нет" and their kind carry no task to expand, and a
    * request short enough to be one word is already as precise as it gets.
-   * Prefixing a message with "!" says "these are my words, send them".
+   * A leading "!" no longer means "send my words as they are": that prefix runs
+   * a shell command (see runUserShell), so skipping the rewrite is /prompt off.
    */
   private async maybeRewrite(text: string): Promise<string> {
     if (this.cfg.promptMode !== "auto") return text;
-    if (text.startsWith("!")) return text.slice(1).trimStart();
     if (text.length < 40) return text;
     if (/^(продолж|дальше|да|нет|ок|ok|yes|no|continue|go on|ещё|еще|стоп|stop)/i.test(text)) return text;
     const written = await this.composePrompt(text);
@@ -629,7 +696,7 @@ export class App {
     line();
     padded(c.gray(tr("— brief —", "— задание —")));
     for (const l of wrapText(written, contentWidth() - 2)) padded(c.dim(l));
-    hint(tr("/prompt off stops this; ! before a message skips it once", "/prompt off выключает это; ! перед сообщением — пропустить один раз"));
+    hint(tr("/prompt off stops this", "/prompt off выключает это"));
     return written;
   }
 
@@ -685,9 +752,13 @@ export class App {
    * `gradle compileDebugKotlin` prints for minutes, and a screen that shows
    * nothing while it does is indistinguishable from one that has hung. The
    * transcript keeps the result; the bar keeps the movement.
+   *
+   * With no bar there is nothing to move: the turn that owned the tail is over,
+   * and printing it into the transcript would land on the composer, which the
+   * editor draws itself and which `out()` knows nothing about.
    */
   progress(text: string): void {
-    if (!this.bar) return void padded(c.dim(text));
+    if (!this.bar) return;
     this.activityLines.push(text);
     if (this.activityLines.length > 8) this.activityLines.shift();
     this.bar.setThinking([...this.activityLines]);
@@ -779,7 +850,6 @@ export class App {
       if (!res.final) return void error(tr("The panel produced nothing.", "Совет ничего не выдал."));
 
       ensureBlank();
-      assistantPrefix(this.session.model);
       for (const l of renderMarkdownBlock(res.final)) padded(l);
       // Kept as an ordinary exchange: the next turn continues from the answer,
       // not from a transcript of how it was reached.
@@ -889,6 +959,7 @@ export class App {
       effort: this.effort(),
       effortIgnored: modelRejectsEffort(this.session.model),
       cwdLabel: shortPath(this.cwd),
+      sessionTitle: this.session.messages.length ? this.session.displayTitle : undefined,
       contextUsed: used,
       contextWindow: window,
       contextEstimated: !findModel(this.session.model, this.catalog)?.contextWindow,
@@ -927,6 +998,10 @@ export class App {
   async run(initialPrompt?: string): Promise<void> {
     if (process.stdout.isTTY) process.stdout.write(ESC + "]0;TRCode" + ESC + "\\");
     this.showBanner({ tip: true });
+    if (!initialPrompt?.trim() && !this.session.messages.length) {
+      this.welcomeScreen = Boolean(process.stdout.isTTY);
+      this.welcomeLogo = await logoIntro({ animate: hasProvider() });
+    }
     if (!hasProvider()) {
       warn(tr("No provider connected. Run ", "Поставщик не подключён. Наберите ") + c.bold("/login") + tr(" or ", " или ") + c.bold("trc auth login") + ".");
       line();
@@ -952,6 +1027,7 @@ export class App {
         text = input.trim();
       }
       if (!text) continue;
+      this.dismissWelcome();
       this.recordInput(text);
 
       if (isCommand(text)) {
@@ -961,6 +1037,14 @@ export class App {
         } catch (err) {
           error((err as Error).message);
         }
+        continue;
+      }
+
+      // A leading "!" runs the line in the shell instead of sending it: the
+      // shortest way to look something up mid-conversation without spending a
+      // turn on it. The output still reaches the model, as a user message.
+      if (isShellLine(text)) {
+        await this.runUserShell(text.slice(1));
         continue;
       }
 
@@ -1004,6 +1088,55 @@ export class App {
     }
     return true;
   }
+
+  // ── shell lines (!) ───────────────────────────────────────────────────────
+
+  /**
+   * Runs a line the user typed with a leading "!".
+   *
+   * It goes through the same tool the model uses, so the sandbox rules,
+   * timeouts, output spilling and the interrupt all behave identically — the
+   * difference is only who asked. The command and its output are then added to
+   * the history as a user message: the terminal keeps the record for the eye,
+   * and the model reads what the user already found out before answering.
+   */
+  async runUserShell(command: string): Promise<void> {
+    const cmd = command.trim();
+    if (!cmd) return;
+    userEcho("! " + cmd);
+    this.recordInput("!" + cmd);
+    const started = Date.now();
+    const bar = this.startTurn();
+    bar.setLabel(cmd);
+    let output = "";
+    let failed = false;
+    try {
+      toolStart("shell", cmd);
+      const res = await shellTool.run({ command: cmd }, this.toolContext());
+      output = res.output ?? "";
+      failed = Boolean(res.isError);
+      toolDone(!failed, output || (failed ? "failed" : "done"), "text");
+      this.statusLine(Date.now() - started, 1, failed ? "failed" : "stop");
+      this.session.add({
+        role: "user",
+        // Hidden from the transcript on replay — the echo above already stands
+        // there — but the model still gets the command and what it printed.
+        meta: { hidden: true },
+        content: `<user-shell-command>\n! ${cmd}\n</user-shell-command>\n<output>\n${output}\n</output>`,
+      });
+      this.session.save();
+    } catch (err) {
+      if ((err as Error)?.name !== "AbortError" && !this.abort?.signal.aborted) {
+        this.lastTurnFailed = true;
+        error((err as Error).message);
+      }
+    } finally {
+      if (this.abort?.signal.aborted) warn(tr("Interrupted.", "Прервано."));
+      await this.finishTurn(bar.stop());
+    }
+  }
+
+  // ── end shell lines ───────────────────────────────────────────────────────
 
   /**
    * The goal set at /goal time decides the prompt; the model's own word
@@ -1064,7 +1197,25 @@ export class App {
     this.heldNotices = [];
   }
 
-  private readInput(): Promise<string | null> {
+  private welcomeLogo: LogoAnimation | undefined;
+  private welcomeScreen = false;
+
+  /** The splash owns the initial screen only, never any conversation output. */
+  private dismissWelcome(): void {
+    if (!this.welcomeScreen) return;
+    this.welcomeScreen = false;
+    this.welcomeLogo?.stop();
+    this.welcomeLogo = undefined;
+    if (!process.stdout.isTTY) return;
+    process.stdout.write(ESC + "[2J" + ESC + "[H");
+    // Forget the splash's bottom-pinned geometry. The first turn starts right
+    // under the header; its footer must not turn that padding into transcript.
+    setStartRow(null);
+    this.promptPinned = false;
+    this.showBanner();
+  }
+
+  private async readInput(): Promise<string | null> {
     this.flushNotices();
     if (!process.stdin.isTTY) {
       this.pipe ??= new PipeReader();
@@ -1077,8 +1228,44 @@ export class App {
       suggest: (buffer) => commandSuggestions(buffer),
       suggestRows: 6,
       onToggleMode: () => this.toggleAutoApprove(),
+      // The welcome animation paints at fixed coordinates; the first keystroke
+      // can start scrolling the rows under them, so it stops there.
+      onFirstKey: () => this.liveLogo?.stop(),
     });
-    return this.editor.read();
+    // The composer belongs on the last line of the screen: ask the terminal
+    // where the banner left the cursor, once, and let the first frame reach the
+    // bottom from there. A terminal that never answers just keeps the prompt
+    // where it is, which is what it did before there was a choice.
+    if (!this.promptPinned) {
+      this.promptPinned = true;
+      // The first turn after the splash also ends here (dismissWelcome() unpins
+      // the prompt), and its bar has just come off the screen. A plain re-measure
+      // forgot what the bar owed: the composer then *dropped* to the bottom by
+      // the difference in height, and the first answer of every session sat
+      // two blank rows above the input. Keeping the debt lets the composer take
+      // the bar's rows back, as it does after every later turn.
+      setStartRow(await queryCursorRow(), bottomSlackPending());
+    } else if (bottomSlackPending()) {
+      // A block came off the screen this turn, and the rows it owed the composer
+      // are only an estimate: the window may have changed size in between, and a
+      // prompt left short of the last line reads as an empty strip under the
+      // status. The terminal knows where the cursor really stands — the first
+      // frame drops to the last line from there. A terminal that does not answer
+      // keeps the estimate.
+      const row = await queryCursorRow(120);
+      if (row !== null) setStartRow(row, true);
+    }
+    const logo = this.welcomeLogo;
+    this.welcomeLogo = undefined;
+    this.liveLogo = logo;
+    const input = this.editor.read();
+    logo?.start();
+    try {
+      return await input;
+    } finally {
+      logo?.stop();
+      this.liveLogo = undefined;
+    }
   }
 
   private onSigint(): void {
@@ -1177,7 +1364,6 @@ export class App {
       if (m.role === "assistant") {
         if (m.content && String(m.content).trim()) {
           ensureBlank();
-          assistantPrefix(m.meta?.model ?? this.session.model);
           // Same styling as a live answer — a replay that dims everything
           // reads as if the formatting had been thrown away.
           for (const l of renderMarkdownBlock(String(m.content), { width: w })) padded(l);
@@ -1447,6 +1633,7 @@ export class App {
   }
 
   async turn(text: string): Promise<void> {
+    this.dismissWelcome();
     if (!hasProvider()) {
       error(tr("No provider connected. Run /login.", "Поставщик не подключён. Наберите /login."));
       return;
@@ -1457,7 +1644,7 @@ export class App {
     // The bar goes up before auto-compaction and the brief rewrite, not after:
     // either can run for minutes on a full window, and a missing input frame
     // for that long reads as the CLI having died.
-    const bar = this.startTurn();
+    const bar = this.startTurn(true);
     let unsent = "";
     const delegation = delegationPreference(text);
     this.explicitSubagents = delegation === "allow";
@@ -1509,6 +1696,9 @@ export class App {
     this.orca?.userPrompt(text, this.session.id);
 
     const started = Date.now();
+    // The turn's own abort flag: a callback that fires after Esc must not draw.
+    // `this.abort` is replaced by the next turn, so it is captured here.
+    const signal = this.abort!.signal;
     // The bar owns stdin for the duration of the turn: it interrupts on Esc
     // and keeps the input frame on screen. It was raised above, before the
     // compaction and rewrite that can each take minutes.
@@ -1593,6 +1783,7 @@ export class App {
         effort: this.effort(),
         toolConcurrency: this.cfg.toolConcurrency,
         interject: this.stepSkills(),
+        steer: () => this.drainSteer(),
         midTurnCompact: () => this.compactMidTurn(),
         projection: { cwd: this.cwd, sessionId: this.session.id },
         conversationId: this.session.id,
@@ -1672,6 +1863,16 @@ export class App {
           spinner.start();
         },
         events: {
+          onSteer: (text) => {
+            // The message the user typed mid-turn is part of the transcript:
+            // it sits where it took effect, above the work it redirected.
+            stopStream();
+            userEcho(text);
+            this.recordInput(text);
+            inToolGroup = false;
+            lastTool = "";
+            bar.setLabel("thinking");
+          },
           onCompacted: () => {
             bar.setLabel("thinking");
           },
@@ -1685,6 +1886,7 @@ export class App {
             spinner.start();
           },
           onReasoning: (delta) => {
+            if (signal.aborted) return;
             endRateWait();
             bumpOut(delta);
             if (!think) {
@@ -1704,12 +1906,22 @@ export class App {
             think.push(delta);
           },
           onText: (delta) => {
+            if (signal.aborted) return;
             endRateWait();
             bumpOut(delta);
             if (!streaming) {
               spinner.stop();
-              ensureBlank();
-              assistantPrefix(this.session.model);
+              // Flush reasoning before any answer text is rendered. Ending it
+              // at onAssistantMessage used to reopen the preview after text
+              // had already streamed, separating the summary from the answer.
+              if (think) {
+                think.end();
+                think = null;
+              }
+              // The reasoning preview has made its point; its reserved rows go
+              // back to the transcript that is about to be written.
+              bar.endReasoning();
+              responseDivider();
               md = new MarkdownStream();
               streaming = true;
               inToolGroup = false;
@@ -1723,6 +1935,7 @@ export class App {
             if (this.orca) this.orca.assistantText(answer.length > 4000 ? answer.slice(-4000) : answer, this.session.id);
           },
           onToolStart: (tool, args) => {
+            if (signal.aborted) return;
             endRateWait();
             stopStream();
             spinner.stop();
@@ -1735,6 +1948,9 @@ export class App {
             toolStart(tool.name, tool.summarize?.(args) ?? "");
           },
           onToolEnd: (tool, ok, display, _call, kind) => {
+            // A tool killed by the interrupt settles after the turn is over; its
+            // result would be drawn into a composer the turn no longer owns.
+            if (signal.aborted) return;
             // The live tail belonged to the tool that just finished; a
             // subagent still running keeps its own preview.
             if (!this.activityActive) {
@@ -1777,6 +1993,13 @@ export class App {
       this.lastTurnFailed = result.stoppedBecause !== "stop" && result.stoppedBecause !== "aborted";
       if (result.stoppedBecause === "stop") this.checkGoalComplete(result.finalText);
       this.statusLine(Date.now() - started, result.steps, result.stoppedBecause);
+      // A finished, ordinary turn is the one calm moment in the transcript:
+      // the answer above, the input below, and nobody waiting. A hint about a
+      // feature the session has not touched goes here or nowhere.
+      if (result.stoppedBecause === "stop") {
+        this.turnsDone++;
+        this.showTip();
+      }
       if (process.env.TRCODE_DEBUG) {
         const t = this.usage.turnTotals();
         const per = t.requests ? Math.round(t.input / t.requests) : 0;
@@ -1810,6 +2033,39 @@ export class App {
         await gate(this.lastAssistantText());
       }
     }
+  }
+
+  /**
+   * One hint about a feature this session has not used, under a finished
+   * answer — see ui/tips.ts for the rules that keep it rare. The ids already
+   * shown are kept in the config, so the same line does not come back after a
+   * restart.
+   */
+  showTip(): void {
+    const cfg = loadConfig();
+    if (cfg.tips === false) return;
+    if (this.tipsThisTurn) return;
+    const seen = cfg.tipsSeen ?? [];
+    const messages = this.session.messages;
+    const state: TipState = {
+      turns: this.turnsDone,
+      goal: Boolean(this.session.goal && this.session.goal.status !== "complete"),
+      // A call of the subagent tool, not the word in some tool's output: a grep
+      // through code that mentions subagents used to retire both tips about them.
+      subagents: messages.some((m) => m.tool_calls?.some((tc) => tc.function.name === "task")),
+      uiLibrary: listEntries().length > 0,
+      brain: (cfg.brainModels?.length ?? 0) > 0,
+      shell: messages.some((m) => (m.content ?? "").includes("<user-shell-command>")),
+      compacted: this.session.compactions > 0 || messages.some((m) => (m.content ?? "").includes("<compacted-context>")),
+      provider: splitModelId(this.session.model).providerId,
+    };
+    const tip = nextTip(state, seen);
+    if (!tip) return;
+    this.tipsThisTurn = true;
+    padded(c.gray(tr("tip — ", "подсказка — ")) + c.dim(tip.text()));
+    // A list key replaces wholesale or the new id never lands: merge keeps the
+    // old array by design.
+    saveConfig({ tipsSeen: [...seen, tip.id] }, { replace: ["tipsSeen"] });
   }
 
   /**
@@ -1992,7 +2248,10 @@ export class App {
         : "",
     ].filter(Boolean);
 
-    line();
+    // One blank row above the totals, never two: the answer block already ends
+    // with a separator of its own when it printed one, and a second blank made
+    // the stats drift away from the answer they describe.
+    ensureBlank();
     if (bits.length) padded(bits.join(c.gray(" · ")));
     this.cacheNudge();
     this.contextNudge();

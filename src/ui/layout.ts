@@ -23,6 +23,25 @@ export function contentWidth(): number {
   return Math.max(30, fullWidth() - PAD_LEFT - padRight());
 }
 
+/**
+ * The status rows under the composer reach the band's right edge, not the chat
+ * gutter: they are about the line you are typing on, and a row that stops eight
+ * cells short of the band above it reads as a stray paragraph instead of chrome.
+ */
+export function statusWidth(): number {
+  return Math.max(30, fullWidth() - PAD_LEFT - 3);
+}
+
+/**
+ * The cells of a composer row the text itself gets: the row is "› " after the
+ * left margin, inside a band one column short of the terminal edge, and two
+ * more cells stay clear on the right. A last glyph butting against the band's
+ * edge reads as clipped rather than filled.
+ */
+export function bandTextWidth(): number {
+  return Math.max(10, fullWidth() - PAD_LEFT - 5);
+}
+
 export const indent = " ".repeat(PAD_LEFT);
 
 /** Prefixes a line with the left margin. */
