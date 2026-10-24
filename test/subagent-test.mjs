@@ -68,6 +68,7 @@ check("another provider is not offered", !models.includes("kimi:k3"), String(mod
 check("image models are not", !models.includes("wan2.7-image"), String(models));
 check("nor speech models", !models.includes("qwen-audio-3.0-tts-plus"), String(models));
 check("nor embeddings", !models.includes("text-embedding-v4"), String(models));
+check("a multi-part request reads as a fan-out", /is a fan-out: launch one subagent per part/i.test(tool.description), tool.description);
 
 // The enum is a suggestion to a model, not a constraint the API enforces, so
 // asking for one of the excluded ids has to land somewhere that works.
@@ -210,6 +211,49 @@ check("nor embeddings", !models.includes("text-embedding-v4"), String(models));
   });
   check("maxSteps 0 runs the turn", res.steps > 0, JSON.stringify(res));
   check("and stops when the model does", res.stoppedBecause === "stop", res.stoppedBecause);
+}
+
+// The live list in the turn bar: who is running, how far into their step
+// budget, and what they have cost. The lead's context never sees any of it.
+{
+  const events = [];
+  const traced = makeTaskTool({
+    cwd: process.cwd(),
+    catalog,
+    skills: [],
+    tools: () => [],
+    defaultModel: "mock-fast",
+    effortFor: () => "off",
+    maxSteps: 6,
+    usage: new UsageTracker(),
+    activity: {
+      begin: (info) => events.push(["begin", info]),
+      update: (info) => events.push(["update", info]),
+      end: (id) => events.push(["end", id]),
+    },
+  });
+  await traced.run(
+    { description: "статус", prompt: "скажи ok" },
+    { cwd: process.cwd(), signal: new AbortController().signal, broker: { ask: async () => true } },
+  );
+  const began = events.find(([kind]) => kind === "begin")?.[1];
+  const updated = events.filter(([kind]) => kind === "update").map(([, info]) => info);
+  const ended = events.find(([kind]) => kind === "end")?.[1];
+  check("a helper is listed the moment it starts", began?.model === "mock-fast" && began?.maxSteps === 6, JSON.stringify(began));
+  check("its steps are reported as it goes", updated.some((i) => i.steps > 0), JSON.stringify(updated.map((i) => i.steps)));
+  check("and so is what it has spent", updated.some((i) => i.tokens > 0), JSON.stringify(updated.map((i) => i.tokens)));
+  check("it leaves the list when it is done", ended === began?.id, String(ended));
+}
+
+// The row itself: `1. model 70% · 25k tok`.
+{
+  const { subagentRow } = await import("../dist/ui/render.js");
+  const { stripAnsi } = await import("../dist/ui/ansi.js");
+  const row = stripAnsi(subagentRow({ id: 1, label: "a", model: "deepseek-v4.1-flash", steps: 7, maxSteps: 10, tokens: 25000 }));
+  check("a row carries the model, the budget share and the tokens", row === "1. deepseek-v4.1-flash 70% · 25k tok", row);
+  const busy = stripAnsi(subagentRow({ id: 2, label: "b", model: "glm-5.3-flash", steps: 3, maxSteps: 3, tokens: 1200, line: "read src/a.ts" }));
+  check("a spent budget never reads 100% while it runs", busy.includes("99%"), busy);
+  check("and its latest action rides along", busy.endsWith("· read src/a.ts"), busy);
 }
 
 mock.kill();

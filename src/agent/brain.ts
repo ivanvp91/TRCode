@@ -13,10 +13,15 @@
  */
 import fs from "node:fs";
 import path from "node:path";
-import { complete } from "../provider/client.js";
+import { complete, ApiError } from "../provider/client.js";
 import { wireModelId } from "../provider/registry.js";
+import { contextWindowFor } from "../provider/models.js";
+import { trimForRequest } from "../session/trim.js";
+import { loadConfig } from "../config.js";
+import { runWorker } from "./worker.js";
 import type { Effort } from "../config.js";
-import type { Message, ModelInfo } from "../types.js";
+import type { Skill } from "../skills/loader.js";
+import type { Message, ModelInfo, ToolContext, ToolDef } from "../types.js";
 import { UsageTracker } from "../usage.js";
 
 export interface BrainEvents {
@@ -26,6 +31,8 @@ export interface BrainEvents {
   onAnswer?(model: string, round: "answer" | "critique" | "final", text: string): void;
   /** A model dropped out — the panel goes on without it. */
   onFailed?(model: string, reason: string): void;
+  /** What a model is doing between its start and its answer — a tool it called. */
+  onTool?(model: string, line: string): void;
 }
 
 export interface BrainOptions {
@@ -46,6 +53,16 @@ export interface BrainOptions {
   usage: UsageTracker;
   signal?: AbortSignal;
   events?: BrainEvents;
+  /**
+   * The session's own tools, so a panelist can look things up instead of
+   * guessing. Without a context the panel is a bare completion, which is what
+   * a headless run gets.
+   */
+  tools?: ToolDef[];
+  context?: ToolContext;
+  skills?: Skill[];
+  /** Tool rounds per model per round; the panel is a discussion, not a work day. */
+  maxSteps?: number;
 }
 
 const ANSWER_PROMPT = `You are one of several models answering the same question, independently and at the same time. You cannot see the others yet.
@@ -54,7 +71,12 @@ const ANSWER_PROMPT = `You are one of several models answering the same question
 - Be specific: name the file, the number, the tradeoff. A general answer is worth nothing here, because every other model can produce one too.
 - Where you are guessing, say so in the same sentence. Where the question is underspecified, state the assumption you are answering under.
 - A conversation and files may be attached below the question. The question is usually about them — "discuss the idea" means the one in the conversation — so read them before deciding the question is empty.
-- Length: what the answer needs and no more. Twenty lines is a lot.`;
+- Length: what the answer needs and no more. Twenty lines is a lot.
+
+You have this session's tools — web search and fetch, file reads, shell. A question about
+the world or about this project usually needs them: check instead of guessing, and cite what
+you found. Use them to establish facts, not to change anything — this is a discussion, and the
+others read your words, not your diff.`;
 
 const CRITIQUE_PROMPT = `You answered a question. Below are the other answers to the same question, written independently.
 
@@ -62,7 +84,9 @@ Your job is not to be agreeable and not to defend what you wrote.
 - Say where the others are wrong or thin, concretely. "Missed X", "wrong about Y because Z".
 - Say where they are right and you were not. Changing your mind here is the point of the exercise.
 - Then give your revised answer. If nothing changed it, say so in one line and repeat the part that matters.
-- Do not summarise the discussion. Do not thank anyone.`;
+- Do not summarise the discussion. Do not thank anyone.
+
+If a claim turns on a fact you can check with the tools, check it before you accept or reject it.`;
 
 const FINAL_PROMPT = `Several models answered the same question and then read each other. Below is everything they said.
 
@@ -70,7 +94,58 @@ Write the final answer for the user:
 - Take what survived scrutiny. Drop what was refuted, silently — the user does not need the history.
 - Where the panel genuinely disagreed and the disagreement matters, say so in one or two lines: what the split is and what it depends on. Do not manufacture a consensus that was not there.
 - Answer in the user's language, in the shape the question asked for.
-- No mention of "models", "panel" or "rounds": the user asked a question, not for a report on how it was answered.`;
+- No mention of "models", "panel" or "rounds": the user asked a question, not for a report on how it was answered.
+
+If the panel disagreed over a fact, settle it with a tool rather than choosing a side.`;
+
+/**
+ * The last word when a model spends its tool budget instead of answering.
+ *
+ * A panelist that researches well answers with "let me check a few more facts"
+ * and stops there, because the step cap lands between its research and its
+ * prose — the panel then"answers" with a promise. This asks the same model,
+ * on the same history, for the answer it has already earned, with no tools
+ * left to reach for.
+ */
+const OUT_OF_BUDGET = `Your tool budget is spent: no further tool calls will be run.
+
+Answer the question now, from what you have. Where a fact is still unverified, say so in one clause — do not announce another check.`;
+
+/** Research is the first round's job; revision and synthesis mostly read. */
+function stepsFor(opts: BrainOptions, round: "answer" | "critique" | "final"): number {
+  const base = opts.maxSteps && opts.maxSteps > 0 ? opts.maxSteps : 8;
+  return round === "answer" ? base : Math.max(2, Math.ceil(base / 2));
+}
+
+/** One more request on a history that already holds the tool results. */
+async function answerFromHistory(
+  model: string,
+  system: string,
+  messages: Message[],
+  opts: BrainOptions,
+): Promise<string> {
+  const cfg = loadConfig();
+  const budget = Math.max(1024, Math.floor(contextWindowFor(model, opts.catalog) / 2));
+  const { messages: kept } = trimForRequest(messages, {
+    budget,
+    keepRecent: cfg.trimKeepRecent,
+    minTrimBytes: cfg.trimMinBytes,
+    maxResultBytes: cfg.maxToolResultBytes,
+  });
+  const res = await complete({
+    model,
+    messages: [
+      { role: "system", content: system },
+      ...kept,
+      { role: "user", content: OUT_OF_BUDGET },
+    ],
+    temperature: 0.4,
+    effort: opts.effortFor(model),
+    signal: opts.signal,
+  });
+  opts.usage.record(model, res.usage, opts.catalog);
+  return res.content.trim();
+}
 
 /** One model's turn. A failure drops it from the panel rather than the run. */
 async function ask(
@@ -81,7 +156,7 @@ async function ask(
   round: "answer" | "critique" | "final",
 ): Promise<string | null> {
   opts.events?.onStart?.(model, round);
-  try {
+  const plain = async (): Promise<string> => {
     const res = await complete({
       model,
       messages: [
@@ -93,7 +168,55 @@ async function ask(
       signal: opts.signal,
     });
     opts.usage.record(model, res.usage, opts.catalog);
-    const text = res.content.trim();
+    return res.content.trim();
+  };
+  try {
+    let text: string;
+    if (opts.context && opts.tools?.length) {
+      try {
+        // The same loop an ordinary turn runs: the question goes in, the model may
+        // search and read, and what comes back is its final message. Every round
+        // starts from a fresh conversation — a panelist has no history to carry.
+        const history: Message[] = [];
+        const result = await runWorker({
+          model,
+          prompt: user,
+          messages: history,
+          context: opts.context,
+          tools: opts.tools,
+          readOnly: false,
+          catalog: opts.catalog,
+          skills: opts.skills ?? [],
+          effort: opts.effortFor(model),
+          maxSteps: stepsFor(opts, round),
+          ceiling: 20,
+          usage: opts.usage,
+          systemPrompt: system,
+          activity: (line) => opts.events?.onTool?.(model, line),
+        });
+        if (result.stoppedBecause === "aborted") {
+          const abort = new Error("aborted");
+          abort.name = "AbortError";
+          throw abort;
+        }
+        // Out of steps with tool calls still on the table: the text so far is a
+        // plan to answer, not an answer. So is a model that went in circles.
+        // Ask for the answer itself, with nothing left to reach for.
+        text =
+          result.stoppedBecause === "max_steps" || result.stoppedBecause === "looping"
+            ? await answerFromHistory(model, system, history, opts)
+            : result.finalText.trim();
+      } catch (err) {
+        if ((err as Error)?.name === "AbortError") throw err;
+        // A host that cannot take tools would drop this model out of the panel
+        // over something that has nothing to do with its opinion. Its voice is
+        // worth more than its search, so ask the same question without them.
+        if (!(err instanceof ApiError && err.status === 400 && /tool/i.test(err.message))) throw err;
+        text = await plain();
+      }
+    } else {
+      text = await plain();
+    }
     if (!text) {
       opts.events?.onFailed?.(model, "returned nothing");
       return null;
@@ -127,11 +250,10 @@ const PATHISH = /[\w./\\-]*[/\\][\w./\\-]+|\b[\w.-]+\.(md|txt|ts|tsx|js|jsx|json
 /**
  * The files the question names, read and attached.
  *
- * The panel has no tools — it is models talking, not agents working — so
- * "обсудите ideas/001-cli-router.md" reached them as a file name and nothing
- * else, and every one of them answered that it could not read it. The question
- * names the file; the file is right here; nobody needs a round of the user
- * pasting it in.
+ * A panelist with tools could read the file itself, but a headless panel has no
+ * tools at all, and every round would spend a step re-reading what the question
+ * already pointed at. The question names the file; the file is right here;
+ * nobody needs a round of the user pasting it in.
  */
 export function attachReferenced(cwd: string, question: string, budget = 40_000): string {
   const seen = new Set<string>();

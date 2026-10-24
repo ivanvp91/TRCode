@@ -19,7 +19,7 @@ Object.defineProperty(process.stdout, "columns", { value: 92, configurable: true
 const ESC = String.fromCharCode(27);
 const strip = (s) => s.replace(new RegExp(ESC + "\\[[0-9;]*m", "g"), "");
 
-const { saveConfig } = await import("../dist/config.js");
+const { saveConfig, LANGUAGES } = await import("../dist/config.js");
 const { t, count, plural3 } = await import("../dist/i18n.js");
 const render = await import("../dist/ui/render.js");
 const { composeStatus } = await import("../dist/ui/inputbox.js");
@@ -105,6 +105,27 @@ saveConfig({ lang: "ru" });
   ok("112 моделей", forms(112) === "моделей");
   ok("count склеивает число и слово", count(3, ["model", "models"], ["модель", "модели", "моделей"]) === "3 модели");
   ok("t выбирает русский", t("no", "да") === "да");
+}
+
+// ── every other language reads from its own catalogue ──────────────────────
+for (const code of ["de", "zh", "pl"]) {
+  const catalog = (await import(`../dist/i18n/${code}.js`)).default;
+  saveConfig({ lang: code });
+  ok(`${code}: строка берётся из каталога`, t("Model", "Модель") === catalog.strings["Model"], t("Model", "Модель"));
+  ok(`${code}: подстановка в шаблоне`, t("Deleted {id}", "Удалена {id}", { id: "abc123" }).includes("abc123"), t("Deleted {id}", "Удалена {id}", { id: "abc123" }));
+  ok(`${code}: в выводе не осталось заглушек`, !/\{\w+\}/.test(t("Deleted {id}", "Удалена {id}", { id: "x" })));
+  const word = catalog.plurals["model|models"][new Intl.PluralRules(code).select(2)] ?? catalog.plurals["model|models"].other;
+  ok(`${code}: склонение из каталога`, count(2, ["model", "models"], ["модель", "модели", "моделей"]) === `2 ${word}`, count(2, ["model", "models"], ["модель", "модели", "моделей"]));
+  ok(`${code}: неизвестная строка падает в английский`, t("Not in any catalogue", "…") === "Not in any catalogue");
+  const b = bannerText();
+  ok(`${code}: шапка переведена`, b.includes(catalog.strings["Directory:"]), b.slice(0, 70));
+  ok(`${code}: справка команды не английская`, !/switch model/.test(helpOf("/model")), helpOf("/model"));
+}
+
+{
+  const codes = LANGUAGES.map((l) => l.code);
+  ok("в списке тринадцать языков", codes.length === 13, codes.join(","));
+  ok("список содержит новые языки", ["zh", "ja", "de", "fr", "es", "it", "pt", "uk", "pl", "ms", "id"].every((c) => codes.includes(c)), codes.join(","));
 }
 
 // ── and back ──────────────────────────────────────────────────────────────

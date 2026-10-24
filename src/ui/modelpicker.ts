@@ -220,11 +220,12 @@ async function runPanel(
       if (on)
         success(
           t(
-            `Favorite: ${c.brightMagenta(wireModelId(res.value))}`,
-            `В избранном: ${c.brightMagenta(wireModelId(res.value))}`,
+            "Favorite: {model}",
+            "В избранном: {model}",
+            { model: c.brightMagenta(wireModelId(res.value)) },
           ),
         );
-      else hint(t(`Removed from favorites: ${wireModelId(res.value)}`, `Убрана из избранного: ${wireModelId(res.value)}`));
+      else hint(t("Removed from favorites: {model}", "Убрана из избранного: {model}", { model: wireModelId(res.value) }));
       continue;
     }
     return res;

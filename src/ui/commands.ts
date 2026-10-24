@@ -104,8 +104,8 @@ const COMMANDS: Command[] = [
         const id = resolveModelId(arg, app.catalog);
         const on = toggleFavorite(id);
         return void (on
-          ? success(t(`Favorite: ${c.brightMagenta(wireModelId(id))}`, `В избранном: ${c.brightMagenta(wireModelId(id))}`))
-          : hint(t(`Removed from favorites: ${wireModelId(id)}`, `Убрана из избранного: ${wireModelId(id)}`)));
+          ? success(t("Favorite: {model}", "В избранном: {model}", { model: c.brightMagenta(wireModelId(id)) }))
+          : hint(t("Removed from favorites: {model}", "Убрана из избранного: {model}", { model: wireModelId(id) })));
       }
       await favModal(app);
     },
@@ -121,7 +121,7 @@ const COMMANDS: Command[] = [
 
       if (parts[0] === "default") {
         const def = parts[1] ? providerById(parts[1].toLowerCase()) : providerById(currentProviderId(app));
-        if (!def) return error(t(`Unknown provider: ${parts[1]}. Available: ${providers().map((p) => p.id).join(", ")}`, `Неизвестный поставщик: ${parts[1]}. Доступны: ${providers().map((p) => p.id).join(", ")}`));
+        if (!def) return error(t("Unknown provider: {name}. Available: {providers}", "Неизвестный поставщик: {name}. Доступны: {providers}", { name: String(parts[1]), providers: providers().map((p) => p.id).join(", ") }));
         return setDefaultProvider(app, def);
       }
 
@@ -131,19 +131,19 @@ const COMMANDS: Command[] = [
       if (parts[0] === "host") {
         const named = parts.slice(1).find((p) => !/^https?:\/\//i.test(p));
         const def = named ? providerById(named.toLowerCase()) : providerById(currentProviderId(app));
-        if (!def) return error(t(`Unknown provider: ${named}. Available: ${providers().map((p) => p.id).join(", ")}`, `Неизвестный поставщик: ${named}. Доступны: ${providers().map((p) => p.id).join(", ")}`));
+        if (!def) return error(t("Unknown provider: {name}. Available: {providers}", "Неизвестный поставщик: {name}. Доступны: {providers}", { name: String(named), providers: providers().map((p) => p.id).join(", ") }));
         return setProviderHost(app, def, parts.find((p) => /^https?:\/\//i.test(p)));
       }
 
       if (parts[0] === "logout") {
         const def = parts[1] ? providerById(parts[1].toLowerCase()) : undefined;
-        if (!def) return error(t(`Which provider? ${others.map((p) => p.id).join(", ") || "none to disconnect"}`, `Какого поставщика? ${others.map((p) => p.id).join(", ") || "отключать нечего"}`));
+        if (!def) return error(t("Which provider? {providers}", "Какого поставщика? {providers}", { providers: others.map((p) => p.id).join(", ") || t("none to disconnect", "отключать нечего") }));
         return logoutFromProvider(app, def);
       }
 
       if (parts[0]) {
         const def = providerById(parts[0].toLowerCase());
-        if (!def) return error(t(`Unknown provider: ${parts[0]}. Available: ${providers().map((p) => p.id).join(", ")}`, `Неизвестный поставщик: ${parts[0]}. Доступны: ${providers().map((p) => p.id).join(", ")}`));
+        if (!def) return error(t("Unknown provider: {name}. Available: {providers}", "Неизвестный поставщик: {name}. Доступны: {providers}", { name: parts[0], providers: providers().map((p) => p.id).join(", ") }));
         return switchToProvider(app, def);
       }
 
@@ -153,7 +153,7 @@ const COMMANDS: Command[] = [
   {
     name: "/lang",
     group: "settings",
-    args: "[en|ru]",
+    args: "[code]",
     help: () => t("language for answers and skill descriptions", "язык ответов и описаний навыков"),
     async run(app, rest) {
       const arg = rest.trim().toLowerCase();
@@ -161,7 +161,7 @@ const COMMANDS: Command[] = [
         ? LANGUAGES.find((l) => l.code === arg || l.label.toLowerCase() === arg || l.native.toLowerCase() === arg)
         : undefined;
       if (arg && !named) {
-        return error(t(`Unknown language: ${arg}. Available: ${LANGUAGES.map((l) => l.code).join(", ")}`, `Неизвестный язык: ${arg}. Доступны: ${LANGUAGES.map((l) => l.code).join(", ")}`));
+        return error(t("Unknown language: {code}. Available: {languages}", "Неизвестный язык: {code}. Доступны: {languages}", { code: arg, languages: LANGUAGES.map((l) => l.code).join(", ") }));
       }
 
       const current = loadConfig().lang;
@@ -172,7 +172,7 @@ const COMMANDS: Command[] = [
             title: "Language",
             items: LANGUAGES.map((l) => ({
               value: l.code,
-              label: l.native.padEnd(10),
+              label: l.native.padEnd(16),
               hint: c.gray(l.code === current ? `${l.label} · current` : l.label),
             })),
             initial: current,
@@ -191,7 +191,7 @@ const COMMANDS: Command[] = [
       // new one — which also clears the screen of the old language.
       app.repaintHeader();
       const picked = LANGUAGES.find((l) => l.code === code)!;
-      success(t(`Language: ${c.brightYellow(picked.native)}`, `Язык: ${c.brightYellow(picked.native)}`));
+      success(t("Language: {language}", "Язык: {language}", { language: c.brightYellow(picked.native) }));
       hint(
         code === "ru"
           ? "Ответы и описания навыков — по-русски. Код, пути и команды остаются как есть."
@@ -224,7 +224,7 @@ const COMMANDS: Command[] = [
       }
 
       if (parts.length && !wanted && !persist) {
-        error(t(`Unknown level "${parts[0]}". Available: ${EFFORT_LEVELS.join(", ")}`, `Неизвестный уровень "${parts[0]}". Доступны: ${EFFORT_LEVELS.join(", ")}`));
+        error(t('Unknown level "{level}". Available: {levels}', 'Неизвестный уровень "{level}". Доступны: {levels}', { level: parts[0], levels: EFFORT_LEVELS.join(", ") }));
         hint(t("Also: /effort reset re-probes support for the current model.", "Ещё: /effort reset заново проверит поддержку у текущей модели."));
         return;
       }
@@ -233,7 +233,7 @@ const COMMANDS: Command[] = [
         wanted ??
         ((await app.exclusiveInput(() =>
           pick({
-            title: t(`Reasoning budget (now: ${app.effort()})`, `Бюджет размышлений (сейчас: ${app.effort()})`),
+            title: t("Reasoning budget (now: {effort})", "Бюджет размышлений (сейчас: {effort})", { effort: app.effort() }),
             items: EFFORT_LEVELS.map((l) => ({
               value: l,
               label: l.padEnd(10),
@@ -258,7 +258,7 @@ const COMMANDS: Command[] = [
       app.repaintHeader();
       hint(persist ? t("Saved as the default.", "Сохранено как значение по умолчанию.") : t("This session only — add save to keep it.", "Только на эту сессию — добавьте save, чтобы запомнить."));
       if (level !== "off" && modelRejectsEffort(app.session.model)) {
-        warn(t(`${app.session.model} rejected this parameter before — it is being omitted.`, `${app.session.model} уже отвергала этот параметр — он не отправляется.`));
+        warn(t("{model} rejected this parameter before — it is being omitted.", "{model} уже отвергала этот параметр — он не отправляется.", { model: app.session.model }));
         hint(t("Re-check with: /effort reset", "Перепроверить: /effort reset"));
       }
       if (level !== "off") {
@@ -343,8 +343,8 @@ const COMMANDS: Command[] = [
         if (!slug) return error(t("Which one: /uilib rm <slug>", "Какой удалить: /uilib rm <слаг>"));
         const ok = deleteEntry(slug);
         return ok
-          ? success(t(`Removed ${slug}.`, `Удалено: ${slug}.`))
-          : error(t(`No such entry: ${slug}`, `Такого макета нет: ${slug}`));
+          ? success(t("Removed {slug}.", "Удалено: {slug}.", { slug }))
+          : error(t("No such entry: {slug}", "Такого макета нет: {slug}", { slug }));
       }
 
       if (sub === "match") {
@@ -359,7 +359,7 @@ const COMMANDS: Command[] = [
         return startBlendTurn(app, picked);
       }
 
-      if (sub) return error(t(`Unknown subcommand: ${sub}`, `Неизвестная подкоманда: ${sub}`));
+      if (sub) return error(t("Unknown subcommand: {name}", "Неизвестная подкоманда: {name}", { name: sub }));
 
       await uiLibraryModal(app);
     },
@@ -487,7 +487,7 @@ const COMMANDS: Command[] = [
       const title = given || (await app.exclusiveInput(() => askLine("New title:", app.session.title)));
       if (title === null) return;
       app.session.rename(title);
-      success(t(`Renamed to: ${app.session.title || "(untitled)"}`, `Переименована в: ${app.session.title || "(без названия)"}`));
+      success(t("Renamed to: {title}", "Переименована в: {title}", { title: app.session.title || t("(untitled)", "(без названия)") }));
     },
   },
   {
@@ -525,8 +525,9 @@ const COMMANDS: Command[] = [
       if (automatic) {
         if (automatic[1]) return setSubagentAuto(app, automatic[1].toLowerCase() === "on");
         const enabled = loadConfig().subagentAuto?.[currentProviderId(app)] === true;
-        return void info(t(`Subagent auto is ${enabled ? "on" : "off"}. /subagents auto on|off`,
-          `Авто запуск субагентов ${enabled ? "включён" : "выключен"}. /subagents auto on|off`));
+        return void info(t("Subagent auto is {state}. /subagents auto on|off",
+          "Авто запуск субагентов {state}. /subagents auto on|off",
+          { state: enabled ? t("on", "включён") : t("off", "выключен") }));
       }
 
       // /subagents model [id] — put one more model on the list without walking
@@ -610,7 +611,7 @@ const COMMANDS: Command[] = [
           command: t("only when /prompt asks", "только по команде /prompt"),
           auto: t("a new task is rewritten before it is sent", "новая задача переписывается перед отправкой"),
         }[mode];
-        return void success(t(`Prompt mode: ${mode} — ${said}`, `Режим промптов: ${mode} — ${said}`));
+        return void success(t("Prompt mode: {mode} — {said}", "Режим промптов: {mode} — {said}", { mode, said }));
       }
 
       // /prompt model [id] — the writer for the provider in use.
@@ -663,14 +664,14 @@ const COMMANDS: Command[] = [
           const next = { ...loadConfig().contextWindows };
           delete next[app.session.model];
           saveConfig({ contextWindows: next }, { replace: ["contextWindows"] });
-          hint(t(`${app.session.model}: back to the reported or assumed size.`, `${app.session.model}: снова размер из каталога или оценка.`));
+          hint(t("{model}: back to the reported or assumed size.", "{model}: снова размер из каталога или оценка.", { model: app.session.model }));
         } else {
           const pinned = parseTokens(arg);
           if (!pinned) {
-            return void error(t(`Not a token count: ${rest.trim()} (try 500k, 2m, 128000)`, `Не похоже на число токенов: ${rest.trim()} (например 500k, 2m, 128000)`));
+            return void error(t("Not a token count: {value} (try 500k, 2m, 128000)", "Не похоже на число токенов: {value} (например 500k, 2m, 128000)", { value: rest.trim() }));
           }
           saveConfig({ contextWindows: { [app.session.model]: pinned } });
-          hint(t(`${app.session.model}: window pinned to ${fmtTokens(pinned)} tokens.`, `${app.session.model}: окно закреплено на ${fmtTokens(pinned)} токенов.`));
+          hint(t("{model}: window pinned to {tokens} tokens.", "{model}: окно закреплено на {tokens} токенов.", { model: app.session.model, tokens: fmtTokens(pinned) }));
         }
         app.cfg = loadConfig();
         // Cached catalog, re-decorated: the pin applies without a round trip.
@@ -852,7 +853,7 @@ const COMMANDS: Command[] = [
       }
       // The injected column hides what it was; name it when there is anything.
       const sources = new Set(rows.flatMap((p) => p.injected.map((i) => i.source)));
-      if (sources.size) hint(t(`Injected: ${[...sources].join(", ")}.`, `Инъекции: ${[...sources].join(", ")}.`));
+      if (sources.size) hint(t("Injected: {sources}.", "Инъекции: {sources}.", { sources: [...sources].join(", ") }));
       hint(t(
         "~estimates per request; history is what travelled after trim. /trace <n> for more steps.",
         "~оценки на запрос; history — то, что ушло после trim. /trace <n> — больше шагов.",
@@ -876,18 +877,18 @@ const COMMANDS: Command[] = [
         trustProjectServers(app.cwd);
         connectMcpServers(app.cwd, (client) => {
           app.rebuildTools();
-          if (client.state === "ready") info(t(`MCP ${client.id}: ${client.tools.length} tools connected.`, `MCP ${client.id}: подключено инструментов: ${client.tools.length}.`));
-          else warn(t(`MCP ${client.id} failed: ${client.detail}`, `MCP ${client.id} не подключился: ${client.detail}`));
+          if (client.state === "ready") info(t("MCP {id}: {tools} tools connected.", "MCP {id}: подключено инструментов: {tools}.", { id: client.id, tools: client.tools.length }));
+          else warn(t("MCP {id} failed: {detail}", "MCP {id} не подключился: {detail}", { id: client.id, detail: client.detail }));
         });
-        return info(t(`Trusted for this folder: ${waiting.join(", ")}. Starting…`, `Одобрено для этой папки: ${waiting.join(", ")}. Запускаю…`));
+        return info(t("Trusted for this folder: {servers}. Starting…", "Одобрено для этой папки: {servers}. Запускаю…", { servers: waiting.join(", ") }));
       }
 
       if (cmd === "reload") {
         stopMcpServers();
         connectMcpServers(app.cwd, (client) => {
           app.rebuildTools();
-          if (client.state === "ready") info(t(`MCP ${client.id}: ${client.tools.length} tools connected.`, `MCP ${client.id}: подключено инструментов: ${client.tools.length}.`));
-          else warn(t(`MCP ${client.id} failed: ${client.detail}`, `MCP ${client.id} не подключился: ${client.detail}`));
+          if (client.state === "ready") info(t("MCP {id}: {tools} tools connected.", "MCP {id}: подключено инструментов: {tools}.", { id: client.id, tools: client.tools.length }));
+          else warn(t("MCP {id} failed: {detail}", "MCP {id} не подключился: {detail}", { id: client.id, detail: client.detail }));
         });
         app.rebuildTools();
         return info(t("Reconnecting MCP servers…", "Переподключаю MCP-серверы…"));
@@ -903,16 +904,16 @@ const COMMANDS: Command[] = [
         if (!target) return warn(t("Usage: /mcp restart <id>", "Использование: /mcp restart <id>"));
         const client = await restartMcpServer(target);
         app.rebuildTools();
-        if (!client) return warn(t(`No MCP server "${target}".`, `Нет MCP-сервера "${target}".`));
+        if (!client) return warn(t('No MCP server "{id}".', 'Нет MCP-сервера "{id}".', { id: target }));
         if (client.state === "ready") {
-          return info(t(`MCP ${client.id}: restarted, ${client.tools.length} tools.`, `MCP ${client.id}: перезапущен, инструментов: ${client.tools.length}.`));
+          return info(t("MCP {id}: restarted, {tools} tools.", "MCP {id}: перезапущен, инструментов: {tools}.", { id: client.id, tools: client.tools.length }));
         }
-        return warn(t(`MCP ${client.id} failed: ${client.detail}`, `MCP ${client.id} не подключился: ${client.detail}`));
+        return warn(t("MCP {id} failed: {detail}", "MCP {id} не подключился: {detail}", { id: client.id, detail: client.detail }));
       }
 
       if (cmd === "logs") {
         const picked = target ? mcpClients().filter((cl) => cl.id === target) : mcpClients();
-        if (!picked.length) return warn(t(`No MCP server "${target}".`, `Нет MCP-сервера "${target}".`));
+        if (!picked.length) return warn(t('No MCP server "{id}".', 'Нет MCP-сервера "{id}".', { id: target }));
         line();
         rule(c.brightCyan(" mcp logs "));
         for (const cl of picked) {
@@ -931,8 +932,9 @@ const COMMANDS: Command[] = [
         info(t("No MCP servers configured.", "MCP-серверы не настроены."));
         hint(
           t(
-            `Add one to ${configPath()} (or .trcode/mcp.json in the project):`,
-            `Добавьте сервер в ${configPath()} (или .trcode/mcp.json проекта):`,
+            "Add one to {path} (or .trcode/mcp.json in the project):",
+            "Добавьте сервер в {path} (или .trcode/mcp.json проекта):",
+            { path: configPath() },
           ),
         );
         padded(c.dim(`  "mcpServers": { "tradingview": { "command": "npx", "args": ["-y", "<package>"] } }`));
@@ -988,8 +990,9 @@ const COMMANDS: Command[] = [
       if (total > 20) {
         hint(
           t(
-            `${total} tool schemas ride along in every request. Trim a server with "tools": ["name", …] or raise "toolInputSchemaMaxBytes" in its config.`,
-            `Схемы всех ${total} инструментов едут в каждом запросе. Урежьте сервер через "tools": ["имя", …] или "toolInputSchemaMaxBytes" в его конфиге.`,
+            '{total} tool schemas ride along in every request. Trim a server with "tools": ["name", …] or raise "toolInputSchemaMaxBytes" in its config.',
+            'Схемы всех {total} инструментов едут в каждом запросе. Урежьте сервер через "tools": ["имя", …] или "toolInputSchemaMaxBytes" в его конфиге.',
+            { total },
           ),
         );
       }
@@ -1026,13 +1029,13 @@ const COMMANDS: Command[] = [
     async run(app, rest) {
       const cfg = loadConfig();
       const target = rest.trim() ? resolveModelId(rest.trim(), app.catalog) : app.session.model;
-      if (target === cfg.model) return info(t(`The default model is already ${c.brightYellow(target)}.`, `Модель по умолчанию уже ${c.brightYellow(target)}.`));
+      if (target === cfg.model) return info(t("The default model is already {model}.", "Модель по умолчанию уже {model}.", { model: c.brightYellow(target) }));
       saveConfig({ model: target });
       app.cfg = loadConfig();
       app.session.model = target;
       app.rebuildTools();
       app.session.save();
-      success(t(`Default model: ${c.brightYellow(target)}`, `Модель по умолчанию: ${c.brightYellow(target)}`));
+      success(t("Default model: {model}", "Модель по умолчанию: {model}", { model: c.brightYellow(target) }));
       hint(`Written to ${configPath()}. Applies to this session too.`);
     },
   },
@@ -1066,7 +1069,7 @@ const COMMANDS: Command[] = [
         hint("Change with: /permissions shell allow");
         return;
       }
-      if (!["read", "write", "shell", "network", "agent"].includes(risk)) return error(t(`Unknown class: ${risk}`, `Неизвестный класс: ${risk}`));
+      if (!["read", "write", "shell", "network", "agent"].includes(risk)) return error(t("Unknown class: {risk}", "Неизвестный класс: {risk}", { risk }));
       if (!["ask", "allow", "deny"].includes(mode)) return error(t("Mode must be ask, allow or deny", "Режим должен быть ask, allow или deny"));
       saveConfig({ permissions: { ...cfg.permissions, [risk]: mode } as any });
       success(`${risk} → ${mode}`);
@@ -1087,7 +1090,7 @@ const COMMANDS: Command[] = [
       // while the session runs on Kimi answers a question nobody asked.
       const def = name ? providerById(name) : providerById(currentProviderId(app));
       if (!def) {
-        return error(t(`Unknown provider: ${name}. Available: ${providers().map((p) => p.id).join(", ")}`, `Неизвестный поставщик: ${name}. Доступны: ${providers().map((p) => p.id).join(", ")}`));
+        return error(t("Unknown provider: {name}. Available: {providers}", "Неизвестный поставщик: {name}. Доступны: {providers}", { name, providers: providers().map((p) => p.id).join(", ") }));
       }
 
       // A third-party provider goes through the shared flow, which may need
@@ -1108,12 +1111,12 @@ const COMMANDS: Command[] = [
       sp.start();
       const check = await verifyKey(cfg.baseUrl, key);
       sp.stop();
-      if (!check.ok) return error(t(`Key rejected: ${check.detail}`, `Ключ отклонён: ${check.detail}`));
+      if (!check.ok) return error(t("Key rejected: {detail}", "Ключ отклонён: {detail}", { detail: check.detail }));
       saveConfig({ apiKey: key });
       app.cfg = loadConfig();
       app.catalog = await fetchModels({ force: true });
       app.rebuildTools();
-      success(t(`Key saved to ${configPath()} — ${check.detail}`, `Ключ сохранён в ${configPath()} — ${check.detail}`));
+      success(t("Key saved to {path} — {detail}", "Ключ сохранён в {path} — {detail}", { path: configPath(), detail: check.detail }));
       if (providers().length > 1) {
         hint(`Other providers: ${providers().filter((p) => p.id !== DEFAULT_PROVIDER).map((p) => `/login ${p.id}`).join(", ")}`);
       }
@@ -1161,7 +1164,7 @@ const COMMANDS: Command[] = [
       try {
         process.chdir(next);
       } catch (err) {
-        return error(t(`Failed: ${(err as Error).message}`, `Не вышло: ${(err as Error).message}`));
+        return error(t("Failed: {message}", "Не вышло: {message}", { message: (err as Error).message }));
       }
       app.cwd = next;
       app.readFiles.clear();
@@ -1169,7 +1172,7 @@ const COMMANDS: Command[] = [
       app.rebuildTools();
       // The workspace listing is snapshotted per directory; a new one is due.
       resetPromptSnapshots();
-      success(t(`Working directory: ${next}`, `Рабочий каталог: ${next}`));
+      success(t("Working directory: {path}", "Рабочий каталог: {path}", { path: next }));
     },
   },
 
@@ -1258,8 +1261,8 @@ const COMMANDS: Command[] = [
           scope: global ? "user" : "project",
         });
         app.rebuildTools();
-        if (existed) warn(t(`That skill already exists: ${file}`, `Такой навык уже есть: ${file}`));
-        else success(t(`Created ${file}`, `Создан ${file}`));
+        if (existed) warn(t("That skill already exists: {file}", "Такой навык уже есть: {file}", { file }));
+        else success(t("Created {file}", "Создан {file}", { file }));
         hint("Open the file and write the procedure. The description line is what matters:");
         hint("the model decides whether to load the skill from it.");
         hint(`Edit it with: /skills edit ${name}`);
@@ -1276,9 +1279,9 @@ const COMMANDS: Command[] = [
         if (want && !["on", "off"].includes(want)) return error(t("Use: /skills auto [on|off]", "Использование: /skills auto [on|off]"));
         if (want) {
           app.cfg = saveConfig({ skillAuto: want === "on" });
-          success(t(`Skill auto-selection ${want}.`, `Автовыбор навыков: ${want}.`));
+          success(t("Skill auto-selection {state}.", "Автовыбор навыков: {state}.", { state: want }));
         } else {
-          info(t(`Skill auto-selection is ${app.cfg.skillAuto === false ? "off" : "on"}.`, `Автовыбор навыков ${app.cfg.skillAuto === false ? "выключен" : "включён"}.`));
+          info(t("Skill auto-selection is {state}.", "Автовыбор навыков {state}.", { state: app.cfg.skillAuto === false ? t("off", "выключен") : t("on", "включён") }));
         }
         const withTriggers = app.skills.filter((s) => s.auto && s.triggers.length).length;
         hint(
@@ -1326,14 +1329,15 @@ const COMMANDS: Command[] = [
       if (!want) {
         info(
           t(
-            `Preset: ${app.preset}. /preset minimal keeps only shell and edit; /preset standard brings everything back.`,
-            `Пресет: ${app.preset}. /preset minimal оставляет только shell и edit; /preset standard возвращает всё.`,
+            "Preset: {preset}. /preset minimal keeps only shell and edit; /preset standard brings everything back.",
+            "Пресет: {preset}. /preset minimal оставляет только shell и edit; /preset standard возвращает всё.",
+            { preset: app.preset },
           ),
         );
         return;
       }
       if (target === app.preset) {
-        return info(t(`Already on ${target}.`, `Уже включён ${target}.`));
+        return info(t("Already on {preset}.", "Уже включён {preset}.", { preset: target }));
       }
       app.presetOverride = target;
       // The preset decides both halves of a request: the tool list and the
@@ -1363,8 +1367,8 @@ const COMMANDS: Command[] = [
         const left = allTipIds().filter((id) => !(cfg.tipsSeen ?? []).includes(id)).length;
         info(
           cfg.tips === false
-            ? t(`Hints are off. /tips on brings them back; ${left} unseen.`, `Подсказки выключены. /tips on вернёт их; не показывали ${left}.`)
-            : t(`Hints are on — one every few turns, never the same twice. ${left} unseen.`, `Подсказки включены — одна раз в несколько ходов, и никогда та же дважды. Не показывали ${left}.`),
+            ? t("Hints are off. /tips on brings them back; {left} unseen.", "Подсказки выключены. /tips on вернёт их; не показывали {left}.", { left })
+            : t("Hints are on — one every few turns, never the same twice. {left} unseen.", "Подсказки включены — одна раз в несколько ходов, и никогда та же дважды. Не показывали {left}.", { left }),
         );
         return;
       }
@@ -1591,7 +1595,8 @@ export async function runCommand(app: App, text: string): Promise<boolean> {
   const cmd = COMMANDS.find((x) => x.name === name);
   if (!cmd) {
     const near = commandNames().filter((n) => n.startsWith(rawName.slice(0, 3)));
-    error(t(`Unknown command ${rawName}${near.length ? ` — did you mean: ${near.join(", ")}` : ""}`, `Неизвестная команда ${rawName}${near.length ? ` — возможно: ${near.join(", ")}` : ""}`));
+    error(t("Unknown command {name}{hint}", "Неизвестная команда {name}{hint}",
+      { name: rawName, hint: near.length ? t(" — did you mean: {names}", " — возможно: {names}", { names: near.join(", ") }) : "" }));
     return true;
   }
   const res = await cmd.run(app, rest);

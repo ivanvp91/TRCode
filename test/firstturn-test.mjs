@@ -129,8 +129,10 @@ class Screen {
 const screen = new Screen(COLS, ROWS);
 const realWrite = process.stdout.write.bind(process.stdout);
 const say = (s = "") => realWrite(s + "\n");
+let painted = "";
 process.stdout.write = (chunk) => {
   const s = String(chunk);
+  painted += s;
   screen.write(s);
   // A terminal answers the cursor probe with the row it stands on.
   if (s.includes(ESC + "[6n")) {
@@ -183,7 +185,7 @@ function gapAboveInput() {
 
 void app.run();
 await sleep(1500);
-for (const [i, q] of ["first question", "second question", "reasoning followed by an answer"].entries()) {
+for (const [i, q] of ["first question", "second question", "reasoning followed by an answer", "a tool round with no words of its own"].entries()) {
   if (i === 2) {
     // Drive the real App callbacks, including an unfinished reasoning line
     // and leading blank answer chunks, while the actual turn bar is installed.
@@ -201,6 +203,20 @@ for (const [i, q] of ["first question", "second question", "reasoning followed b
       return { stoppedBecause: "stop", steps: 1, finalText: "Final answer without a large gap." };
     };
   }
+  if (i === 3) {
+    // A round that opens with whitespace and then only calls a tool used to
+    // draw a "Response" heading with nothing under it — read as an empty answer.
+    app.runWithFailover = async ({ events }) => {
+      const read = { name: "read" };
+      events.onText("\n  \n");
+      events.onToolStart(read, { path: "package.json" });
+      events.onToolEnd(read, true, "3 of 30 lines");
+      events.onText("Answer after the tool.\n");
+      events.onAssistantMessage();
+      return { stoppedBecause: "stop", steps: 1, finalText: "Answer after the tool." };
+    };
+  }
+  painted = "";
   for (const ch of q) stdin.emit("data", Buffer.from(ch));
   stdin.emit("data", Buffer.from("\r"));
   // The mock answers in well under a second; the rest is the frame settling.
@@ -215,6 +231,10 @@ for (const [i, q] of ["first question", "second question", "reasoning followed b
     const answer = lines.findLastIndex((l) => l.includes("Final answer without a large gap."));
     check("the reasoning summary closes before the response divider", thinking >= 0 && divider === thinking + 2, shown);
     check("one blank row separates the divider from the answer", answer === divider + 2 && lines[divider + 1]?.trim() === "", shown);
+  }
+  if (i === 3) {
+    const dividers = (painted.match(/Response|Ответ/g) ?? []).length;
+    check("a wordless tool round prints no empty divider", dividers === 1, `dividers ${dividers}`);
   }
 }
 

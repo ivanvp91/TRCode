@@ -19,6 +19,7 @@ import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
 import { sessionsDir } from "../config.js";
+import { backupBefore } from "./backups.js";
 import type { Session } from "./session.js";
 
 /** Beyond this a snapshot costs more disk than the undo is worth. */
@@ -148,6 +149,9 @@ export function recordWrite(
   const beforeBuf = opts.before === null ? null : Buffer.from(opts.before, "utf8");
   const afterBuf = Buffer.from(opts.after, "utf8");
   const oversize = (beforeBuf?.length ?? 0) > MAX_SNAPSHOT_BYTES;
+  // The store below is what /rewind reads; this is the copy a person can open
+  // in the project itself, and it goes away with the session that made it.
+  if (!oversize) backupBefore(session, absPath(session, opts.path), opts.before);
 
   let beforeHash: string | null = null;
   let backupFailed = false;

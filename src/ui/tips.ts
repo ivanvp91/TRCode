@@ -131,8 +131,8 @@ export const TIPS: Tip[] = [
     id: "subagents",
     when: (s) => !s.subagents,
     text: () => t(
-      "`/subagents` decides which models helpers run on — a cheap model is enough for most steps.",
-      "`/subagents` задаёт модели для помощников — на большинстве шагов хватает дешёвой.",
+      "`/subagents auto on` lets the agent fan out on its own; the same panel picks the helper models.",
+      "`/subagents auto on` разрешает агенту самому запускать помощников — там же выбираются их модели.",
     ),
   },
 ];

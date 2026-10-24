@@ -4,7 +4,7 @@ import { t } from "../i18n.js";
 import type { UserQuestion, UserAnswer } from "../tools/questions.js";
 import { c, width } from "./ansi.js";
 import { contentWidth, indent } from "./layout.js";
-import { setFooter, refreshFooter } from "./render.js";
+import { setFooter, setFooterAbove, refreshFooter } from "./render.js";
 import { pushConsumer } from "./stdin.js";
 import { innerWidth, modalBottom, modalButtons, modalField, modalFooter, modalRow, modalSep, modalTop, type ModalAction } from "./modal.js";
 
@@ -58,7 +58,7 @@ export function questionModal(
       { id: "cancel", label: t("Cancel", "Отмена"), hotkey: "c", tone: "danger" },
     ];
     const clear = () => {
-      if (installed) { setFooter(null); installed = false; }
+      if (installed) { setFooterAbove(null); installed = false; }
     };
     const finish = (value: UserAnswer[] | null, cancelled = false) => {
       if (closed) return;
@@ -156,7 +156,7 @@ export function questionModal(
       view = Math.max(0, Math.min(view, Math.max(0, body.length - room)));
       const title = review() ? t("Review answers", "Проверка ответов") : t("Questions", "Вопросы");
       const progress = review() ? t("Answers are sent only after Submit", "Ответы отправятся только после Submit")
-        : t(`Question ${step + 1} of ${questions.length}`, `Вопрос ${step + 1} из ${questions.length}`) + (questions[step].header ? ` · ${questions[step].header}` : "");
+        : t("Question {current} of {total}", "Вопрос {current} из {total}", { current: step + 1, total: questions.length }) + (questions[step].header ? ` · ${questions[step].header}` : "");
       const keys = focus === "custom" ? t("Type · Enter next · Tab buttons · Esc cancel", "Ввод · Enter далее · Tab кнопки · Esc отмена")
         : focus === "buttons" ? t("←→ buttons · Enter · Tab answers · Esc cancel", "←→ кнопки · Enter · Tab ответы · Esc отмена")
         : t("↑↓ choose · Enter next · Space mark · Tab buttons · Esc cancel", "↑↓ выбор · Enter далее · Пробел отметить · Tab кнопки · Esc отмена");
@@ -165,7 +165,7 @@ export function questionModal(
       // Background workers can keep writing above the form without moving it.
       frame = rows.map((row) => indent + row);
       if (installed) refreshFooter();
-      else { installed = true; setFooter(() => frame); }
+      else { installed = true; setFooterAbove(() => frame); }
     };
     const insert = (text: string) => {
       if (review()) return;

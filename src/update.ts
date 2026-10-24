@@ -201,8 +201,9 @@ export function versionBadge(): { text: string; note?: string } {
     return {
       text: `${VERSION}*`,
       note: tr(
-        `update to ${applied} installed — restart the terminal`,
-        `обновление ${applied} установлено — перезапустите терминал`,
+        "update to {version} installed — restart the terminal",
+        "обновление {version} установлено — перезапустите терминал",
+        { version: applied },
       ),
     };
   }
@@ -211,8 +212,9 @@ export function versionBadge(): { text: string; note?: string } {
     return {
       text: `${VERSION}*`,
       note: tr(
-        `${upd.version} is available — run /update`,
-        `доступна ${upd.version} — выполните /update`,
+        "{version} is available — run /update",
+        "доступна {version} — выполните /update",
+        { version: upd.version },
       ),
     };
   }

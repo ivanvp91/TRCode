@@ -34,7 +34,13 @@ export function providerItems(app: App): PickerItem[] {
       label: p.id === "openai" && mode === "oauth" && readCredentials(p.id)?.email ? `${p.label} · ${readCredentials(p.id)!.email}` : p.label,
       badge: p.id === cur ? t("current", "текущий") : undefined,
       hint: mode
-        ? t(`${mode === "oauth" ? "subscription" : "API key"} · ${n} ${plural(n, "model", "models")}`, `${mode === "oauth" ? "подписка" : "ключ API"} · ${count(n, ["model", "models"], ["модель", "модели", "моделей"])}`)
+        ? t("{kind} · {n} {models}", "{kindRu} · {modelsRu}", {
+          kind: mode === "oauth" ? "subscription" : "API key",
+          kindRu: mode === "oauth" ? "подписка" : "ключ API",
+          n,
+          models: plural(n, "model", "models"),
+          modelsRu: count(n, ["model", "models"], ["модель", "модели", "моделей"]),
+        })
         : t("not connected — Enter to log in", "не подключён — Enter, чтобы войти"),
     };
   });
@@ -42,7 +48,7 @@ export function providerItems(app: App): PickerItem[] {
 
 /** Connects the provider if needed, then points the session at one of its models. */
 export async function switchToProvider(app: App, def: ProviderDef): Promise<void> {
-  if (def.id === currentProviderId(app)) return info(t(`Already on ${def.label}.`, `Уже на ${def.label}.`));
+  if (def.id === currentProviderId(app)) return info(t("Already on {provider}.", "Уже на {provider}.", { provider: def.label }));
   if (!modeFor(def.id)) {
     if (def.id === DEFAULT_PROVIDER) return error(t("No TokenRouter key. Run /login.", "Нет ключа TokenRouter. Наберите /login."));
     const res = await loginProvider(def, { exclusive: (fn) => app.exclusiveInput(fn) });
@@ -53,7 +59,7 @@ export async function switchToProvider(app: App, def: ProviderDef): Promise<void
     app.catalog = await fetchModels({ force: true });
   }
   const id = defaultModelFor(app, def.id);
-  if (!id) return error(t(`${def.label} has no models to switch to.`, `У ${def.label} нет моделей для переключения.`));
+  if (!id) return error(t("{provider} has no models to switch to.", "У {provider} нет моделей для переключения.", { provider: def.label }));
 
   rememberCurrent(app);
   const state = providerState(def.id);
@@ -70,7 +76,13 @@ export async function switchToProvider(app: App, def: ProviderDef): Promise<void
   app.repaintHeader();
   warnIfIncompatible(app, id);
   const n = providerModels(app, def.id).length;
-  if (n > 1) hint(t(`${n} models here — pick another with /model`, `${count(n, ["model", "models"], ["модель", "модели", "моделей"])} здесь — другую выбрать через /model`));
+  if (n > 1)
+    hint(
+      t("{n} models here — pick another with /model", "{modelsRu} здесь — другую выбрать через /model", {
+        n,
+        modelsRu: count(n, ["model", "models"], ["модель", "модели", "моделей"]),
+      }),
+    );
 }
 
 /**
@@ -102,8 +114,13 @@ export async function refreshCatalog(app: App, opts: { quiet?: boolean } = {}): 
   const change = delta ? ` (${delta > 0 ? "+" : ""}${delta})` : "";
   success(
     t(
-      `Catalog refreshed: ${app.catalog.length} models${change}.`,
-      `Каталог обновлён: ${count(app.catalog.length, ["model", "models"], ["модель", "модели", "моделей"])}${change}.`,
+      "Catalog refreshed: {n} models{change}.",
+      "Каталог обновлён: {modelsRu}{change}.",
+      {
+        n: app.catalog.length,
+        modelsRu: count(app.catalog.length, ["model", "models"], ["модель", "модели", "моделей"]),
+        change,
+      },
     ),
   );
 }
@@ -111,15 +128,19 @@ export async function refreshCatalog(app: App, opts: { quiet?: boolean } = {}): 
 /** Pins the default provider — what a new session opens on. */
 export function setDefaultProvider(app: App, def: ProviderDef): void {
   if (!modeFor(def.id)) {
-    return error(t(`${def.label} is not connected — /provider ${def.id} connects it.`, `${def.label} не подключён — подключит /provider ${def.id}.`));
+    return error(t("{provider} is not connected — /provider {id} connects it.", "{provider} не подключён — подключит /provider {id}.", { provider: def.label, id: def.id }));
   }
   // The remembered model is what a new session will open on, so pin the
   // current one when defaulting to the provider we are already using.
   if (def.id === currentProviderId(app)) rememberCurrent(app);
   saveConfig({ defaultProvider: def.id });
   app.cfg = loadConfig();
-  success(t(`Default provider: ${c.brightYellow(def.label)}`, `Поставщик по умолчанию: ${c.brightYellow(def.label)}`));
-  hint(t(`New sessions start on ${providerState(def.id).model ?? defaultModelFor(app, def.id) ?? loadConfig().model}.`, `Новые сессии будут открываться на ${providerState(def.id).model ?? defaultModelFor(app, def.id) ?? loadConfig().model}.`));
+  success(t("Default provider: {provider}", "Поставщик по умолчанию: {provider}", { provider: c.brightYellow(def.label) }));
+  hint(
+    t("New sessions start on {model}.", "Новые сессии будут открываться на {model}.", {
+      model: providerState(def.id).model ?? defaultModelFor(app, def.id) ?? loadConfig().model,
+    }),
+  );
 }
 
 /**
@@ -137,23 +158,23 @@ export async function setProviderHost(app: App, def: ProviderDef, given?: string
   app.cfg = loadConfig();
   await refreshCatalog(app, { quiet: true });
   const now = modeConfig(def.id, "apikey")?.baseUrl;
-  success(t(`${def.label} host: ${now}`, `Сервер ${def.label}: ${now}`));
-  if (modeFor(def.id)) hint(t(`The key stays as it is — /login ${def.id} replaces it.`, `Ключ остаётся прежним — заменить: /login ${def.id}.`));
+  success(t("{provider} host: {host}", "Сервер {provider}: {host}", { provider: def.label, host: String(now) }));
+  if (modeFor(def.id)) hint(t("The key stays as it is — /login {id} replaces it.", "Ключ остаётся прежним — заменить: /login {id}.", { id: def.id }));
 }
 
 /** Drops a provider's credential, and the session's model with it if need be. */
 export async function logoutFromProvider(app: App, def: ProviderDef): Promise<void> {
   if (def.id === DEFAULT_PROVIDER) return error(t("Remove the TokenRouter key with: trc auth logout", "Ключ TokenRouter удаляется так: trc auth logout"));
-  if (!(await disconnectProvider(def.id))) return warn(t(`${def.label} was not connected.`, `${def.label} не был подключён.`));
+  if (!(await disconnectProvider(def.id))) return warn(t("{provider} was not connected.", "{provider} не был подключён.", { provider: def.label }));
   await refreshCatalog(app, { quiet: true });
-  success(t(`${def.label} disconnected.`, `${def.label} отключён.`));
+  success(t("{provider} disconnected.", "{provider} отключён.", { provider: def.label }));
   // The session was talking to it; leaving the model in place would only
   // produce a 401 on the next turn.
   if (currentProviderId(app) === def.id) {
     app.session.model = loadConfig().model;
     app.session.save();
     app.rebuildTools();
-    info(t(`Model: ${app.session.model}`, `Модель: ${app.session.model}`));
+    info(t("Model: {model}", "Модель: {model}", { model: app.session.model }));
   }
 }
 
@@ -232,8 +253,15 @@ export async function settingsModal(app: App): Promise<void> {
       ),
       hint: c.dim(
         t(
-          `trim ×${LIGHT_BUDGET} at ${level(cfg.autoCompactLightAt)}, digest ×${MEDIUM_BUDGET} at ${level(cfg.autoCompactMediumAt)}, full at ${level(cfg.autoCompactAt)} · /compact auto off`,
-          `сокращение ×${LIGHT_BUDGET} с ${level(cfg.autoCompactLightAt)}, конспект ×${MEDIUM_BUDGET} с ${level(cfg.autoCompactMediumAt)}, полное с ${level(cfg.autoCompactAt)} · /compact auto off`,
+          "trim ×{lightBudget} at {light}, digest ×{mediumBudget} at {medium}, full at {full} · /compact auto off",
+          "сокращение ×{lightBudget} с {light}, конспект ×{mediumBudget} с {medium}, полное с {full} · /compact auto off",
+          {
+            lightBudget: LIGHT_BUDGET,
+            light: level(cfg.autoCompactLightAt),
+            mediumBudget: MEDIUM_BUDGET,
+            medium: level(cfg.autoCompactMediumAt),
+            full: level(cfg.autoCompactAt),
+          },
         ),
       ),
       badge: autoCompactOn ? c.brightGreen(t("on", "вкл")) : c.gray(t("off", "выкл")),
@@ -294,8 +322,22 @@ export async function settingsModal(app: App): Promise<void> {
   const compact = picked.includes("autoCompact");
   success(
     t(
-      `Saved: skills ${picked.includes("skillAuto") ? "on" : "off"}, UI library ${picked.includes("uilibAuto") ? "on" : "off"}, favorites ${picked.includes("favoritesAllProviders") ? "all providers" : "current provider"}, auto-compact ${compact ? "on" : "off"}, ${shown} of ${STATUS_FIELDS.length} status fields, update check ${upd ? "on" : "off"}.`,
-      `Сохранено: навыки ${picked.includes("skillAuto") ? "вкл" : "выкл"}, UI-библиотека ${picked.includes("uilibAuto") ? "вкл" : "выкл"}, избранное ${picked.includes("favoritesAllProviders") ? "со всех поставщиков" : "только текущий поставщик"}, автосжатие ${compact ? "вкл" : "выкл"}, полей статуса ${shown} из ${STATUS_FIELDS.length}, проверка обновлений ${upd ? "вкл" : "выкл"}.`,
+      "Saved: skills {skills}, UI library {uilib}, favorites {favorites}, auto-compact {compact}, {shown} of {total} status fields, update check {updates}.",
+      "Сохранено: навыки {skillsRu}, UI-библиотека {uilibRu}, избранное {favoritesRu}, автосжатие {compactRu}, полей статуса {shown} из {total}, проверка обновлений {updatesRu}.",
+      {
+        skills: picked.includes("skillAuto") ? "on" : "off",
+        skillsRu: picked.includes("skillAuto") ? "вкл" : "выкл",
+        uilib: picked.includes("uilibAuto") ? "on" : "off",
+        uilibRu: picked.includes("uilibAuto") ? "вкл" : "выкл",
+        favorites: picked.includes("favoritesAllProviders") ? "all providers" : "current provider",
+        favoritesRu: picked.includes("favoritesAllProviders") ? "со всех поставщиков" : "только текущий поставщик",
+        compact: compact ? "on" : "off",
+        compactRu: compact ? "вкл" : "выкл",
+        shown,
+        total: STATUS_FIELDS.length,
+        updates: upd ? "on" : "off",
+        updatesRu: upd ? "вкл" : "выкл",
+      },
     ),
   );
 }
@@ -317,15 +359,26 @@ export function setAutoCompact(app: App, arg: string): void {
   if (want === undefined) {
     if (word) {
       return warn(
-        t(`Unknown value "${arg.trim()}" — use /compact auto on|off.`, `Неизвестное значение «${arg.trim()}» — используйте /compact auto on|off.`),
+        t('Unknown value "{value}" — use /compact auto on|off.', "Неизвестное значение «{value}» — используйте /compact auto on|off.", { value: arg.trim() }),
       );
     }
     const on = cfg.autoCompact !== false;
     const left = app.session.autoCompacts;
     info(
       t(
-        `Auto-compaction is ${on ? "on" : "off"}: trims old tool output at ${pct(cfg.autoCompactLightAt)} (up to ${LIGHT_BUDGET} per cycle), digests with the working tail kept at ${pct(cfg.autoCompactMediumAt)} (up to ${MEDIUM_BUDGET}), full handoff at ${pct(cfg.autoCompactAt)}. This cycle: ${left.light}/${LIGHT_BUDGET} trims, ${left.medium}/${MEDIUM_BUDGET} digests — a full pass starts a new cycle.`,
-        `Автосжатие ${on ? "включено" : "выключено"}: сокращение старых результатов с ${pct(cfg.autoCompactLightAt)} (до ${LIGHT_BUDGET} раз за цикл), конспект с сохранением рабочего хвоста с ${pct(cfg.autoCompactMediumAt)} (до ${MEDIUM_BUDGET} раз), полная сводка с ${pct(cfg.autoCompactAt)}. В этом цикле: ${left.light}/${LIGHT_BUDGET} сокращений, ${left.medium}/${MEDIUM_BUDGET} конспектов — полная сводка начинает новый цикл.`,
+        "Auto-compaction is {state}: trims old tool output at {light} (up to {lightBudget} per cycle), digests with the working tail kept at {medium} (up to {mediumBudget}), full handoff at {full}. This cycle: {lightUsed}/{lightBudget} trims, {mediumUsed}/{mediumBudget} digests — a full pass starts a new cycle.",
+        "Автосжатие {stateRu}: сокращение старых результатов с {light} (до {lightBudget} раз за цикл), конспект с сохранением рабочего хвоста с {medium} (до {mediumBudget} раз), полная сводка с {full}. В этом цикле: {lightUsed}/{lightBudget} сокращений, {mediumUsed}/{mediumBudget} конспектов — полная сводка начинает новый цикл.",
+        {
+          state: on ? "on" : "off",
+          stateRu: on ? "включено" : "выключено",
+          light: pct(cfg.autoCompactLightAt),
+          lightBudget: LIGHT_BUDGET,
+          medium: pct(cfg.autoCompactMediumAt),
+          mediumBudget: MEDIUM_BUDGET,
+          full: pct(cfg.autoCompactAt),
+          lightUsed: left.light,
+          mediumUsed: left.medium,
+        },
       ),
     );
     return;
@@ -334,8 +387,13 @@ export function setAutoCompact(app: App, arg: string): void {
   if (want) {
     success(
       t(
-        `Auto-compaction on: trim at ${pct(cfg.autoCompactLightAt)}, digest at ${pct(cfg.autoCompactMediumAt)}, full at ${pct(cfg.autoCompactAt)}.`,
-        `Автосжатие включено: сокращение с ${pct(cfg.autoCompactLightAt)}, конспект с ${pct(cfg.autoCompactMediumAt)}, полное с ${pct(cfg.autoCompactAt)}.`,
+        "Auto-compaction on: trim at {light}, digest at {medium}, full at {full}.",
+        "Автосжатие включено: сокращение с {light}, конспект с {medium}, полное с {full}.",
+        {
+          light: pct(cfg.autoCompactLightAt),
+          medium: pct(cfg.autoCompactMediumAt),
+          full: pct(cfg.autoCompactAt),
+        },
       ),
     );
   } else {
@@ -367,17 +425,21 @@ export async function runUpdate(app: App, rest = ""): Promise<void> {
     try {
       rel = await latestRelease();
     } catch (err) {
-      error(tr(`Could not reach GitHub: ${(err as Error).message}`, `GitHub недоступен: ${(err as Error).message}`));
+      error(tr("Could not reach GitHub: {message}", "GitHub недоступен: {message}", { message: (err as Error).message }));
       return;
     }
     if (!rel.version || !isNewer(VERSION, rel.version)) {
-      success(tr(`Already on the latest version (${VERSION}).`, `Уже последняя версия (${VERSION}).`));
+      success(tr("Already on the latest version ({version}).", "Уже последняя версия ({version}).", { version: VERSION }));
       return;
     }
     line(
       tr(
-        `  New version available: ${c.bold(rel.version)} ${c.gray(`(current: ${VERSION})`)}`,
-        `  Доступна новая версия: ${c.bold(rel.version)} ${c.gray(`(текущая: ${VERSION})`)}`,
+        "  New version available: {version} {current}",
+        "  Доступна новая версия: {version} {current}",
+        {
+          version: c.bold(rel.version),
+          current: c.gray(tr("(current: {version})", "(текущая: {version})", { version: VERSION })),
+        },
       ),
     );
     if (args.includes("--check")) {
@@ -388,16 +450,18 @@ export async function runUpdate(app: App, rest = ""): Promise<void> {
       await applyUpdate(rel, { onStep: (msg) => info(msg) });
       success(
         tr(
-          `Updated to ${rel.version}. Restart the terminal to run the new build.`,
-          `Обновлено до ${rel.version}. Перезапустите терминал, чтобы запустить новую сборку.`,
+          "Updated to {version}. Restart the terminal to run the new build.",
+          "Обновлено до {version}. Перезапустите терминал, чтобы запустить новую сборку.",
+          { version: rel.version },
         ),
       );
       app.repaintHeader();
     } catch (err) {
       error(
         tr(
-          `Update failed: ${(err as Error).message}`,
-          `Не удалось обновиться: ${(err as Error).message}`,
+          "Update failed: {message}",
+          "Не удалось обновиться: {message}",
+          { message: (err as Error).message },
         ),
       );
     }
@@ -456,15 +520,16 @@ export async function modelModal(app: App, opts: { only?: boolean } = {}): Promi
         get subtitle() {
           const n = (all ? providerModels(app, provider) : app.catalog).length;
           return t(
-            `${all ? label : "Every provider"} · ${n} models · ★ default · ● in use`,
-            `${all ? label : "Все поставщики"} · ${n} · ★ по умолчанию · ● текущая`,
+            "{scope} · {n} models · ★ default · ● in use",
+            "{scopeRu} · {n} · ★ по умолчанию · ● текущая",
+            { scope: all ? label : "Every provider", scopeRu: all ? label : "Все поставщики", n },
           );
         },
         actions: [
           { id: "refresh", label: t("Refresh", "Обновить"), hotkey: "r" },
           all
             ? { id: "scope", label: t("All providers", "Все поставщики"), hotkey: "a" }
-            : { id: "scope", label: t(`Only ${label}`, `Только ${label}`), hotkey: "o" },
+            : { id: "scope", label: t("Only {label}", "Только {label}", { label }), hotkey: "o" },
           { id: "default", label: t("Make default", "По умолчанию"), hotkey: "d" },
           { id: "provider", label: t("Provider…", "Поставщик…"), hotkey: "p" },
         ],
@@ -491,8 +556,8 @@ export async function modelModal(app: App, opts: { only?: boolean } = {}): Promi
         app.cfg = loadConfig();
         setModel(app, res.value);
         warnIfIncompatible(app, res.value);
-        success(t(`Default model: ${c.brightYellow(res.value)}`, `Модель по умолчанию: ${c.brightYellow(res.value)}`));
-        hint(t(`Written to ${configPath()}. Applies to this session too.`, `Записано в ${configPath()}. Действует и в этой сессии.`));
+        success(t("Default model: {model}", "Модель по умолчанию: {model}", { model: c.brightYellow(res.value) }));
+        hint(t("Written to {path}. Applies to this session too.", "Записано в {path}. Действует и в этой сессии.", { path: configPath() }));
         return;
       }
       continue;
@@ -501,7 +566,7 @@ export async function modelModal(app: App, opts: { only?: boolean } = {}): Promi
     setModel(app, res.value);
     warnIfIncompatible(app, res.value);
     const aliasFor = Object.entries(cfg.aliases).find(([, v]) => v === res.value)?.[0];
-    if (aliasFor) hint(t(`alias: /model ${aliasFor}`, `алиас: /model ${aliasFor}`));
+    if (aliasFor) hint(t("alias: /model {alias}", "алиас: /model {alias}", { alias: aliasFor }));
     if (res.value !== cfg.model) hint(t("make it the default: /default", "сделать моделью по умолчанию: /default"));
     return;
   }
@@ -517,8 +582,9 @@ export async function providerModal(app: App): Promise<void> {
       openModal({
         title: t("Provider", "Поставщик"),
         subtitle: t(
-          `In use: ${providerLabel(here)} · default: ${def?.label ?? "—"} · Enter switches this session`,
-          `Сейчас: ${providerLabel(here)} · по умолчанию: ${def?.label ?? "—"} · Enter переключит сессию`,
+          "In use: {inUse} · default: {defaultProvider} · Enter switches this session",
+          "Сейчас: {inUse} · по умолчанию: {defaultProvider} · Enter переключит сессию",
+          { inUse: providerLabel(here), defaultProvider: def?.label ?? "—" },
         ),
         items: providerItems(app),
         initial: here,
@@ -566,5 +632,5 @@ export async function favModal(app: App): Promise<void> {
   saveConfig({ favoriteModels: picked }, { replace: ["favoriteModels"] });
   app.cfg = loadConfig();
   if (!picked.length) return void success(t("Favorites cleared.", "Избранное очищено."));
-  success(t(`Favorites: ${picked.length}`, `В избранном: ${count(picked.length, ["model", "models"], ["модель", "модели", "моделей"])}`));
+  success(t("Favorites: {n}", "В избранном: {modelsRu}", { n: picked.length, modelsRu: count(picked.length, ["model", "models"], ["модель", "модели", "моделей"]) }));
 }

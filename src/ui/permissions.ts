@@ -108,7 +108,7 @@ export class PermissionBroker {
           ? t("Write this file?", "Записать этот файл?")
           : tool.name === "edit"
             ? t("Apply this edit?", "Применить эту правку?")
-            : t(`Allow ${tool.name}?`, `Разрешить ${tool.name}?`);
+            : t("Allow {name}?", "Разрешить {name}?", { name: tool.name });
 
     line();
     rule(c.brightYellow(t(" permission required ", " нужно подтверждение ")));
@@ -128,14 +128,14 @@ export class PermissionBroker {
       for (const l of lines.slice(0, 30)) {
         line("  " + (styled ? l : c.dim(clip(l, contentWidth() - 2))));
       }
-      if (lines.length > 30) line(c.gray(t(`  … ${lines.length - 30} more lines`, `  … ещё строк: ${lines.length - 30}`)));
+      if (lines.length > 30) line(c.gray(t("  … {rest} more lines", "  … ещё строк: {rest}", { rest: lines.length - 30 })));
     }
     line();
 
     const answer = await choose<"once" | "always" | "reject">(
       [
         { value: "once", label: t("Allow", "Разрешить"), key: "y", tone: "ok" },
-        { value: "always", label: t(`Always allow ${tool.name} this session`, `Всегда разрешать ${tool.name} в этой сессии`), key: "a", tone: "warn" },
+        { value: "always", label: t("Always allow {name} this session", "Всегда разрешать {name} в этой сессии", { name: tool.name }), key: "a", tone: "warn" },
         { value: "reject", label: t("Reject", "Отклонить"), key: "n", tone: "danger" },
       ],
       { initial: "once", fallback: "reject", cancel: () => this.onCancel?.() },

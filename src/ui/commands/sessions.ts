@@ -11,6 +11,7 @@ import { Session, type SessionMeta } from "../../session/session.js";
 import { compactSession, contextPressure } from "../../session/compact.js";
 import { pushConsumer } from "../stdin.js";
 import { dropStore, forgetFrom, listCheckpoints, rewindFiles, type Checkpoint } from "../../session/checkpoint.js";
+import { dropSessionBackups } from "../../session/backups.js";
 import { collapsedCount, collapsedText } from "../paste.js";
 import { dropSessionHistory } from "../../session/history.js";
 import { fmtTokens, historyTokens } from "../../usage.js";
@@ -85,7 +86,7 @@ export type SessionAction = "open" | "compact" | "rename" | "delete" | "cancel";
 /** `/resume <id>`: card, three buttons, no list to fall back to. */
 export async function openSession(app: App, id: string): Promise<void> {
   const loaded = Session.load(app.cwd, id);
-  if (!loaded) return error(t(`Session not found: ${id}`, `Сессия не найдена: ${id}`));
+  if (!loaded) return error(t("Session not found: {id}", "Сессия не найдена: {id}", { id }));
   sessionCard(app, loaded);
   const action = await choose<SessionAction>(
     [
@@ -98,7 +99,19 @@ export async function openSession(app: App, id: string): Promise<void> {
   if (action === "cancel") return;
   adoptSession(app, loaded);
   if (action === "compact") await compactNow(app, "", false);
-  success(t(`Restored ${loaded.id} — ${loaded.messages.length} ${plural(loaded.messages.length, "message", "messages")}, model ${loaded.model}`, `Восстановлена ${loaded.id} — ${count(loaded.messages.length, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}, модель ${loaded.model}`));
+  success(
+    t(
+      "Restored {id} — {n} {messages}, model {model}",
+      "Восстановлена {id} — {messagesRu}, модель {model}",
+      {
+        id: loaded.id,
+        n: loaded.messages.length,
+        messages: plural(loaded.messages.length, "message", "messages"),
+        messagesRu: count(loaded.messages.length, ["message", "messages"], ["сообщение", "сообщения", "сообщений"]),
+        model: loaded.model,
+      },
+    ),
+  );
   app.replayHistory();
 }
 
@@ -152,8 +165,9 @@ async function manageList(app: App): Promise<string | null> {
       if (res.values.length > 1) {
         hint(
           t(
-            `${res.values.length} marked — the Delete button removes them all, Enter opens one row.`,
-            `Отмечено ${res.values.length} — кнопка «Удалить» снесёт все, Enter открывает одну строку.`,
+            "{n} marked — the Delete button removes them all, Enter opens one row.",
+            "Отмечено {n} — кнопка «Удалить» снесёт все, Enter открывает одну строку.",
+            { n: res.values.length },
           ),
         );
         continue;
@@ -192,8 +206,12 @@ async function deleteMarked(app: App, metas: SessionMeta[], ids: string[]): Prom
       {
         value: "yes",
         label: t(
-          `Delete ${count(targets.length, ["session", "sessions"], ["сессия", "сессии", "сессий"])} · ${count(msgs, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}`,
-          `Удалить ${count(targets.length, ["session", "sessions"], ["сессия", "сессии", "сессий"])} · ${count(msgs, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}`,
+          "Delete {sessions} · {messages}",
+          "Удалить {sessions} · {messages}",
+          {
+            sessions: count(targets.length, ["session", "sessions"], ["сессия", "сессии", "сессий"]),
+            messages: count(msgs, ["message", "messages"], ["сообщение", "сообщения", "сообщений"]),
+          },
         ),
         key: "y",
         tone: "danger",
@@ -206,12 +224,19 @@ async function deleteMarked(app: App, metas: SessionMeta[], ids: string[]): Prom
   let done = 0;
   for (const id of targets) {
     dropStore(app.cwd, id);
+    dropSessionBackups(app.cwd, id);
     dropSessionHistory(app.cwd, id);
     if (Session.remove(app.cwd, id)) done++;
   }
   if (done < targets.length)
-    warn(t(`${targets.length - done} could not be deleted.`, `Не удалось удалить: ${targets.length - done}.`));
-  success(t(`Deleted ${done} ${plural(done, "session", "sessions")}.`, `Удалено ${count(done, ["session", "sessions"], ["сессия", "сессии", "сессий"])}.`));
+    warn(t("{n} could not be deleted.", "Не удалось удалить: {n}.", { n: targets.length - done }));
+  success(
+    t("Deleted {n} {sessions}.", "Удалено {sessionsRu}.", {
+      n: done,
+      sessions: plural(done, "session", "sessions"),
+      sessionsRu: count(done, ["session", "sessions"], ["сессия", "сессии", "сессий"]),
+    }),
+  );
   return done > 0;
 }
 
@@ -252,7 +277,7 @@ export async function browseSessions(app: App, mode: "resume" | "manage"): Promi
 
     const loaded = Session.load(app.cwd, chosen);
     if (!loaded) {
-      error(t(`Session not found: ${chosen}`, `Сессия не найдена: ${chosen}`));
+      error(t("Session not found: {id}", "Сессия не найдена: {id}", { id: chosen }));
       continue;
     }
     sessionCard(app, loaded);
@@ -285,7 +310,12 @@ export async function browseSessions(app: App, mode: "resume" | "manage"): Promi
         loaded.rename(title);
         // The same session may be open right now; keep both copies in step.
         if (loaded.id === app.session.id) app.session.title = loaded.title;
-        success(t(`Renamed to: ${loaded.title || "(untitled)"}`, `Переименована в: ${loaded.title || "(без названия)"}`));
+        success(
+          t("Renamed to: {title}", "Переименована в: {titleRu}", {
+            title: loaded.title || "(untitled)",
+            titleRu: loaded.title || "(без названия)",
+          }),
+        );
       }
       continue;
     }
@@ -306,16 +336,29 @@ export async function browseSessions(app: App, mode: "resume" | "manage"): Promi
         // The snapshots exist to undo that session's edits; without it they
         // are unreachable bytes on disk.
         dropStore(app.cwd, loaded.id);
+        dropSessionBackups(app.cwd, loaded.id);
         dropSessionHistory(app.cwd, loaded.id);
-        if (Session.remove(app.cwd, loaded.id)) success(t(`Deleted ${loaded.id}`, `Удалена ${loaded.id}`));
-        else error(t(`Could not delete ${loaded.id}`, `Не удалось удалить ${loaded.id}`));
+        if (Session.remove(app.cwd, loaded.id)) success(t("Deleted {id}", "Удалена {id}", { id: loaded.id }));
+        else error(t("Could not delete {id}", "Не удалось удалить {id}", { id: loaded.id }));
       }
       continue;
     }
 
     adoptSession(app, loaded);
     if (action === "compact") await compactNow(app, "", false);
-    success(t(`Restored ${loaded.id} — ${loaded.messages.length} ${plural(loaded.messages.length, "message", "messages")}, model ${loaded.model}`, `Восстановлена ${loaded.id} — ${count(loaded.messages.length, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}, модель ${loaded.model}`));
+    success(
+      t(
+        "Restored {id} — {n} {messages}, model {model}",
+        "Восстановлена {id} — {messagesRu}, модель {model}",
+        {
+          id: loaded.id,
+          n: loaded.messages.length,
+          messages: plural(loaded.messages.length, "message", "messages"),
+          messagesRu: count(loaded.messages.length, ["message", "messages"], ["сообщение", "сообщения", "сообщений"]),
+          model: loaded.model,
+        },
+      ),
+    );
     app.replayHistory();
     return;
   }
@@ -351,11 +394,16 @@ export async function eraseSessions(app: App): Promise<void> {
     // The same cleanup as a single delete above: snapshots and input history
     // are unreachable bytes once the file they belong to is gone.
     dropStore(app.cwd, m.id);
+    dropSessionBackups(app.cwd, m.id);
     dropSessionHistory(app.cwd, m.id);
     if (Session.remove(app.cwd, m.id)) done++;
   }
-  if (done < metas.length) warn(t(`${metas.length - done} could not be deleted.`, `Не удалось удалить: ${metas.length - done}.`));
-  success(t(`Erased ${done} ${plural(done, "session", "sessions")}.`, `Удалено ${count(done, ["session", "sessions"], ["сессия", "сессии", "сессий"])}.`));
+  if (done < metas.length) warn(t("{n} could not be deleted.", "Не удалось удалить: {n}.", { n: metas.length - done }));
+  success(t("Erased {n} {sessions}.", "Удалено {sessionsRu}.", {
+    n: done,
+    sessions: plural(done, "session", "sessions"),
+    sessionsRu: count(done, ["session", "sessions"], ["сессия", "сессии", "сессий"]),
+  }));
 }
 
 /**
@@ -402,13 +450,14 @@ export async function rewindTurn(app: App, rest: string): Promise<void> {
   line();
   padded(
     t(
-      `Rewinding to before: ${truncate(chosen.prompt, 60)}`,
-      `Возврат к состоянию до: ${truncate(chosen.prompt, 60)}`,
+      "Rewinding to before: {prompt}",
+      "Возврат к состоянию до: {prompt}",
+      { prompt: truncate(chosen.prompt, 60) },
     ),
   );
   for (const f of chosen.files.slice(0, 12)) hint(c.gray("• ") + f);
   if (chosen.files.length > 12) {
-    hint(c.gray(t(`… and ${chosen.files.length - 12} more`, `… и ещё ${chosen.files.length - 12}`)));
+    hint(c.gray(t("… and {n} more", "… и ещё {n}", { n: chosen.files.length - 12 })));
   }
   line();
 
@@ -432,7 +481,12 @@ export async function rewindTurn(app: App, rest: string): Promise<void> {
     const forked = Session.forkFrom(app.session, chosen.at);
     if (!forked || !forked.messages.length) return info(t("Nothing before that point to carry over.", "До этой точки ничего переносить."));
     forked.save();
-    success(t(`Forked into ${forked.id} (${forked.messages.length} messages). Original untouched.`, `Ветка ${forked.id} (${forked.messages.length} сообщ.). Оригинал не тронут.`));
+    success(
+      t("Forked into {id} ({n} messages). Original untouched.", "Ветка {id} ({n} сообщ.). Оригинал не тронут.", {
+        id: forked.id,
+        n: forked.messages.length,
+      }),
+    );
     const go = await choose<"switch" | "stay">(
       [
         { value: "switch", label: t("Switch to the fork now", "Перейти в ветку сейчас"), key: "s" },
@@ -455,22 +509,24 @@ export async function rewindTurn(app: App, rest: string): Promise<void> {
       app.readFiles.delete(path.resolve(app.session.cwd, f));
     }
     const parts: string[] = [];
-    if (res.restored.length) parts.push(t(`${res.restored.length} restored`, `восстановлено: ${res.restored.length}`));
-    if (res.deleted.length) parts.push(t(`${res.deleted.length} removed`, `удалено: ${res.deleted.length}`));
+    if (res.restored.length) parts.push(t("{n} restored", "восстановлено: {n}", { n: res.restored.length }));
+    if (res.deleted.length) parts.push(t("{n} removed", "удалено: {n}", { n: res.deleted.length }));
     if (parts.length) success(parts.join(", "));
     if (res.diverged.length) {
       warn(
         t(
-          `Changed outside this session — preserved and skipped: ${res.diverged.join(", ")}`,
-          `Изменены вне сессии — сохранены и пропущены: ${res.diverged.join(", ")}`,
+          "Changed outside this session — preserved and skipped: {files}",
+          "Изменены вне сессии — сохранены и пропущены: {files}",
+          { files: res.diverged.join(", ") },
         ),
       );
     }
     if (res.failed.length) {
       error(
         t(
-          `Could not restore: ${res.failed.join(", ")}`,
-          `Не удалось восстановить: ${res.failed.join(", ")}`,
+          "Could not restore: {files}",
+          "Не удалось восстановить: {files}",
+          { files: res.failed.join(", ") },
         ),
       );
     }
@@ -485,8 +541,13 @@ export async function rewindTurn(app: App, rest: string): Promise<void> {
     else app.session.save();
     success(
       t(
-        `Conversation rewound — ${app.session.messages.length} ${plural(app.session.messages.length, "message", "messages")} left.`,
-        `Разговор откачен — осталось ${count(app.session.messages.length, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}.`,
+        "Conversation rewound — {n} {messages} left.",
+        "Разговор откачен — осталось {messagesRu}.",
+        {
+          n: app.session.messages.length,
+          messages: plural(app.session.messages.length, "message", "messages"),
+          messagesRu: count(app.session.messages.length, ["message", "messages"], ["сообщение", "сообщения", "сообщений"]),
+        },
       ),
     );
   } else {
@@ -561,7 +622,7 @@ export async function forkTurn(app: App, rest: string): Promise<void> {
     if (!chosenKey) return;
     at = Number(chosenKey);
     if (!Number.isInteger(at) || at < 0 || at >= messages.length) {
-      return error(t(`No such position in the history: ${arg}`, `Такой позиции в истории нет: ${arg}`));
+      return error(t("No such position in the history: {arg}", "Такой позиции в истории нет: {arg}", { arg }));
     }
     label = truncate(cuts.get(at) ?? `#${at}`, 60);
   }
@@ -572,11 +633,18 @@ export async function forkTurn(app: App, rest: string): Promise<void> {
   }
   forked.save();
 
-  padded(t(`Branching from: ${label}`, `Ветвление от: ${label}`));
+  padded(t("Branching from: {label}", "Ветвление от: {label}", { label }));
   success(
     t(
-      `Forked into ${forked.id} — ${forked.messages.length} ${plural(forked.messages.length, "message", "messages")}. The original ${app.session.id} is untouched.`,
-      `Ветка ${forked.id} — ${count(forked.messages.length, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}. Оригинал ${app.session.id} не тронут.`,
+      "Forked into {id} — {n} {messages}. The original {original} is untouched.",
+      "Ветка {id} — {messagesRu}. Оригинал {original} не тронут.",
+      {
+        id: forked.id,
+        n: forked.messages.length,
+        messages: plural(forked.messages.length, "message", "messages"),
+        messagesRu: count(forked.messages.length, ["message", "messages"], ["сообщение", "сообщения", "сообщений"]),
+        original: app.session.id,
+      },
     ),
   );
 
@@ -658,7 +726,7 @@ export function expandCollapsed(rest: string): void {
   const arg = rest.trim();
   const id = arg ? Number(arg) : undefined;
   if (arg && (!Number.isInteger(id) || id! < 1 || id! > total)) {
-    return warn(t(`No such block: 1–${total}.`, `Нет такого блока: 1–${total}.`));
+    return warn(t("No such block: 1–{total}.", "Нет такого блока: 1–{total}.", { total }));
   }
   const text = collapsedText(id);
   if (!text) return warn(t("Nothing to show.", "Показывать нечего."));
@@ -715,8 +783,13 @@ export async function editTurn(app: App, rest: string): Promise<void> {
   app.editor?.prefill(String(chosen.m.content));
   success(
     t(
-      `Dropped ${dropped} ${plural(dropped, "message", "messages")}. The text is in the input — edit it and send.`,
-      `Удалено ${count(dropped, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}. Текст в поле ввода — правьте и отправляйте.`,
+      "Dropped {n} {messages}. The text is in the input — edit it and send.",
+      "Удалено {messagesRu}. Текст в поле ввода — правьте и отправляйте.",
+      {
+        n: dropped,
+        messages: plural(dropped, "message", "messages"),
+        messagesRu: count(dropped, ["message", "messages"], ["сообщение", "сообщения", "сообщений"]),
+      },
     ),
   );
   hint(t("Files written after that turn are untouched — /rewind puts those back.", "Файлы, записанные после того хода, не тронуты — их вернёт /rewind."));

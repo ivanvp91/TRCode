@@ -22,7 +22,7 @@ export function goalCommand(app: App, rest: string): void {
   switch (word) {
     case "status":
       info(t("Goal: ", "Цель: ") + goalLine(goal ?? undefined));
-      if (goal?.maxTurns) info(t(`Turns used: ${goal.turnsUsed} of ${goal.maxTurns}.`, `Потрачено ходов: ${goal.turnsUsed} из ${goal.maxTurns}.`));
+      if (goal?.maxTurns) info(t("Turns used: {used} of {total}.", "Потрачено ходов: {used} из {total}.", { used: goal.turnsUsed, total: goal.maxTurns }));
       return;
     case "clear":
       if (!goal) return info(t("No goal set.", "Цель не задана."));
@@ -46,7 +46,7 @@ export function goalCommand(app: App, rest: string): void {
   }
 
   if (word.startsWith("--")) {
-    return error(t(`Unknown option ${word}.`, `Неизвестный флаг ${word}.`));
+    return error(t("Unknown option {word}.", "Неизвестный флаг {word}.", { word }));
   }
 
   // A new (or replaced) goal: parse the --turns flag out of the tail.
@@ -67,8 +67,9 @@ export function goalCommand(app: App, rest: string): void {
   if (!maxTurns) {
     hint(
       t(
-        `A built-in limit of ${DEFAULT_MAX_TURNS} turns pauses it automatically — /goal resume grants a fresh budget.`,
-        `Встроенный лимит ${DEFAULT_MAX_TURNS} ходов остановит её автоматически — /goal resume выдаст новый бюджет.`,
+        "A built-in limit of {turns} turns pauses it automatically — /goal resume grants a fresh budget.",
+        "Встроенный лимит {turns} ходов остановит её автоматически — /goal resume выдаст новый бюджет.",
+        { turns: DEFAULT_MAX_TURNS },
       ),
     );
   }

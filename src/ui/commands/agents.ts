@@ -1,10 +1,9 @@
 /** /brain, /swarm and /subagents: models that work alongside the main one. */
 import { c } from "../ansi.js";
-import { error, hint, padded, rule, success, warn } from "../render.js";
+import { error, hint, line, padded, rule, success, warn } from "../render.js";
 import { openModal, pick, type PickerItem, type PickerTab } from "../picker.js";
 import { choose } from "../choice.js";
 import { FAVORITE_TAB, favoriteIds, openModelsModal, pickModelsAcrossProviders } from "../modelpicker.js";
-import { askLine } from "../prompt.js";
 import { loadConfig, saveConfig } from "../../config.js";
 import { resolveModelId, groupByVendor, incompatibleReason, servesModality, usableModels } from "../../provider/models.js";
 import { providerLabel, splitModelId, wireModelId } from "../../provider/registry.js";
@@ -65,7 +64,7 @@ export async function brainPanelModal(app: App): Promise<void> {
   saveConfig({ brainModels: picked }, { replace: ["brainModels"] });
   app.cfg = loadConfig();
   if (!picked.length) return void success(t("Panel cleared.", "Совет очищен."));
-  success(t(`Panel: ${picked.map(wireModelId).join(", ")}`, `Совет: ${picked.map(wireModelId).join(", ")}`));
+  success(t("Panel: {panel}", "Совет: {panel}", { panel: picked.map(wireModelId).join(", ") }));
 }
 
 /** The panel as it stands, and the question to put to it. */
@@ -112,12 +111,17 @@ export async function brainModal(app: App): Promise<void> {
       openModal({
         title: t("Brain", "Совет моделей"),
         subtitle: t(
-          "★ marks the main model — it writes the final answer. Enter on a row in All models adds or removes it.",
-          "★ — главная модель, она пишет итог. Enter по строке в «Все модели» добавляет или убирает её.",
+          "Space marks models, Enter applies the marks to the panel (★ marks the main model — it writes the final answer).",
+          "Пробел отмечает модели, Enter применяет отметки к совету (★ — главная модель, она пишет итог).",
         ),
         tabs,
         initialTab: "panel",
         search: false,
+        // Every row is a checkbox on the panel itself: a whole batch is added
+        // or dropped in one Enter instead of reopening the panel per model.
+        multi: true,
+        selected: configured,
+        allowEmpty: true,
         empty: t("No panel yet — choose the models first.", "Совета пока нет — сначала выберите модели."),
         groupGap: [FAVORITE_TAB, "all"],
         actions: [
@@ -162,33 +166,47 @@ export async function brainModal(app: App): Promise<void> {
       continue;
     }
 
-    // A row answered from the catalogue or favorite tab toggles membership; from
-    // the panel tab, Enter asks. Which tab answered comes back with the result.
-    if (res.kind === "item" && (res.tab === "all" || res.tab === FAVORITE_TAB)) {
-      const next = configured.includes(res.value)
-        ? configured.filter((m) => m !== res.value)
-        : [...configured, res.value];
+    // Enter returns the whole checked set, whichever tabs it was marked on.
+    // Newly checked rows join the panel, unchecked rows leave it — in one save.
+    if (res.kind === "item") {
+      const next = [...new Set(res.values)];
+      const added = next.filter((id) => !configured.includes(id));
+      const removed = configured.filter((id) => !next.includes(id));
+      if (!added.length && !removed.length) return;
       saveConfig(
-        { brainModels: next, brainMainModel: cfg.brainMainModel === res.value ? "" : cfg.brainMainModel },
+        {
+          brainModels: next,
+          brainMainModel: cfg.brainMainModel && next.includes(cfg.brainMainModel) ? cfg.brainMainModel : "",
+        },
         { replace: ["brainModels"] },
       );
       app.cfg = loadConfig();
+      if (!next.length) return void success(t("Panel cleared.", "Совет очищен."));
+      const delta = [added.length ? `+${added.length}` : "", removed.length ? `−${removed.length}` : ""]
+        .filter(Boolean)
+        .join(" ");
       success(
-        next.includes(res.value)
-          ? t(`Added: ${wireModelId(res.value)}`, `Добавлена: ${wireModelId(res.value)}`)
-          : t(`Removed: ${wireModelId(res.value)}`, `Убрана: ${wireModelId(res.value)}`),
+        t("Panel ({count}): {panel}", "Совет ({count}): {panel}", {
+          count: next.length,
+          panel: next.map(wireModelId).join(", "),
+        }) + (delta ? c.dim(` · ${delta}`) : ""),
       );
-      continue;
+      return;
     }
 
-    // "Ask", and Enter on a panel row, are the same thing: the panel answers as
-    // a panel, so which row the cursor was on never mattered.
+    // "Ask" is the button (and /brain <question>): the panel answers as a panel,
+    // so which row the cursor was on never mattered.
     const panel = brainPanel(app);
     if (panel.length < 2) {
       brainNeedsPanel();
       return;
     }
-    const question = await app.exclusiveInput(() => askLine(t("The question:", "Вопрос:"), ""));
+    // The question goes through the ordinary composer, not a bare prompt line:
+    // it looks and edits like every other message, and the answer that follows
+    // grows from the same place the user just typed in.
+    line();
+    padded(c.bold(t("The question:", "Вопрос:")));
+    const question = (await app.askComposer())?.trim();
     if (!question) return;
     await app.runBrain(question, panel);
     return;
@@ -204,16 +222,15 @@ export async function setBrainMain(app: App, model: string | null): Promise<void
   const panel = loadConfig().brainModels;
   if (!panel.includes(model)) {
     warn(
-      t(
-        `${wireModelId(model)} is not on the panel — add it before making it main.`,
-        `${wireModelId(model)} нет в совете — сначала добавьте её.`,
-      ),
+      t("{model} is not on the panel — add it before making it main.", "{model} нет в совете — сначала добавьте её.", {
+        model: wireModelId(model),
+      }),
     );
     return;
   }
   saveConfig({ brainMainModel: model });
   app.cfg = loadConfig();
-  success(t(`Main model: ${wireModelId(model)}`, `Главная модель: ${wireModelId(model)}`));
+  success(t("Main model: {model}", "Главная модель: {model}", { model: wireModelId(model) }));
 }
 
 /** The whole catalogue as picker rows — vendor sections, newest first. */
@@ -272,7 +289,7 @@ export async function swarmPanelModal(app: App): Promise<void> {
       t("Roster cleared — /swarm picks its own models again.", "Список очищен — /swarm снова подбирает модели сам."),
     );
   }
-  success(t(`Swarm: ${picked.map(wireModelId).join(", ")}`, `Рой: ${picked.map(wireModelId).join(", ")}`));
+  success(t("Swarm: {models}", "Рой: {models}", { models: picked.map(wireModelId).join(", ") }));
 }
 
 /** Saves the synthesiser when it sits on the roster; says so either way. */
@@ -280,15 +297,14 @@ export function setSwarmMain(app: App, model: string | null): void {
   if (!model) return hint(t("Put the cursor on a model first.", "Сначала поставьте курсор на модель."));
   if (!swarmNow(app).includes(model)) {
     return warn(
-      t(
-        `${wireModelId(model)} is not on the roster — add it before making it the synthesiser.`,
-        `${wireModelId(model)} нет в рое — сначала добавьте её.`,
-      ),
+      t("{model} is not on the roster — add it before making it the synthesiser.", "{model} нет в рое — сначала добавьте её.", {
+        model: wireModelId(model),
+      }),
     );
   }
   saveConfig({ swarmMainModel: model });
   app.cfg = loadConfig();
-  success(t(`Synthesis: ${wireModelId(model)}`, `Сведение: ${wireModelId(model)}`));
+  success(t("Synthesis: {model}", "Сведение: {model}", { model: wireModelId(model) }));
 }
 
 /** Asks for the task, then runs the roster the panel was showing. */
@@ -302,7 +318,9 @@ export async function askSwarm(app: App, roster: string[]): Promise<void> {
     );
     return void hint(t("Choose them with /swarm models", "Выбрать: /swarm models"));
   }
-  const task = await app.exclusiveInput(() => askLine(t("The task:", "Задача:"), ""));
+  line();
+  padded(c.bold(t("The task:", "Задача:")));
+  const task = (await app.askComposer())?.trim();
   if (!task) return;
   await runSwarm(app, task, roster);
 }
@@ -420,8 +438,8 @@ export async function swarmModal(app: App): Promise<void> {
       app.cfg = loadConfig();
       success(
         next.includes(res.value)
-          ? t(`Added: ${wireModelId(res.value)}`, `Добавлена: ${wireModelId(res.value)}`)
-          : t(`Removed: ${wireModelId(res.value)}`, `Убрана: ${wireModelId(res.value)}`),
+          ? t("Added: {model}", "Добавлена: {model}", { model: wireModelId(res.value) })
+          : t("Removed: {model}", "Убрана: {model}", { model: wireModelId(res.value) }),
       );
       continue;
     }
@@ -442,10 +460,9 @@ export function subagentPool(app: App, providerId: string) {
 
 export function noSubagentModels(providerId: string): void {
   error(
-    t(
-      `${providerLabel(providerId)} has no model a subagent could run on.`,
-      `У ${providerLabel(providerId)} нет моделей для субагентов.`,
-    ),
+    t("{provider} has no model a subagent could run on.", "У {provider} нет моделей для субагентов.", {
+      provider: providerLabel(providerId),
+    }),
   );
 }
 
@@ -464,8 +481,9 @@ export function addSubagentModel(app: App, named: string): void {
   if (!pool.some((m) => m.id === added)) {
     return void error(
       t(
-        `${added} is not a model of ${providerLabel(provider)} a subagent could run on.`,
-        `${added} — не модель ${providerLabel(provider)}, на которой может работать субагент.`,
+        "{model} is not a model of {provider} a subagent could run on.",
+        "{model} — не модель {provider}, на которой может работать субагент.",
+        { model: added, provider: providerLabel(provider) },
       ),
     );
   }
@@ -478,10 +496,10 @@ export function addSubagentModel(app: App, named: string): void {
   app.cfg = loadConfig();
   app.rebuildTools();
   success(
-    t(
-      `${providerLabel(provider)}: subagents also run on ${wireModelId(added)}.`,
-      `${providerLabel(provider)}: субагенты работают также на ${wireModelId(added)}.`,
-    ),
+    t("{provider}: subagents also run on {model}.", "{provider}: субагенты работают также на {model}.", {
+      provider: providerLabel(provider),
+      model: wireModelId(added),
+    }),
   );
 }
 
@@ -495,10 +513,9 @@ export function setSubagentMode(app: App, mode: "session" | "list"): void {
   const list = loadConfig().subagentModels?.[provider] ?? [];
   if (mode === "list" && !list.length) {
     warn(
-      t(
-        `${providerLabel(provider)} has no list yet — mark the models first.`,
-        `У ${providerLabel(provider)} ещё нет списка — сначала отметьте модели.`,
-      ),
+      t("{provider} has no list yet — mark the models first.", "У {provider} ещё нет списка — сначала отметьте модели.", {
+        provider: providerLabel(provider),
+      }),
     );
     return void hint(t("Space marks a model, Enter saves.", "Пробел отмечает модель, Enter сохраняет."));
   }
@@ -508,16 +525,21 @@ export function setSubagentMode(app: App, mode: "session" | "list"): void {
   if (mode === "session") {
     return void success(
       t(
-        `${providerLabel(provider)}: subagents run on the session's model${list.length ? ` — the list of ${list.length} is kept, unused` : ""}.`,
-        `${providerLabel(provider)}: субагенты работают на модели сессии${list.length ? ` — список из ${list.length} сохранён, но не используется` : ""}.`,
+        "{provider}: subagents run on the session's model{kept}.",
+        "{provider}: субагенты работают на модели сессии{keptRu}.",
+        {
+          provider: providerLabel(provider),
+          kept: list.length ? ` — the list of ${list.length} is kept, unused` : "",
+          keptRu: list.length ? ` — список из ${list.length} сохранён, но не используется` : "",
+        },
       ),
     );
   }
   success(
-    t(
-      `Subagents on ${providerLabel(provider)}: ${list.map(wireModelId).join(", ")}`,
-      `Субагенты у ${providerLabel(provider)}: ${list.map(wireModelId).join(", ")}`,
-    ),
+    t("Subagents on {provider}: {models}", "Субагенты у {provider}: {models}", {
+      provider: providerLabel(provider),
+      models: list.map(wireModelId).join(", "),
+    }),
   );
 }
 
@@ -533,8 +555,9 @@ export function clearSubagentModels(app: App): void {
   app.rebuildTools();
   success(
     t(
-      `${providerLabel(provider)}: the list is gone — subagents run on the session's model.`,
-      `${providerLabel(provider)}: список удалён — субагенты работают на модели сессии.`,
+      "{provider}: the list is gone — subagents run on the session's model.",
+      "{provider}: список удалён — субагенты работают на модели сессии.",
+      { provider: providerLabel(provider) },
     ),
   );
 }
@@ -544,8 +567,11 @@ export function setSubagentAuto(app: App, enabled: boolean): void {
   saveConfig({ subagentAuto: { [provider]: enabled } });
   app.cfg = loadConfig();
   app.rebuildTools();
-  success(t(`${providerLabel(provider)}: subagent auto ${enabled ? "on" : "off"}.`,
-    `${providerLabel(provider)}: авто запуск субагентов ${enabled ? "включён" : "выключен"}.`));
+  success(t("{provider}: subagent auto {state}.", "{provider}: авто запуск субагентов {stateRu}.", {
+    provider: providerLabel(provider),
+    state: enabled ? "on" : "off",
+    stateRu: enabled ? "включён" : "выключен",
+  }));
 }
 
 export async function subagentsModal(app: App, required = false): Promise<void> {
@@ -559,7 +585,7 @@ export async function subagentsModal(app: App, required = false): Promise<void> 
     const mode = subagentMode(provider);
     const auto = loadConfig().subagentAuto?.[provider] === true;
     const onSession = t("the session's model", "модель сессии");
-    const onList = t(`the ${current.length} marked below`, `${current.length} отмеченных ниже`);
+    const onList = t("the {count} marked below", "{count} отмеченных ниже", { count: current.length });
 
     const res = await app.exclusiveInput(() =>
       openModelsModal({
@@ -573,12 +599,15 @@ export async function subagentsModal(app: App, required = false): Promise<void> 
         allowEmpty: true,
         title: required ? t("Choose models to launch subagents", "Выберите модели для запуска субагентов") : t("Models for subagents", "Модели для субагентов"),
         subtitle: t(
-          `${providerLabel(provider)} · auto ${auto ? "on" : "off"} · subagents run on ${mode === "list" ? onList : onSession}${
-            mode === "session" && current.length ? ` · a list of ${current.length} is kept, unused` : ""
-          } · Space marks a model, Enter saves and uses the list.`,
-          `${providerLabel(provider)} · auto ${auto ? "on" : "off"} · субагенты работают на: ${mode === "list" ? onList : onSession}${
-            mode === "session" && current.length ? ` · список из ${current.length} сохранён, но не используется` : ""
-          } · Пробел отмечает модель, Enter сохраняет и включает список.`,
+          "{provider} · auto {auto} · subagents run on {target}{kept} · Space marks a model, Enter saves and uses the list.",
+          "{provider} · auto {auto} · субагенты работают на: {target}{keptRu} · Пробел отмечает модель, Enter сохраняет и включает список.",
+          {
+            provider: providerLabel(provider),
+            auto: auto ? "on" : "off",
+            target: mode === "list" ? onList : onSession,
+            kept: mode === "session" && current.length ? ` · a list of ${current.length} is kept, unused` : "",
+            keptRu: mode === "session" && current.length ? ` · список из ${current.length} сохранён, но не используется` : "",
+          },
         ),
         actions: [
           { id: "auto", label: auto ? t("Auto: on", "Авто: вкл") : t("Auto: off", "Авто: выкл"), hotkey: "u" },
@@ -627,14 +656,14 @@ export async function subagentsModal(app: App, required = false): Promise<void> 
     app.rebuildTools();
     if (!res.values.length) {
       return void success(
-        t(`${providerLabel(provider)}: the session's model only.`, `${providerLabel(provider)}: только модель сессии.`),
+        t("{provider}: the session's model only.", "{provider}: только модель сессии.", { provider: providerLabel(provider) }),
       );
     }
     return void success(
-      t(
-        `Subagents on ${providerLabel(provider)}: ${res.values.map(wireModelId).join(", ")}`,
-        `Субагенты у ${providerLabel(provider)}: ${res.values.map(wireModelId).join(", ")}`,
-      ),
+      t("Subagents on {provider}: {models}", "Субагенты у {provider}: {models}", {
+        provider: providerLabel(provider),
+        models: res.values.map(wireModelId).join(", "),
+      }),
     );
   }
 }

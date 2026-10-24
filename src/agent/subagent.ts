@@ -15,8 +15,10 @@ import { c } from "../ui/ansi.js";
 import { padded, truncate } from "../ui/render.js";
 import { runWorker, taskModels, resolveWorkerModel } from "./worker.js";
 export { subagentMode } from "./worker.js";
+import { wireModelId } from "../provider/registry.js";
 import { roleSteps, subagentRoles, type SubagentRole } from "./roles.js";
 import { buildSystemPrompt } from "./prompt.js";
+import { stepCeiling } from "./loop.js";
 import { ApiError } from "../provider/client.js";
 import { UsageTracker, fmtTokens } from "../usage.js";
 import type { Effort } from "../config.js";
@@ -24,14 +26,33 @@ import type { Message, ModelInfo, ToolDef } from "../types.js";
 import type { Skill } from "../skills/loader.js";
 
 /**
- * Rolling progress sink for subagent actions. With one, per-step lines go to a
- * live preview (the turn bar) instead of piling up in the transcript — the
- * transcript keeps only each task's header and its done/failed line.
+ * One running helper as the turn bar lists it: the model it runs on, how much
+ * of its step budget it has spent, and what it has cost so far.
+ */
+export interface SubagentProgress {
+  id: number;
+  label: string;
+  /** Display name, provider prefix stripped — that is what the bar shows. */
+  model: string;
+  /** Steps taken so far, against the budget the helper was given. */
+  steps: number;
+  maxSteps: number;
+  /** Input + output tokens this helper has spent. */
+  tokens: number;
+  /** Its latest action, shown after the counters. */
+  line?: string;
+}
+
+/**
+ * Rolling progress sink for subagent actions. With one, the running helpers are
+ * listed in the turn bar — model, share of the step budget, tokens — instead of
+ * piling lines up in the transcript, which keeps only each task's header and
+ * its done/failed line.
  */
 export interface SubagentActivity {
-  begin(): void;
-  push(line: string): void;
-  end(): void;
+  begin(info: SubagentProgress): void;
+  update(info: SubagentProgress): void;
+  end(id: number): void;
 }
 
 /** A subagent that finished and can take a follow-up. */
@@ -119,6 +140,7 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
       "Launches a subagent on one subtask. It has its own context and the full tool set, " +
       "and returns only its final text — your context stays free of the intermediate steps.\n" +
       "Emit SEVERAL task calls in one turn to run them in parallel: different subsystems, different hypotheses, different models.\n" +
+      "A request that splits into independent parts — ten languages, ten modules, the same edit in many files — is a fan-out: launch one subagent per part in that turn, without being asked, then join the results.\n" +
       "Write the assignment self-contained: the subagent cannot see this conversation. Say exactly what to return.\n" +
       "A follow-up to a finished subagent: pass its agent_id and only the new instruction — it keeps its history.\n" +
       "Subagents share your working directory; parallel writers must touch different files.\n" +
@@ -208,15 +230,24 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
       const usage = deps.usage.child("task");
       const tag = `  ${c.brightBlue(`├ [${id}]`)}`;
       const act = deps.activity;
+      // The bar measures progress against the same ceiling the run gets, so a
+      // helper that is about to be stopped reads ~100% rather than 40%.
+      const budget = stepCeiling(roleSteps(deps.maxSteps, role), 40);
+      const info: SubagentProgress = { id, label, model: wireModelId(model), steps: 0, maxSteps: budget, tokens: 0 };
+      const spent = () => {
+        const t = usage.totals();
+        return t.input + t.output;
+      };
       const step = (text: string) => {
-        if (act) act.push(`[${id}] ${text}`);
-        else padded(`${tag} ${c.dim(text)}`);
+        if (!act) return void padded(`${tag} ${c.dim(text)}`);
+        info.line = text;
+        act.update({ ...info, tokens: spent() });
       };
       const badges = [model, roleName, readOnly ? "read-only" : "", parked ? "follow-up" : ""].filter(Boolean).join(" · ");
       padded(`${tag} ${c.bold(label)} ${c.gray(`· ${badges}`)}`);
 
       const started = Date.now();
-      act?.begin();
+      act?.begin({ ...info, tokens: spent() });
 
       const messages: Message[] = parked?.messages ?? [];
       if (parked) {
@@ -243,6 +274,13 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
           effort: role?.effort ?? deps.effortFor(model),
           systemPrompt,
           activity: step,
+          events: {
+            // The request about to go out is step n, so n steps are behind it.
+            onStep: (n) => {
+              info.steps = n;
+              act?.update({ ...info, tokens: spent() });
+            },
+          },
         });
 
         registry.park({ id, label, model, readOnly, role: roleName, messages, at: Date.now(), busy: false });
@@ -297,7 +335,7 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
         }
         return { output: `Subagent "${label}" crashed: ${msg}`, isError: true };
       } finally {
-        act?.end();
+        act?.end(id);
       }
     },
   };

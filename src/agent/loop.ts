@@ -33,6 +33,8 @@ export interface AgentEvents {
   onTrim?(savedTokens: number, count: number): void;
   /** The connection died; the step is being resent. `hadText`: part of the answer had already been streamed. */
   onReconnect?(reason: string, attempt: number, of: number, hadText?: boolean): void;
+  /** A step came back with neither an answer nor a tool call, and is being sent again. */
+  onNoAnswer?(why: string, attempt: number, of: number): void;
   /** The user steered the running turn: the text has just joined the history. */
   onSteer?(text: string): void;
   /** The history was compacted mid-turn, between a tool round and the next request. */
@@ -139,6 +141,20 @@ export function parseArgs(raw: string): { ok: true; args: Record<string, any> } 
 function whenAborted(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise((resolve) => signal.addEventListener("abort", () => resolve(), { once: true }));
+}
+
+/**
+ * What the model is told when its thinking turn ended without an answer. Sent
+ * only with the retried request: the user did not type it, so it is never
+ * written into the history and never replayed as their words.
+ */
+function answerNudge(why: string): Message {
+  return {
+    role: "user",
+    content:
+      `Your previous reply ended without an answer (${why}). Answer the request above now, ` +
+      "and keep the reasoning short: the whole reply has to fit in this one response.",
+  };
 }
 
 /** Runs tool calls with bounded concurrency, preserving result order. */
@@ -297,6 +313,16 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
   // host that keeps hanging up should surface, not be retried forever.
   let netRetries = 0;
   const NET_RETRIES = 3;
+  // Thinking turns that came back without an answer, counted for the whole
+  // turn: a host that keeps cutting the stream short must surface rather than
+  // be resent forever. Five tries, not two: a host that spends the whole output
+  // budget on thinking often does it on the first few attempts, and a turn that
+  // cost minutes of reasoning should not be thrown away on the second.
+  let noAnswer = 0;
+  const NO_ANSWER_RETRIES = 5;
+  // A line the model gets on its next try only, never in the history: the user
+  // did not say it, and a replay must not pretend otherwise.
+  let nudge: Message | null = null;
   // The last step tool calls, and how many steps in a row have made exactly
   // the same ones. See loopBreakResults.
   let lastCallSignature = "";
@@ -348,6 +374,7 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
         : { messages, saved: 0, trimmed: 0 };
     if (trim.trimmed) events?.onTrim?.(trim.saved, trim.trimmed);
     const wire: Message[] = [{ role: "system", content: opts.systemPrompt }, ...trim.messages];
+    if (nudge) wire.push(nudge);
 
     // What the model is about to see, by component. The stored history alone
     // cannot answer that after a resume: trim rewrote old results and the
@@ -444,6 +471,39 @@ export async function runAgent(opts: RunOptions): Promise<RunResult> {
       });
     }
 
+    // A step that brought back neither an answer nor a call did not finish the
+    // turn. A reasoning-only reply is what a spent output budget or a stream the
+    // host cut short looks like from here: the thinking streams, the answer
+    // never does, and the turn used to end as if the model had spoken — an
+    // empty answer, one statistics line, no explanation. The step goes out
+    // again instead, and nothing empty reaches the history.
+    if (!text.trim() && !toolCalls.length) {
+      const budgetSpent = finishReason === "length";
+      const why = budgetSpent
+        ? "the output limit was reached while thinking"
+        : "the stream ended before any answer";
+      if (noAnswer < NO_ANSWER_RETRIES) {
+        noAnswer++;
+        events?.onNoAnswer?.(why, noAnswer, NO_ANSWER_RETRIES);
+        // A budget already spent on thinking is spent the same way by an
+        // identical resend, so that case is asked to answer straight away; a
+        // stream that merely broke is resent exactly as it was.
+        if (budgetSpent || noAnswer > 1) nudge = answerNudge(why);
+        // Waits 1.5s, 3s, 4.5s… — backing off, but never longer than it takes
+        // to notice: five tries should not mean a minute of silence.
+        await new Promise((r) => setTimeout(r, Math.min(8000, 1500 * noAnswer)));
+        if (opts.signal.aborted) return { finalText, steps: step, stoppedBecause: "aborted" };
+        step--; // the same step, sent again
+        reasoning = "";
+        continue;
+      }
+      throw new ApiError(
+        `The model finished thinking without answering — ${why}. Nothing was added to the history, so the turn can simply be sent again.`,
+        0,
+      );
+    }
+
+    nudge = null;
     const assistantMsg: Message = {
       role: "assistant",
       content: text || null,

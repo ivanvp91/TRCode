@@ -35,7 +35,9 @@ trc
 
 On your first launch, TRCode will tell you that no provider is connected yet. Connect one in the next step.
 
-The interface and replies are in English by default. Use `/lang` inside TRCode to change the language.
+The interface and replies are in English by default; `/lang` switches both, and thirteen
+languages are available — English, Russian, Chinese, Japanese, German, French, Spanish,
+Italian, Portuguese, Ukrainian, Polish, Malay and Indonesian.
 
 ## 3. Connect a provider and choose a model
 

@@ -29,6 +29,7 @@ import {
 import { stashPaste, takeCollapsed } from "./paste.js";
 import { panelRows } from "./panel.js";
 import { contextRow } from "./inputbox.js";
+import { OutputRate } from "./rate.js";
 
 const CTRL_C = String.fromCharCode(3);
 const CTRL_U = String.fromCharCode(21);
@@ -215,6 +216,12 @@ export interface TurnBarOptions {
  */
 const PREVIEW_ROWS = 7;
 
+/**
+ * How many helpers the bar lists at once. A fan-out is usually two to five;
+ * past this the list would be taller than the screen it shares with the input.
+ */
+const ACTIVITY_ROWS = 8;
+
 export class TurnBar {
   private timer: NodeJS.Timeout | null = null;
   private release: (() => void) | null = null;
@@ -224,8 +231,12 @@ export class TurnBar {
   private inTokens = 0;
   private outTokens = 0;
   private cachedTokens = 0;
+  /** Wall-clock the model actually spent streaming, for the live tok/s. */
+  private rate = new OutputRate();
   /** Rolling reasoning preview, shown above the spinner while a model thinks. */
   private thinking: string[] = [];
+  /** Running helpers and long-command progress, drawn above the spinner. */
+  private activity: string[] = [];
   /** Once the preview has appeared, its rows stay reserved for the turn. */
   private previewShown = false;
   /** Where the caret sits inside rows(), so the footer can show it there. */
@@ -257,6 +268,7 @@ export class TurnBar {
   start(): void {
     if (!process.stdout.isTTY || this.timer) return;
     this.started = Date.now();
+    this.rate = new OutputRate();
     this.previewShown = false;
     this.menu = [];
     this.menuIdx = 0;
@@ -307,9 +319,40 @@ export class TurnBar {
     if (cachedTokens !== undefined) this.cachedTokens = cachedTokens;
   }
 
+  /**
+   * Output tokens that just streamed in. The speed in the spinner line is
+   * measured over these and their timestamps, not over the turn's clock: a turn
+   * spends most of its time in tools and waits, and dividing by that reported a
+   * figure that had nothing to do with the model's throughput.
+   */
+  noteOutput(tokens: number): void {
+    this.rate.note(tokens);
+  }
+
+  /** The step ended — its usage line has arrived, so generation time stops. */
+  endOutput(): void {
+    this.rate.close();
+  }
+
+  /** Milliseconds this turn's model spent generating, for the statistics line. */
+  generationMs(): number {
+    return this.rate.generationMs();
+  }
+
   setThinking(rows: string[]): void {
     this.thinking = rows;
     if (rows.length) this.previewShown = true;
+    refreshFooter();
+  }
+
+  /**
+   * The helper list: one row per running subagent, plus progress lines from
+   * /orchestrate and /swarm. Unlike the reasoning preview these rows are not
+   * reserved for the turn — they go when the work they describe is done, and
+   * the footer hands the rows back to the transcript.
+   */
+  setActivity(rows: string[]): void {
+    this.activity = rows;
     refreshFooter();
   }
 
@@ -334,6 +377,7 @@ export class TurnBar {
   stop(): { queued: string[]; draft: string } {
     this.pause();
     this.started = 0;
+    this.rate.close();
     return { queued: this.queued.map((q) => q.text), draft: this.buf.trim() };
   }
 
@@ -631,6 +675,7 @@ export class TurnBar {
     // rows inside the conversation or blank rows at the bottom, and a gap
     // between two messages is the worse of the two.
     const preview = this.previewShown ? this.thinking.slice(-PREVIEW_ROWS) : [];
+    const activity = this.activity.slice(-ACTIVITY_ROWS);
     // The dropdown keeps its height while the filter narrows it down (see
     // suggestionLines) and sits in a panel, so one number covers it here too:
     // the list rows, the keys row and the two borders.
@@ -652,7 +697,12 @@ export class TurnBar {
     // A short window keeps the bar on screen: the preview gives rows back first,
     // because everything under it — the input and the status rows — has to stay
     // visible, and a bar taller than the screen would push them off it.
-    const previewRows = Math.min(preview.length, Math.max(0, termRows - chrome - 1));
+    const room = Math.max(0, termRows - chrome - 1);
+    // The helper list keeps its rows ahead of the reasoning preview: it is the
+    // only line about work that is actually running, and its height matters to
+    // whoever is waiting on four subagents at once.
+    const liveActivity = activity.slice(-Math.min(activity.length, room));
+    const previewRows = Math.min(preview.length, Math.max(0, room - (liveActivity.length ? liveActivity.length + 1 : 0)));
     const thinking = preview.slice(-previewRows);
 
     const rows: string[] = [];
@@ -660,6 +710,12 @@ export class TurnBar {
     // A gap between the transcript above and the live block: without it the
     // streamed text and the spinner (or reasoning preview) read as one blob.
     rows.push("");
+    for (const a of liveActivity) {
+      rows.push(indent + "  " + clipAnsi(a, Math.max(10, w - 4)));
+    }
+    // The list is its own block, like the preview under it: without a row
+    // between them the last helper row reads as part of the reasoning text.
+    if (liveActivity.length) rows.push("");
     for (const tl of thinking) {
       rows.push(indent + "  " + c.dim(clipRow(tl, Math.max(10, w - 4))));
     }
@@ -730,11 +786,10 @@ export class TurnBar {
       this.inTokens || this.outTokens
         ? ` · ↑ ${fmtCompact(this.inTokens)} ↓ ${fmtCompact(this.outTokens)}${cached}`
         : "";
-    // Average over the whole turn so far — thinking and tool calls included.
-    const tps =
-      this.outTokens && Date.now() - this.started > 1000
-        ? ` · ${fmtCompact(Math.round(this.outTokens / ((Date.now() - this.started) / 1000)))} tok/s`
-        : "";
+    // Tokens per second of generation — the minutes a tool call or a rate-limit
+    // wait takes are not the model's speed. See OutputRate.
+    const rate = this.rate.perSecond();
+    const tps = rate === null ? "" : ` · ${fmtCompact(Math.round(rate))} tok/s`;
     const command = this.buf.trim().startsWith("/");
     const hint = this.menu.length
       ? c.gray("  enter to pick · esc to close the list")

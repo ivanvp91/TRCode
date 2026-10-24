@@ -30,6 +30,7 @@ const prompt = buildSystemPrompt(opts);
 // ── the rules that keep a session from getting expensive ────────────────────
 check("delegating wide reading is quantified", /more than about three files/i.test(prompt), "");
 check("it says to delegate read-only subagents", /task with read_only: true/i.test(prompt));
+check("a multi-part request is a fan-out, not a queue", /is a fan-out, not a queue/i.test(prompt), prompt.slice(0, 400));
 check("grep before read", /grep for the line/i.test(prompt));
 check("offset/limit for large files", /offset\/limit/.test(prompt));
 check("no cat through the shell", /never cat\/type one through shell/i.test(prompt));

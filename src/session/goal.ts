@@ -63,8 +63,8 @@ export function completeGoal(goal: Goal): void {
 export function goalLine(goal: Goal | undefined): string {
   if (!goal) return t("no goal set", "цель не задана");
   const bits = [statusMark(goal.status), goal.objective];
-  if (goal.maxTurns) bits.push(t(`${goal.turnsUsed}/${goal.maxTurns} turns`, `${goal.turnsUsed}/${goal.maxTurns} ходов`));
-  else if (goal.turnsUsed) bits.push(t(`${goal.turnsUsed} turns`, `${goal.turnsUsed} ходов`));
+  if (goal.maxTurns) bits.push(t("{used}/{total} turns", "{used}/{total} ходов", { used: goal.turnsUsed, total: goal.maxTurns }));
+  else if (goal.turnsUsed) bits.push(t("{used} turns", "{used} ходов", { used: goal.turnsUsed }));
   return bits.join(" · ");
 }
 
@@ -79,16 +79,17 @@ export function statusMark(status: GoalStatus): string {
  */
 export function goalPrompt(goal: Goal): string {
   const budget = goal.maxTurns
-    ? t(`Turns used: ${goal.turnsUsed} of ${goal.maxTurns}.`, `Потрачено ходов: ${goal.turnsUsed} из ${goal.maxTurns}.`)
+    ? t("Turns used: {used} of {total}.", "Потрачено ходов: {used} из {total}.", { used: goal.turnsUsed, total: goal.maxTurns })
     : "";
   return t(
-    `Continue working toward the session goal (do not ask for confirmation, act):\n${goal.objective}\n\n` +
+    `Continue working toward the session goal (do not ask for confirmation, act):\n{objective}\n\n` +
       `Work step by step: assess the current state, do the next concrete step, verify the result. ` +
       `When the goal is fully reached — and only then — end your reply with <goal-complete>. ` +
-      `If you genuinely cannot proceed, say exactly what blocks you. ${budget}`.trim(),
-    `Продолжай работать над целью сессии (не спрашивай подтверждений, действуй):\n${goal.objective}\n\n` +
+      `If you genuinely cannot proceed, say exactly what blocks you. {budget}`,
+    `Продолжай работать над целью сессии (не спрашивай подтверждений, действуй):\n{objective}\n\n` +
       `Работай по шагам: оцени текущее состояние, сделай следующий конкретный шаг, проверь результат. ` +
       `Когда цель полностью достигнута — и только тогда — заверши ответ тегом <goal-complete>. ` +
-      `Если продолжать невозможно, скажи точно, что мешает. ${budget}`.trim(),
-  );
+      `Если продолжать невозможно, скажи точно, что мешает. {budget}`,
+    { objective: goal.objective, budget },
+  ).trim();
 }

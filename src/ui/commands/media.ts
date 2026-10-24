@@ -37,7 +37,7 @@ export const CONFIG_KEY: Record<MediaKind, "imageModel" | "videoModel" | "audioM
 export async function chooseMediaModel(app: App, kind: MediaKind, named: string, opts: { allowOff?: boolean } = {}): Promise<string | null> {
   let refresh = false;
   for (;;) {
-    const spinner = new Spinner(t(`reading ${kind} models`, `читаю модели: ${kind}`));
+    const spinner = new Spinner(t("reading {kind} models", "читаю модели: {kind}", { kind }));
     spinner.start();
     let pool: Awaited<ReturnType<typeof mediaPool>>;
     try {
@@ -52,7 +52,7 @@ export async function chooseMediaModel(app: App, kind: MediaKind, named: string,
     }
     for (const e of pool.errors) warn(e);
     if (!pool.models.length) {
-      error(t(`No connected provider makes ${kind} here.`, `Ни один подключённый поставщик не делает ${kind}.`));
+      error(t("No connected provider makes {kind} here.", "Ни один подключённый поставщик не делает {kind}.", { kind }));
       hint(
         t(
           "Supported: OpenRouter, TokenRouter, xAI (API key), Z.AI — connect one with /login.",
@@ -70,7 +70,7 @@ export async function chooseMediaModel(app: App, kind: MediaKind, named: string,
       );
       const near = exact ? [exact] : pool.models.filter((m) => fromPoolId(m.id).toLowerCase().includes(q));
       if (near.length !== 1) {
-        error(t(`No single ${kind} model matches "${named}".`, `Не нашлось одной модели (${kind}) по "${named}".`));
+        error(t("No single {kind} model matches \"{named}\".", "Не нашлось одной модели ({kind}) по \"{named}\".", { kind, named }));
         if (near.length) hint(near.slice(0, 8).map((m) => fromPoolId(m.id)).join(", "));
         return null;
       }
@@ -86,8 +86,9 @@ export async function chooseMediaModel(app: App, kind: MediaKind, named: string,
           defaultModel: "",
           title: KIND_LABEL[kind](),
           subtitle: t(
-            `${pool.models.length} models · ● in use · the chat calls it when asked`,
-            `${pool.models.length} моделей · ● текущая · чат вызывает её по просьбе`,
+            "{count} models · ● in use · the chat calls it when asked",
+            "{count} моделей · ● текущая · чат вызывает её по просьбе",
+            { count: pool.models.length },
           ),
           includeIncompatible: true,
           // Stars belong to chat models; a starred video model would sit in
@@ -120,7 +121,13 @@ export async function chooseMediaModel(app: App, kind: MediaKind, named: string,
     // The tool's description names the model, and so does the video brief.
     app.rebuildTools();
     if (!stored) {
-      success(t(`${KIND_LABEL[kind]()}: off — the chat no longer has this tool.`, `${KIND_LABEL[kind]()}: выключено — в чате больше нет этого инструмента.`));
+      success(
+        t(
+          "{label}: off — the chat no longer has this tool.",
+          "{label}: выключено — в чате больше нет этого инструмента.",
+          { label: KIND_LABEL[kind]() },
+        ),
+      );
     } else {
       const hintLine = pool.hints.get(picked!);
       success(`${KIND_LABEL[kind]()}: ${stored}` + (hintLine ? c.gray(`  ${hintLine}`) : ""));
@@ -134,7 +141,7 @@ export function mediaStatus(kind: MediaKind): void {
   info(`${KIND_LABEL[kind]()}: ` + (id || t("none — off", "не выбрана — выключено")));
   const host = id ? parseMediaId(id).providerId : "";
   if (id && !providerServes(host, kind)) {
-    hint(t(`${host} is not connected with an API key: /login`, `${host} не подключён по API-ключу: /login`));
+    hint(t("{host} is not connected with an API key: /login", "{host} не подключён по API-ключу: /login", { host }));
   }
 }
 
@@ -150,7 +157,7 @@ export async function mediaCommand(app: App, kind: "image" | "audio", rest: stri
     saveConfig({ [CONFIG_KEY[kind]]: "" });
     app.cfg = loadConfig();
     app.rebuildTools();
-    return void success(t(`${KIND_LABEL[kind]()}: off.`, `${KIND_LABEL[kind]()}: выключено.`));
+    return void success(t("{label}: off.", "{label}: выключено.", { label: KIND_LABEL[kind]() }));
   }
   const stored = await chooseMediaModel(app, kind, /^(refresh|reload)$/i.test(arg) ? "" : arg, { allowOff: true });
   if (stored) {
@@ -178,7 +185,7 @@ export async function videoCommand(app: App, rest: string): Promise<void> {
   if (/^models?$/i.test(word)) return void (await chooseVideoModel(app, named));
   if (/^(prompt_?models?|writer)$/i.test(word)) return void (await chooseVideoPromptModel(app, named));
   if (word) {
-    warn(t(`Unknown: /video ${word}`, `Непонятно: /video ${word}`));
+    warn(t("Unknown: /video {word}", "Непонятно: /video {word}", { word }));
     return void hint("/video [on|off|status|model [id]|prompt_model [id]]");
   }
 
@@ -203,7 +210,7 @@ export async function videoCommand(app: App, rest: string): Promise<void> {
           {
             value: "writer",
             label: t("Prompt model", "Модель промптов"),
-            hint: writer || t(`session model (${app.session.model})`, `модель сессии (${app.session.model})`),
+            hint: writer || t("session model ({model})", "модель сессии ({model})", { model: app.session.model }),
           },
         ],
         search: false,
@@ -224,7 +231,7 @@ export function videoStatus(app: App): void {
   padded(c.gray(t("video model   ", "модель видео     ")) + videoModelId());
   padded(c.gray(t("prompt model  ", "модель промптов   ")) + (videoPromptModelId() || `${app.session.model} (${t("session", "сессии")})`));
   const host = parseMediaId(videoModelId()).providerId;
-  if (!videoAvailable()) hint(t(`${host} is not connected with an API key: /login`, `${host} не подключён по API-ключу: /login`));
+  if (!videoAvailable()) hint(t("{host} is not connected with an API key: /login", "{host} не подключён по API-ключу: /login", { host }));
 }
 
 export async function chooseVideoModel(app: App, named: string): Promise<void> {
@@ -266,7 +273,7 @@ export async function chooseVideoPromptModel(app: App, named: string): Promise<v
   app.cfg = loadConfig();
   success(
     chosen
-      ? t(`Video prompts are written by ${chosen}.`, `Промпты для видео пишет ${chosen}.`)
+      ? t("Video prompts are written by {model}.", "Промпты для видео пишет {model}.", { model: chosen })
       : t("Video prompts are written by the session model.", "Промпты для видео пишет модель сессии."),
   );
   // Already in the mode: the switch takes effect now, not on the next /video.
@@ -276,7 +283,7 @@ export async function chooseVideoPromptModel(app: App, named: string): Promise<v
 export async function startVideoMode(app: App): Promise<void> {
   if (isVideoMode()) return videoStatus(app);
   if (!videoAvailable()) {
-    warn(t(`${videoModelId()} is on a provider that is not connected; choose another.`, `${videoModelId()} у неподключённого поставщика; выберите другую.`));
+    warn(t("{model} is on a provider that is not connected; choose another.", "{model} у неподключённого поставщика; выберите другую.", { model: videoModelId() }));
     if (!(await chooseMediaModel(app, "video", ""))) return;
     if (!videoAvailable()) return;
   }
@@ -312,5 +319,5 @@ export function stopVideoMode(app: App): void {
   // Only undo our own switch: a model the user picked mid-mode stays.
   if (prev && writer && app.session.model === writer && prev !== writer) setModel(app, prev);
   else app.rebuildTools();
-  success(t(`Video mode off. Model: ${app.session.model}`, `Режим видео выключен. Модель: ${app.session.model}`));
+  success(t("Video mode off. Model: {model}", "Режим видео выключен. Модель: {model}", { model: app.session.model }));
 }

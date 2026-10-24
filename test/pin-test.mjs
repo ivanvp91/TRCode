@@ -705,5 +705,50 @@ for (const long of ["first\nsecond\nthird", "wrapped text ".repeat(24)]) {
   check("editing preserves the draft", (await editing) === "draft");
 }
 
+// ── a submitted line gives the hole back to the transcript ──────────────────
+// The composer drops to the last line on a fresh session, which leaves a hole
+// between the transcript and the input. Once the line is sent, that hole is the
+// next paragraph's place: printing at the bottom instead put the echo and the
+// whole answer under a wall of blank rows, and a panel opened there too.
+{
+  const fresh = new Screen(COLS, ROWS);
+  process.stdout.write = (chunk) => { fresh.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: ROWS, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: COLS, configurable: true });
+  process.stdout.emit("resize");
+  render.setStartRow(null);
+  render.line("banner");
+  render.line("a previous line");
+  render.setStartRow(fresh.row + 1);
+
+  const { InputEditor } = await import("../dist/ui/editor.js");
+  const status = () => ({ left: "model", hint: "keys", context: "context: 3%" });
+  const ed = new InputEditor({ status, history: [] });
+  const p = ed.read();
+  await new Promise((r) => setTimeout(r, 20));
+  check("a fresh composer drops to the last line", /context: 3%/.test(fresh.lines()[ROWS - 1]), fresh.lines().join("\n"));
+  check("leaving a hole above it", fresh.lines().slice(2, 13).every((l) => l === ""), fresh.lines().join("\n"));
+
+  stdin.emit("data", Buffer.from("hello"));
+  stdin.emit("data", Buffer.from("\r"));
+  await p;
+  render.line("echo line one");
+  render.line("answer line one");
+  const lines = fresh.lines();
+  check(
+    "what is printed next starts at the transcript's end",
+    lines[2] === "echo line one" && lines[3] === "answer line one",
+    lines.join("\n"),
+  );
+
+  const again = ed.read();
+  await new Promise((r) => setTimeout(r, 20));
+  const back = fresh.lines();
+  check("the next composer finds the bottom again", /context: 3%/.test(back[ROWS - 1]), back.join("\n"));
+  check("and the echo stays where it landed", back[2] === "echo line one", back.join("\n"));
+  stdin.emit("data", Buffer.from("\r"));
+  await again;
+}
+
 say(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

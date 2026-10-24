@@ -55,7 +55,7 @@ insert, Esc to dismiss. `/help` prints the full reference.
 system prompt, tool schemas, history after trim, injections — the projection behind
 [Token spend](models-and-costs.md#token-spend))
 
-**Settings** — `/lang [en\|ru]`, `/default [name]`, `/aliases`, `/permissions`, `/login [provider] [url]`, `/settings`, `/tips [on\|off\|reset]`, `/update [--check]`, `/config`, `/cwd`
+**Settings** — `/lang [code]`, `/default [name]`, `/aliases`, `/permissions`, `/login [provider] [url]`, `/settings`, `/tips [on\|off\|reset]`, `/update [--check]`, `/config`, `/cwd`
 (the catalog lives in `/model` — the panel lists the current provider by type and vendor,
 `/model all` every provider, and its Refresh button re-reads it past the cache; `/login`
 connects the one in use unless another is named, and takes a host for the providers whose
@@ -75,9 +75,14 @@ details in [Writing the prompt](tools-and-workflows.md#writing-the-prompt))
 
 ```
 /lang            # pick from a list
-/lang ru         # Русский
+/lang de         # Deutsch
+/lang zh         # 中文
 /lang en         # English (the default)
 ```
+
+Thirteen languages: English, Russian, Chinese, Japanese, German, French, Spanish, Italian,
+Portuguese, Ukrainian, Polish, Malay and Indonesian. `/lang` takes the code, the English
+name or the native name, and a bare `/lang` opens the picker.
 
 `/lang` sets three things at once and saves the choice as the default: the language the
 agent answers in, the one skills describe themselves in, and the interface itself — the
@@ -92,10 +97,16 @@ names and anything an API returns stay as they are too.
 Still English: the non-interactive CLI (`trc --help`, `trc auth …`), the progress output of
 `/orchestrate` and `/swarm`, and a handful of rarely-seen messages.
 
-Strings are written in both languages where they are used — `t("Model", "Модель")` —
-rather than kept in a key catalogue, so the English text stays visible in the code that
-prints it. Command labels are lazy (`help: () => t(…)`) because the command table is built
-once at import, long before `/lang` runs.
+English and Russian are written in both languages where they are used —
+`t("Model", "Модель")` — rather than kept in a key catalogue, so the English text stays
+visible in the code that prints it. Every other language is a catalogue in
+`src/i18n/<code>.ts`, keyed by that same English text: adding a language is one file and
+no call site changes, and a string with no translation yet reads in English instead of
+disappearing. Values inside a string are placeholders — `t("Deleted {id}", "Удалена {id}",
+{ id })` — which is what lets the catalogue match on the English text. Plurals come from
+`Intl.PluralRules`, with each catalogue carrying the forms its own language needs (Polish
+wants four, Chinese one). Command labels are lazy (`help: () => t(…)`) because the command
+table is built once at import, long before `/lang` runs.
 
 The setting is stated in the system prompt rather than inferred. "Answer in the user's
 language" sounds reasonable and behaves badly: a pasted stack trace or an English error
@@ -168,11 +179,14 @@ A lone `!` is still plain text.
 
 ## The interface
 
-An empty interactive session opens with a monochrome dotted TR monogram and a small
-TRCODE wordmark. Braille characters draw the dots directly in the terminal; a quiet
-breathing effect changes the whole mark's grey tone together. Smaller windows use a
-compact version. Only changed cells are redrawn, and animation pauses while terminal
-output drains. Motion stops on the first
+An empty interactive session opens with a dotted TR monogram and a small TRCODE
+wordmark. Braille characters draw the dots directly in the terminal. The mark keeps the
+grey it always had and is shaded like brushed silver — a neutral ramp, steel in one
+corner, polished in the other — while a specular band travels across it, there and back,
+once every ten seconds. The shades glide rather than step: a channel only ever moves by
+one four-step increment per frame, and 30 frames per second keep a redraw around a
+kilobyte. Smaller windows use a compact version. Only changed cells are redrawn,
+and animation pauses while terminal output drains. Motion stops on the first
 key or a window resize, leaving the input ready throughout. The first submitted message
 or command removes the logo and its empty space; the conversation starts under the
 header. Set `TRCODE_NO_SPLASH=1` for a static logo. Small windows
@@ -453,6 +467,19 @@ if a shell command really is the only way, say which files it will change.
 
 Snapshots are deleted with their session, and stores whose session is already gone are
 cleaned up at startup.
+
+Alongside that store, every file `edit` or `write` is about to overwrite leaves a plain
+copy in `.tmp/agent-backups/<session id>/`, keeping its path and stamped with the time it
+was taken — `src/app.ts.20261024-143355`. These are not for `/rewind`; they are for a
+person who wants a file back by hand, so they are ordinary files inside the project
+instead of hashed blobs in `~/.trcode`. They live exactly as long as their session:
+deleting a session deletes its copies, and copies whose session file is gone are swept at
+startup. A file being created has nothing to copy, an empty or oversized one is skipped,
+the same bytes are never copied twice, and a copy that fails is never a reason to refuse
+the write. `.tmp/` is the directory media scratch uses, so the copies sit under the same
+ignore rule. Coverage matches the rewind log exactly: a file a shell command *names* gets a
+copy the same way it gets a rewind entry, and a path built by a glob or inside a script
+gets neither.
 
 ### Forking a session
 

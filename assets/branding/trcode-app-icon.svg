@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024" role="img" aria-label="TRCode">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.32" y2="1">
+      <stop offset="0" stop-color="#232a34"/>
+      <stop offset="0.52" stop-color="#12151a"/>
+      <stop offset="1" stop-color="#07080b"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.24" cy="0.14" r="0.78">
+      <stop offset="0" stop-color="#4b5b6e" stop-opacity="0.5"/>
+      <stop offset="1" stop-color="#4b5b6e" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#2ee3dc" stop-opacity="0.22"/>
+      <stop offset="0.6" stop-color="#2ee3dc" stop-opacity="0.07"/>
+      <stop offset="1" stop-color="#2ee3dc" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="mark" x1="0.08" y1="0" x2="0.82" y2="1">
+      <stop offset="0" stop-color="#9dfff4"/>
+      <stop offset="0.38" stop-color="#54ecdf"/>
+      <stop offset="0.82" stop-color="#1fc4cf"/>
+      <stop offset="1" stop-color="#128ba2"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0" y1="0" x2="0.4" y2="1">
+      <stop offset="0" stop-color="#0c5866"/>
+      <stop offset="1" stop-color="#073540"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.16"/>
+      <stop offset="0.48" stop-color="#ffffff" stop-opacity="0.03"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.1"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" rx="228" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="228" fill="url(#glow)"/>
+  <circle cx="512" cy="512" r="380" fill="url(#halo)"/>
+  <rect x="1.5" y="1.5" width="1021" height="1021" rx="226.5" fill="none" stroke="url(#rim)" stroke-width="3"/>
+
+  <g transform="translate(228.5 204) scale(7)">
+    <path fill="url(#edge)" transform="translate(0.16 0.16)" d="M 16 16 H 51 C 64 16 71 23 71 34 C 71 44 65 50 55 51 L 75 72 H 60 L 39 50 L 47 42 H 52 C 59 42 61 39 61 34 C 61 29 58 26 52 26 H 34 V 59 C 34 65 37 69 43 72 H 28 C 24 69 23 64 23 58 V 26 H 6 Z"/>
+    <path fill="url(#mark)" d="M 16 16 H 51 C 64 16 71 23 71 34 C 71 44 65 50 55 51 L 75 72 H 60 L 39 50 L 47 42 H 52 C 59 42 61 39 61 34 C 61 29 58 26 52 26 H 34 V 59 C 34 65 37 69 43 72 H 28 C 24 69 23 64 23 58 V 26 H 6 Z"/>
+  </g>
+</svg>

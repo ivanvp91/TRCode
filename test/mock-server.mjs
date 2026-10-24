@@ -43,6 +43,9 @@ const MODELS = [
   // Thinking mode with tools: DeepSeek refuses any later step whose assistant
   // turns do not carry back the reasoning that came with the tool call.
   { id: "mock-thinking", owned_by: "mock", context_window: 64000 },
+  // Researches forever while tools are on offer: the panel's step cap has to
+  // turn into an answer, not into a promise to answer later.
+  { id: "mock-greedy", owned_by: "mock", context_window: 64000 },
   // Hangs up in the middle of the answer the first time, then behaves: the
   // dropped connection a client has to resend rather than report.
   { id: "mock-drop", owned_by: "mock", context_window: 64000 },
@@ -52,6 +55,11 @@ const MODELS = [
   // Same, but its router says so in words inside the still-open stream
   // ("Upstream idle timeout exceeded") instead of closing the socket.
   { id: "mock-upstream-timeout", owned_by: "mock", context_window: 64000 },
+  // Thinks its budget away and ends with no answer the first time, then
+  // answers: the reasoning-only turn a client must resend, not accept.
+  { id: "mock-thinking-only", owned_by: "mock", context_window: 64000 },
+  // Never answers at all — only reasoning. The turn has to end in words.
+  { id: "mock-never-answers", owned_by: "mock", context_window: 64000 },
 ];
 
 /** The mock-limited window, in ms; attempts closer together get a 429. */
@@ -61,6 +69,10 @@ let lastLimitedAt = 0;
 const rateLog = [];
 let burstRefused = false;
 const dropped = new Set();
+/** Requests seen by the thinking mocks, so the first one can be cut short. */
+const silentSeen = new Set();
+/** Tool calls the greedy mock has made; their ids have to differ per step. */
+let greedyCalls = 0;
 
 function sse(res, obj) {
   res.write(`data: ${JSON.stringify(obj)}\n\n`);
@@ -254,6 +266,42 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    // A thinking turn that never reaches an answer. Real hosts do it two ways:
+    // the output budget is spent on reasoning and the reply ends with
+    // finish_reason "length" and no text, or a router gives up on its upstream
+    // and the stream simply stops, with no finish_reason at all. Both look like
+    // a finished turn to a client that only reads the finish reason.
+    if (payload.model === "mock-thinking-only" || payload.model === "mock-never-answers") {
+      // Whether the retry came with the client's nudge: it belongs on that one
+      // request only, so the test reads it back from here rather than from the
+      // history, where it must never land.
+      const nudged = messages.some((m) => String(m.content ?? "").includes("previous reply ended"));
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      sse(res, chunk({ role: "assistant", content: "" }));
+      sse(res, chunk({ reasoning_content: "Взвешиваю варианты. ".repeat(30) }));
+      sse(res, { ...chunk({}), usage: { prompt_tokens: 50, completion_tokens: 40, total_tokens: 90 } });
+      if (payload.model === "mock-never-answers") {
+        log(`SILENT model=mock-never-answers thinking-only nudge=${nudged}\n`);
+        sse(res, chunk({}, "length"));
+        res.write("data: [DONE]" + "\n\n");
+        res.end();
+        return;
+      }
+      if (!silentSeen.has(payload.model)) {
+        silentSeen.add(payload.model);
+        log(`SILENT model=mock-thinking-only thinking-only nudge=${nudged}\n`);
+        res.write("data: [DONE]" + "\n\n");
+        res.end();
+        return;
+      }
+      log(`SILENT model=mock-thinking-only retry answered nudge=${nudged}\n`);
+      sse(res, chunk({ content: "ОТВЕТ ПОСЛЕ РАЗМЫШЛЕНИЯ" }));
+      sse(res, chunk({}, "stop"));
+      res.write("data: [DONE]" + "\n\n");
+      res.end();
+      return;
+    }
+
     // A model that thinks for a very long time and never finishes: what Esc
     // has to be able to cut through. The response is left open on purpose —
     // the client must abort it rather than wait for an end that never comes.
@@ -265,6 +313,53 @@ const server = http.createServer((req, res) => {
         clearInterval(tick);
         log(`SLOW model=mock-slow closed\n`);
       });
+      return;
+    }
+
+    // A panelist with no restraint: as long as tools are offered it asks for
+    // another one, so the only way to an answer is to take the tools away.
+    if (payload.model === "mock-greedy") {
+      const offersTools = Array.isArray(payload.tools) && payload.tools.length > 0;
+      // The forced answer at the end of the budget is a plain completion, not a
+      // stream: a mock that answered in SSE there would be testing the wrong thing.
+      if (payload.stream === false) {
+        log("GREEDY answer (json)\n");
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            choices: [{ index: 0, message: { role: "assistant", content: "ОТВЕТ ПОСЛЕ ЛИМИТА" }, finish_reason: "stop" }],
+            usage: { prompt_tokens: 100, completion_tokens: 5, total_tokens: 105 },
+          }),
+        );
+        return;
+      }
+      res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
+      sse(res, chunk({ role: "assistant", content: "" }));
+      if (offersTools) {
+        greedyCalls++;
+        log("GREEDY tool call\n");
+        sse(
+          res,
+          chunk({
+            tool_calls: [
+              {
+                index: 0,
+                id: `call_g${greedyCalls}`,
+                type: "function",
+                function: { name: "read", arguments: JSON.stringify({ path: "package.json", n: greedyCalls }) },
+              },
+            ],
+          }),
+        );
+        sse(res, chunk({}, "tool_calls"));
+      } else {
+        log("GREEDY answer\n");
+        sse(res, chunk({ content: "ОТВЕТ ПОСЛЕ ЛИМИТА" }));
+        sse(res, chunk({}, "stop"));
+      }
+      sse(res, { ...chunk({}), usage: { prompt_tokens: 100, completion_tokens: 5, total_tokens: 105 } });
+      res.write("data: [DONE]\n\n");
+      res.end();
       return;
     }
 

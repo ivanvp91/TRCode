@@ -38,7 +38,7 @@ export async function ensureWriterChosen(app: App): Promise<boolean> {
       items: [
         {
           value: "default",
-          label: t(`Keep ${wireModelId(fallback)}`, `Оставить ${wireModelId(fallback)}`),
+          label: t("Keep {model}", "Оставить {model}", { model: wireModelId(fallback) }),
           hint: t("the default writer, asked once", "модель по умолчанию, спрашивается один раз"),
         },
         {
@@ -55,7 +55,7 @@ export async function ensureWriterChosen(app: App): Promise<boolean> {
   if (res.kind === "action" && res.id === "auto" || (res.kind === "item" && res.value === "default")) {
     saveConfig({ promptModels: { [provider]: AUTO } });
     app.cfg = loadConfig();
-    hint(t(`Writing with ${fallback}. Change it with /prompt models.`, `Пишет ${fallback}. Сменить: /prompt models.`));
+    hint(t("Writing with {model}. Change it with /prompt models.", "Пишет {model}. Сменить: /prompt models.", { model: fallback }));
     return true;
   }
   if (res.kind === "item" && res.value === "pick") {
@@ -75,8 +75,9 @@ export async function chooseWriter(app: App, named: string): Promise<void> {
     app.cfg = loadConfig();
     success(
       t(
-        `${providerLabel(provider)}: the default writer — ${promptModelFor(app.session.model, app.catalog)}.`,
-        `${providerLabel(provider)}: модель по умолчанию — ${promptModelFor(app.session.model, app.catalog)}.`,
+        "{provider}: the default writer — {model}.",
+        "{provider}: модель по умолчанию — {model}.",
+        { provider: providerLabel(provider), model: promptModelFor(app.session.model, app.catalog) },
       ),
     );
     return;
@@ -92,14 +93,15 @@ export async function chooseWriter(app: App, named: string): Promise<void> {
     if (splitModelId(id).providerId !== provider) {
       return void error(
         t(
-          `${id} belongs to another provider — a writer has to be one this key can call.`,
-          `${id} у другого поставщика — писать промпты должна модель, доступная этому ключу.`,
+          "{model} belongs to another provider — a writer has to be one this key can call.",
+          "{model} у другого поставщика — писать промпты должна модель, доступная этому ключу.",
+          { model: id },
         ),
       );
     }
     saveConfig({ promptModels: { [provider]: id } });
     app.cfg = loadConfig();
-    success(t(`${providerLabel(provider)} writes prompts with ${id}.`, `${providerLabel(provider)}: промпты пишет ${id}.`));
+    success(t("{provider} writes prompts with {model}.", "{provider}: промпты пишет {model}.", { provider: providerLabel(provider), model: id }));
     return;
   }
 
@@ -134,14 +136,15 @@ export async function chooseWriter(app: App, named: string): Promise<void> {
         defaultModel: app.session.model,
         title: t("Prompt model", "Модель промптов"),
         subtitle: t(
-          `${all ? "Every provider" : label} · ★ session model · ● in use · a small one is enough`,
-          `${all ? "Все поставщики" : label} · ★ модель сессии · ● текущая · хватит маленькой`,
+          "{scope} · ★ session model · ● in use · a small one is enough",
+          "{scope} · ★ модель сессии · ● текущая · хватит маленькой",
+          { scope: all ? t("Every provider", "Все поставщики") : label },
         ),
         actions: [
           { id: "auto", label: t("Auto (default)", "Авто (по умолчанию)"), hotkey: "a" },
           { id: "refresh", label: t("Refresh", "Обновить"), hotkey: "r" },
           all
-            ? { id: "scope", label: t(`Only ${label}`, `Только ${label}`), hotkey: "o" }
+            ? { id: "scope", label: t("Only {label}", "Только {label}", { label }), hotkey: "o" }
             : { id: "scope", label: t("All providers", "Все поставщики"), hotkey: "s" },
         ],
       }),
@@ -162,8 +165,9 @@ export async function chooseWriter(app: App, named: string): Promise<void> {
         app.cfg = loadConfig();
         success(
           t(
-            `${providerLabel(provider)}: the default writer — ${promptModelFor(app.session.model, app.catalog)}.`,
-            `${providerLabel(provider)}: модель по умолчанию — ${promptModelFor(app.session.model, app.catalog)}.`,
+            "{provider}: the default writer — {model}.",
+            "{provider}: модель по умолчанию — {model}.",
+            { provider: providerLabel(provider), model: promptModelFor(app.session.model, app.catalog) },
           ),
         );
         return;
@@ -174,8 +178,9 @@ export async function chooseWriter(app: App, named: string): Promise<void> {
     if (!res.value || splitModelId(res.value).providerId !== provider) {
       warn(
         t(
-          `${res.value} belongs to another provider — pin it with /model first.`,
-          `${res.value} у другого поставщика — сначала переключитесь на него через /model.`,
+          "{model} belongs to another provider — pin it with /model first.",
+          "{model} у другого поставщика — сначала переключитесь на него через /model.",
+          { model: res.value },
         ),
       );
       continue;
@@ -183,7 +188,7 @@ export async function chooseWriter(app: App, named: string): Promise<void> {
     saveConfig({ promptModels: { [provider]: res.value } });
     app.cfg = loadConfig();
     success(
-      t(`${providerLabel(provider)} writes prompts with ${res.value}.`, `${providerLabel(provider)}: промпты пишет ${res.value}.`),
+      t("{provider} writes prompts with {model}.", "{provider}: промпты пишет {model}.", { provider: providerLabel(provider), model: res.value }),
     );
     return;
   }

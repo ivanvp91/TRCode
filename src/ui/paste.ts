@@ -35,7 +35,7 @@ const IMAGE_PATH = /^["'(]?\s*\S*\.(png|jpe?g|gif|webp|bmp|svg)\s*["')]?$/i;
 /** The token for a stashed blob, in the current interface language. */
 export function tokenFor(s: Stashed): string {
   if (s.kind === "image") return `[Image #${s.id}]`;
-  return t(`[Pasted text #${s.id} · ${s.lines} lines]`, `[Вставка #${s.id} · ${s.lines} строк]`);
+  return t("[Pasted text #{id} · {lines} lines]", "[Вставка #{id} · {lines} строк]", { id: s.id, lines: s.lines });
 }
 
 /**

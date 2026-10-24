@@ -22,12 +22,14 @@ import {
   rule,
   success,
   toolStart,
+  subagentRow,
   truncate,
   userEcho,
   warn,
   logoIntro,
   setStartRow,
   bottomSlackPending,
+  gapPending,
   wrapText,
 } from "./render.js";
 import { contentWidth, fmtAgo, fmtDuration } from "./layout.js";
@@ -78,7 +80,7 @@ import { composePrompt, promptModelFor } from "../agent/promptwriter.js";
 import { runAgent, type AgentEvents } from "../agent/loop.js";
 import { delegationPreference } from "../agent/delegation.js";
 import { subagentModelsConfigured } from "../agent/worker.js";
-import { SubagentRegistry } from "../agent/subagent.js";
+import { SubagentRegistry, type SubagentActivity, type SubagentProgress } from "../agent/subagent.js";
 import { buildTools, TodoStore } from "../tools/index.js";
 import { shellTool } from "../tools/shell.js";
 import { createSpillStore, type SpillStore } from "../tools/spill.js";
@@ -100,6 +102,7 @@ import {
 import { loadInputHistory, saveInputHistory, dropSessionHistory } from "../session/history.js";
 import { autoCompactLevel, compactSession, contextPressure, lightCompact } from "../session/compact.js";
 import { markTurn, pruneOrphanStores, recordWrite } from "../session/checkpoint.js";
+import { pruneOrphanBackups } from "../session/backups.js";
 import { UsageTracker, estimateTokens, fmtTokens } from "../usage.js";
 import type { Message, ModelInfo, ToolCall, ToolContext, ToolDef } from "../types.js";
 import { runCommand, isCommand, isShellLine, commandNames, commandSuggestions, printCommandIndex, subagentsModal } from "./commands.js";
@@ -229,26 +232,42 @@ export class App {
   pendingUilibGate: ((proposal: string) => Promise<void>) | null = null;
   /** The next turn is a uilib capture/blend — no design-reference matching. */
   skipNextDesignMatch = false;
-  /** Rolling preview of subagent actions; lives in the turn bar, not the transcript. */
+  /** Progress lines from /orchestrate and /swarm; they live in the turn bar. */
   private activityLines: string[] = [];
-  private activityActive = 0;
-  private readonly subagentActivity = {
-    begin: () => {
-      this.activityActive++;
-    },
-    push: (l: string) => {
-      this.activityLines.push(l);
-      if (this.activityLines.length > 8) this.activityLines.shift();
-      this.bar?.setThinking([...this.activityLines]);
-    },
-    end: () => {
-      this.activityActive = Math.max(0, this.activityActive - 1);
-      if (!this.activityActive) {
-        this.activityLines = [];
-        this.bar?.setThinking([]);
-      }
+  /** Helpers running right now, by id — the bar lists model, budget share, tokens. */
+  private subagentsRunning = new Map<number, SubagentProgress>();
+  private readonly subagentActivity: SubagentActivity = {
+    begin: (info) => this.reportSubagent(info),
+    update: (info) => this.reportSubagent(info),
+    end: (id) => {
+      this.subagentsRunning.delete(id);
+      this.repaintActivity();
     },
   };
+
+  private reportSubagent(info: SubagentProgress): void {
+    this.subagentsRunning.set(info.id, info);
+    this.repaintActivity();
+  }
+
+  /** A line of progress from a long command, rolled to the last eight. */
+  pushActivity(text: string): void {
+    this.activityLines.push(c.dim(truncate(text, 120)));
+    if (this.activityLines.length > 8) this.activityLines.shift();
+    this.repaintActivity();
+  }
+
+  /**
+   * The live block above the input: one row per running helper, then the
+   * rolling progress lines. A helper leaves the list the moment it finishes —
+   * its header and result are already in the transcript by then.
+   */
+  private repaintActivity(): void {
+    const helpers = [...this.subagentsRunning.values()].sort((a, b) => a.id - b.id).map(subagentRow);
+    // Progress lines go first so the tail slice in the bar can only ever drop
+    // them, never a running helper.
+    this.bar?.setActivity([...this.activityLines, ...helpers]);
+  }
   /** Pane status reporting, when this process runs inside Orca. */
   private orca = OrcaReporter.detect();
   /** Releases the turn-cancel key listener; null when no turn is running. */
@@ -291,6 +310,7 @@ export class App {
   async init(): Promise<void> {
     Session.pruneEmpty(this.cwd);
     pruneOrphanStores(this.cwd);
+    pruneOrphanBackups(this.cwd);
     // When every provider's catalog is already on disk this costs a file read;
     // when one of them would have to be asked over the network, the prompt
     // opens on the cached catalog instead and the refresh lands behind it. A
@@ -317,11 +337,11 @@ export class App {
     connectMcpServers(this.cwd, (client) => {
       this.rebuildTools();
       if (client.state === "ready") {
-        this.notice("info", tr(`MCP ${client.id}: ${client.tools.length} tools connected.`, `MCP ${client.id}: подключено инструментов: ${client.tools.length}.`));
+        this.notice("info", tr("MCP {id}: {count} tools connected.", "MCP {id}: подключено инструментов: {count}.", { id: client.id, count: client.tools.length }));
       } else if (client.cfg.required) {
-        this.notice("warn", tr(`MCP ${client.id} (required) failed: ${client.detail}`, `MCP ${client.id} (обязательный) не подключился: ${client.detail}`));
+        this.notice("warn", tr("MCP {id} (required) failed: {detail}", "MCP {id} (обязательный) не подключился: {detail}", { id: client.id, detail: client.detail }));
       } else {
-        this.notice("warn", tr(`MCP ${client.id} failed: ${client.detail}`, `MCP ${client.id} не подключился: ${client.detail}`));
+        this.notice("warn", tr("MCP {id} failed: {detail}", "MCP {id} не подключился: {detail}", { id: client.id, detail: client.detail }));
       }
     });
     // Servers the repository declares itself wait for the user: each is a
@@ -331,8 +351,9 @@ export class App {
       this.notice(
         "warn",
         tr(
-          `This project's .trcode/mcp.json wants to start MCP servers: ${waiting.join(", ")}. They run commands on this machine — review them with /mcp, start them with /mcp trust.`,
-          `.trcode/mcp.json проекта хочет запустить MCP-серверы: ${waiting.join(", ")}. Они выполняют команды на этой машине — посмотрите их в /mcp, запустите через /mcp trust.`,
+          "This project's .trcode/mcp.json wants to start MCP servers: {servers}. They run commands on this machine — review them with /mcp, start them with /mcp trust.",
+          ".trcode/mcp.json проекта хочет запустить MCP-серверы: {servers}. Они выполняют команды на этой машине — посмотрите их в /mcp, запустите через /mcp trust.",
+          { servers: waiting.join(", ") },
         ),
       );
     }
@@ -346,8 +367,9 @@ export class App {
       this.notice(
         "info",
         tr(
-          `MCP ${client.id}: catalog changed — ${client.tools.length} tools.`,
-          `MCP ${client.id}: каталог изменился — инструментов: ${client.tools.length}.`,
+          "MCP {id}: catalog changed — {count} tools.",
+          "MCP {id}: каталог изменился — инструментов: {count}.",
+          { id: client.id, count: client.tools.length },
         ),
       );
     });
@@ -401,7 +423,7 @@ export class App {
     const fallback = sameHost?.id ?? (known(this.cfg.model) ? this.cfg.model : undefined);
     if (!fallback) return;
     this.session.model = fallback;
-    warn(tr(`Model "${stale}" is not in the ${this.cfg.baseUrl} catalog — switched to ${fallback}.`, `Модели "${stale}" нет в каталоге ${this.cfg.baseUrl} — переключился на ${fallback}.`));
+    warn(tr("Model \"{stale}\" is not in the {host} catalog — switched to {fallback}.", "Модели \"{stale}\" нет в каталоге {host} — переключился на {fallback}.", { stale, host: this.cfg.baseUrl, fallback }));
   }
 
   rebuildTools(): void {
@@ -484,7 +506,7 @@ export class App {
     this.lastTurnFailed = false;
     this.tipsThisTurn = false;
     this.activityLines = [];
-    this.activityActive = 0;
+    this.subagentsRunning.clear();
     this.subagentDecision = null;
     this.subagentDecisionProvider = "";
     this.explicitSubagents = false;
@@ -539,7 +561,7 @@ export class App {
     }
     this.abort = null;
     this.activityLines = [];
-    this.activityActive = 0;
+    this.subagentsRunning.clear();
     this.session.save();
     if (!this.pending.length) await this.orca?.idle(this.session.id);
   }
@@ -557,13 +579,14 @@ export class App {
     const repaint = () => bar.setTokens(input, Math.max(0, output), cached);
     const progress: TaskProgress = {
       label: (text) => bar.setLabel(text),
-      activity: (text) => this.subagentActivity.push(truncate(text, 120)),
+      activity: (text) => this.pushActivity(truncate(text, 120)),
       events: () => {
         let streamed = 0;
         const bump = (delta: string) => {
           const tokens = estimateTokens(delta);
           streamed += tokens;
           output += tokens;
+          bar.noteOutput(tokens);
           repaint();
         };
         return {
@@ -571,6 +594,7 @@ export class App {
           onReasoning: bump,
           onUsage: (_model, usage) => {
             if (!usage) return;
+            bar.endOutput();
             input += usage.prompt_tokens;
             output += usage.completion_tokens - streamed;
             cached += usage.cached_tokens ?? 0;
@@ -643,7 +667,7 @@ export class App {
    */
   async composePrompt(task: string): Promise<string | null> {
     const model = promptModelFor(this.session.model, this.catalog);
-    const label = tr(`writing the brief on ${wireModelId(model)}`, `пишу задание на ${wireModelId(model)}`);
+    const label = tr("writing the brief on {model}", "пишу задание на {model}", { model: wireModelId(model) });
     // Mid-turn the bar already owns the bottom of the screen and stdin; a
     // second spinner on top of it would hide the input frame. Idle (from
     // /prompt) still needs its own spinner and Esc listener.
@@ -669,7 +693,7 @@ export class App {
       });
     } catch (err) {
       if ((err as Error)?.name === "AbortError") warn(tr("Interrupted.", "Прервано."));
-      else warn(tr(`Could not write the brief: ${(err as Error).message}`, `Не удалось составить задание: ${(err as Error).message}`));
+      else warn(tr("Could not write the brief: {message}", "Не удалось составить задание: {message}", { message: (err as Error).message }));
       return null;
     } finally {
       composeWatch?.stop();
@@ -721,6 +745,8 @@ export class App {
   }
 
   private askUserQuestions(questions: UserQuestion[], signal: AbortSignal): Promise<UserAnswer[] | null> {
+    // The dialog is drawn above the bar, so the bar stays: the question floats
+    // over the conversation and the input line keeps its place underneath.
     return this.exclusiveInput(async () => {
       if (signal.aborted) return null;
       this.orca?.waiting("ask_user_question", questions[0].question);
@@ -729,7 +755,7 @@ export class App {
       } finally {
         this.orca?.busy(this.session.id);
       }
-    });
+    }, { keepBar: true });
   }
 
   /**
@@ -818,11 +844,25 @@ export class App {
         effortFor: (m) => effortFor(m, this.effortOverride),
         usage: this.usage.child("brain"),
         signal: this.abort!.signal,
+        // The panel answers questions, and a question about the world or about
+        // this project needs the same eyes an ordinary turn has: the session's
+        // tools, under the session's approval rules. Without this the models
+        // could only reason from what was pasted into the question.
+        tools: this.tools,
+        context: this.toolContext(),
+        skills: this.activeSkills,
+        // A discussion, not a work day: a few tool rounds per model per round,
+        // because three rounds of three models multiply every step by nine.
+        maxSteps: Math.min(this.cfg.maxSteps > 0 ? this.cfg.maxSteps : 12, 8),
         events: {
           onStart: (model, round) => {
             spinner.setLabel(
-              tr(`${wireModelId(model)} — ${round}`, `${wireModelId(model)} — ${{ answer: "отвечает", critique: "разбирает чужое", final: "сводит итог" }[round]}`),
+              tr("{model} — {round}", "{model} — {roundLabel}", { model: wireModelId(model), round, roundLabel: { answer: "отвечает", critique: "разбирает чужое", final: "сводит итог" }[round] }),
             );
+            spinner.start();
+          },
+          onTool: (model, line) => {
+            spinner.setLabel(tr("{model} · {line}", "{model} · {line}", { model: wireModelId(model), line }));
             spinner.start();
           },
           onAnswer: (model, round, text) => {
@@ -841,7 +881,7 @@ export class App {
           },
           onFailed: (model, reason) => {
             spinner.stop();
-            warn(tr(`${wireModelId(model)} dropped out: ${reason}`, `${wireModelId(model)} выбыл: ${reason}`));
+            warn(tr("{model} dropped out: {reason}", "{model} выбыл: {reason}", { model: wireModelId(model), reason }));
             spinner.start();
           },
         },
@@ -856,7 +896,7 @@ export class App {
       this.session.add({ role: "user", content: question });
       this.session.add({ role: "assistant", content: res.final, meta: { model: this.session.model } });
       this.session.save();
-      this.statusLine(Date.now() - started, res.panel.length, "stop");
+      this.statusLine(Date.now() - started, res.panel.length, "stop", bar.generationMs());
     } catch (err) {
       if ((err as Error)?.name === "AbortError") warn(tr("Interrupted.", "Прервано."));
       else error((err as Error).message);
@@ -1149,7 +1189,7 @@ export class App {
     if (!/<goal-complete>/i.test(answer)) return;
     completeGoal(goal);
     this.session.save();
-    success(tr(`Goal complete: ${goal.objective}`, `Цель достигнута: ${goal.objective}`));
+    success(tr("Goal complete: {objective}", "Цель достигнута: {objective}", { objective: goal.objective }));
   }
 
   // ── end goal ──────────────────────────────────────────────────────────────
@@ -1158,26 +1198,29 @@ export class App {
    * Runs `fn` with sole ownership of stdin. The editor is idle while commands
    * run, so this only has to step aside for the turn-cancel key listener.
    */
-  async exclusiveInput<T>(fn: () => Promise<T>): Promise<T> {
+  async exclusiveInput<T>(fn: () => Promise<T>, opts: { keepBar?: boolean } = {}): Promise<T> {
     // Commands can open another chooser from their own exclusive callback.
     // Keep those calls reentrant while unrelated tools wait their turn.
     if (this.inputScope.getStore()) return fn();
-    const run = this.inputQueue.then(() => this.inputScope.run(true, () => this.withExclusiveInput(fn)));
+    const run = this.inputQueue.then(() => this.inputScope.run(true, () => this.withExclusiveInput(fn, opts)));
     this.inputQueue = run.catch(() => undefined);
     return run;
   }
 
-  private async withExclusiveInput<T>(fn: () => Promise<T>): Promise<T> {
+  private async withExclusiveInput<T>(fn: () => Promise<T>, opts: { keepBar?: boolean } = {}): Promise<T> {
     const hadTurnKeys = Boolean(this.turnKeys);
     if (hadTurnKeys) this.detachTurnKeys();
     // A permission prompt draws its own rows; the bar has to get out of the
-    // way or the two fight over the bottom of the screen.
+    // way or the two fight over the bottom of the screen. A dialog drawn
+    // *above* the bar is the exception: it needs the input line under it to
+    // stay where it is, so the bar keeps running and keeps its keys parked
+    // below the dialog's own consumer.
     const bar = this.bar;
-    bar?.pause();
+    if (!opts.keepBar) bar?.pause();
     try {
       return await fn();
     } finally {
-      bar?.resume();
+      if (!opts.keepBar) bar?.resume();
       if (hadTurnKeys && this.abort && !this.abort.signal.aborted) this.attachTurnKeys();
     }
   }
@@ -1215,6 +1258,19 @@ export class App {
     this.showBanner();
   }
 
+  /**
+   * One line typed in the ordinary composer — a command's own question.
+   *
+   * The panels used to ask with a bare `❯ label` row: no band, no status, none
+   * of the editing keys, drawn wherever the cursor happened to stand. A
+   * question asked of the panel is a message like any other, so it is typed in
+   * the message box.
+   */
+  async askComposer(): Promise<string | null> {
+    if (!process.stdin.isTTY) return null;
+    return this.exclusiveInput(() => this.readInput());
+  }
+
   private async readInput(): Promise<string | null> {
     this.flushNotices();
     if (!process.stdin.isTTY) {
@@ -1245,6 +1301,14 @@ export class App {
       // two blank rows above the input. Keeping the debt lets the composer take
       // the bar's rows back, as it does after every later turn.
       setStartRow(await queryCursorRow(), bottomSlackPending());
+    } else if (gapPending()) {
+      // The line that was just sent gave back the rows the input had dropped
+      // through, so the cursor stands on the last transcript row and the input
+      // has to find the bottom again from there. The row count is only a lower
+      // bound (a wrapped line takes two rows and one newline); the terminal
+      // knows where the cursor really is, so ask it.
+      const row = await queryCursorRow(120);
+      if (row !== null) setStartRow(row, false);
     } else if (bottomSlackPending()) {
       // A block came off the screen this turn, and the rows it owed the composer
       // are only an estimate: the window may have changed size in between, and a
@@ -1309,7 +1373,7 @@ export class App {
         `${msgs.length} ${plural(msgs.length, "message", "messages")} · ~${fmtTokens(used)} of ${fmtTokens(window)} tokens ` +
           `(${Math.round((used / window) * 100)}%) · ${this.session.model}` +
           (this.session.compactions
-            ? tr(` · compacted ${this.session.compactions}×`, ` · сжатий: ${this.session.compactions}`)
+            ? tr(" · compacted {count}×", " · сжатий: {count}", { count: this.session.compactions })
             : ""),
       ),
     );
@@ -1348,8 +1412,9 @@ export class App {
               c.gray("▍ ") +
                 c.gray(
                   tr(
-                    `… ${rows.length - keep} more lines · ctrl+o to see all of it`,
-                    `… ещё строк: ${rows.length - keep} · ctrl+o — показать целиком`,
+                    "… {count} more lines · ctrl+o to see all of it",
+                    "… ещё строк: {count} · ctrl+o — показать целиком",
+                    { count: rows.length - keep },
                   ),
                 ),
             );
@@ -1486,7 +1551,7 @@ export class App {
     // confirming again would just bounce off an existing folder.
     const slug = /^\s*(?:[-*]\s*)?slug\s*[:=]\s*["'`]?([\w-]+)/im.exec(proposal)?.[1];
     if (slug && getEntry(slug)) {
-      hint(t(`Already saved as ${slug}.`, `Уже сохранено как ${slug}.`));
+      hint(t("Already saved as {slug}.", "Уже сохранено как {slug}.", { slug }));
       return;
     }
     line();
@@ -1592,7 +1657,7 @@ export class App {
       const got = getEntry(matches[0].entry.slug);
       if (got) {
         picked = got;
-        success(tr(`design reference: ${got.entry.title}`, `дизайн-референс: ${got.entry.title}`));
+        success(tr("design reference: {title}", "дизайн-референс: {title}", { title: got.entry.title }));
       }
     } else {
       picked = await pickUiEntry(this, text);
@@ -1724,14 +1789,27 @@ export class App {
     let think: ThinkingStream | null = null;
     /** The answer so far, for Orca's pane preview. */
     let answer = "";
+    /** Text that arrived before anything visible did — usually a stray newline. */
+    let opening = "";
 
-    // Live counters: input is known once the first usage lands, output grows
-    // with the stream so a long silence still shows movement.
+    // Live counters: input is what the last request carried, output is the
+    // turn's running total — the stream is estimated while it arrives and each
+    // step's usage line takes over with the exact count. Replacing the total
+    // with the last step's number made the bar's ↓ shrink every step, and made
+    // the speed beside it drop with it.
     const promptEstimate = contextPressure(this.session, this.catalog).used;
     let liveIn = promptEstimate;
     let liveOut = 0;
+    /** Exact output of the steps that have already reported usage. */
+    let settledOut = 0;
+    /** Estimate for the step that is streaming right now. */
+    let streamed = 0;
     const bumpOut = (delta: string) => {
-      liveOut += estimateTokens(delta);
+      const tokens = estimateTokens(delta);
+      if (!tokens) return;
+      streamed += tokens;
+      liveOut = settledOut + streamed;
+      bar.noteOutput(tokens);
       spinner.setTokens(liveIn, liveOut);
     };
     spinner.setTokens(liveIn, 0);
@@ -1748,6 +1826,7 @@ export class App {
         md = null;
       }
       streaming = false;
+      opening = "";
     };
 
     // A server that joins the registry after the first request has gone out
@@ -1793,8 +1872,9 @@ export class App {
           if (!process.stdin.isTTY) return false;
           warn(
             tr(
-              `No data from the server for ~${fmtDuration(idleMs)} — could be long thinking, could be a dead connection.`,
-              `Сервер молчит уже ~${fmtDuration(idleMs)} — возможно, модель долго думает, а возможно, соединение мертво.`,
+              "No data from the server for ~{duration} — could be long thinking, could be a dead connection.",
+              "Сервер молчит уже ~{duration} — возможно, модель долго думает, а возможно, соединение мертво.",
+              { duration: fmtDuration(idleMs) },
             ),
           );
           const answer = await this.exclusiveInput(() =>
@@ -1825,8 +1905,9 @@ export class App {
             const why = (said || tr("rate limit", "лимит запросов")).replace(/[.\s]+$/, "");
             warn(
               tr(
-                `${name}: the host refused with 429 — ${why}. Waiting ~${fmtDuration(waitMs)} before retrying.`,
-                `${name}: хост ответил 429 — ${why}. Жду ~${fmtDuration(waitMs)} и повторяю.`,
+                "{name}: the host refused with 429 — {why}. Waiting ~{duration} before retrying.",
+                "{name}: хост ответил 429 — {why}. Жду ~{duration} и повторяю.",
+                { name, why, duration: fmtDuration(waitMs) },
               ),
             );
           }
@@ -1835,7 +1916,7 @@ export class App {
             const left = until - Date.now();
             if (left <= 0) return endRateWait();
             spinner.setLabel(
-              tr(`${name} rate limit — waiting ~${fmtDuration(left)}`, `${name} rate limit — ждём ~${fmtDuration(left)}`),
+              tr("{name} rate limit — waiting ~{duration}", "{name} rate limit — ждём ~{duration}", { name, duration: fmtDuration(left) }),
             );
           };
           if (rateTicker) clearInterval(rateTicker);
@@ -1853,12 +1934,13 @@ export class App {
           const why = (said || tr("transient upstream failure", "временный сбой у хоста")).replace(/[.\s]+$/, "");
           warn(
             tr(
-              `Host unavailable — ${why}. Sending the same request again in ${fmtDuration(waitMs)} (${attempt}/${of}). Esc cancels.`,
-              `Хост недоступен — ${why}. Отправлю тот же запрос снова через ${fmtDuration(waitMs)} (${attempt}/${of}). Esc отменяет.`,
+              "Host unavailable — {why}. Sending the same request again in {duration} ({attempt}/{of}). Esc cancels.",
+              "Хост недоступен — {why}. Отправлю тот же запрос снова через {duration} ({attempt}/{of}). Esc отменяет.",
+              { why, duration: fmtDuration(waitMs), attempt, of },
             ),
           );
           spinner.setLabel(
-            tr(`retrying ${attempt}/${of} in ${fmtDuration(waitMs)}`, `повтор ${attempt}/${of} через ${fmtDuration(waitMs)}`),
+            tr("retrying {attempt}/{of} in {duration}", "повтор {attempt}/{of} через {duration}", { attempt, of, duration: fmtDuration(waitMs) }),
           );
           spinner.start();
         },
@@ -1877,7 +1959,7 @@ export class App {
             bar.setLabel("thinking");
           },
           onCompactFailed: (reason) => {
-            warn(tr(`Could not compact mid-turn: ${reason}`, `Не удалось сжать контекст по ходу дела: ${reason}`));
+            warn(tr("Could not compact mid-turn: {reason}", "Не удалось сжать контекст по ходу дела: {reason}", { reason }));
             bar.setLabel("thinking");
           },
           onStep: (step) => {
@@ -1910,6 +1992,11 @@ export class App {
             endRateWait();
             bumpOut(delta);
             if (!streaming) {
+              // A round that only calls tools often opens with a newline or a
+              // space. Drawing the divider for that leaves a "Response" heading
+              // with nothing under it, which reads as an empty answer.
+              opening += delta;
+              if (!opening.trim()) return;
               spinner.stop();
               // Flush reasoning before any answer text is rendered. Ending it
               // at onAssistantMessage used to reopen the preview after text
@@ -1925,7 +2012,12 @@ export class App {
               md = new MarkdownStream();
               streaming = true;
               inToolGroup = false;
-              answer = "";
+              const text = opening.replace(/^\s+/, "");
+              opening = "";
+              answer = text;
+              md.push(text);
+              if (this.orca) this.orca.assistantText(text, this.session.id);
+              return;
             }
             md?.push(delta);
             answer += delta;
@@ -1953,9 +2045,9 @@ export class App {
             if (signal.aborted) return;
             // The live tail belonged to the tool that just finished; a
             // subagent still running keeps its own preview.
-            if (!this.activityActive) {
+            if (!this.subagentsRunning.size) {
               this.activityLines = [];
-              bar.setThinking([]);
+              this.repaintActivity();
             }
             toolDone(ok, display || (ok ? "done" : "failed"), kind);
             spinner.setLabel("thinking");
@@ -1964,8 +2056,11 @@ export class App {
           onUsage: (_model, usage) => {
             endRateWait();
             if (!usage) return;
+            bar.endOutput();
             liveIn = usage.prompt_tokens;
-            liveOut = usage.completion_tokens;
+            settledOut += usage.completion_tokens;
+            streamed = 0;
+            liveOut = settledOut;
             spinner.setTokens(liveIn, liveOut, usage.cached_tokens ?? 0);
           },
           onAssistantMessage: () => stopStream(),
@@ -1979,8 +2074,25 @@ export class App {
             spinner.stop();
             warn(
               tr(
-                `Connection lost: ${reason}. Sending the same request again (${attempt}/${of}).`,
-                `Соединение оборвалось: ${reason}. Отправляю тот же запрос заново (${attempt}/${of}).`,
+                "Connection lost: {reason}. Sending the same request again ({attempt}/{of}).",
+                "Соединение оборвалось: {reason}. Отправляю тот же запрос заново ({attempt}/{of}).",
+                { reason, attempt, of },
+              ),
+            );
+            spinner.start();
+          },
+          // A thinking turn that came back with no answer is not a finished
+          // turn: the bar was still up, the reasoning was on screen, and the
+          // statistics line used to appear over an empty answer as if the model
+          // had nothing to say. Say what happened, and resend the step.
+          onNoAnswer: (why, attempt, of) => {
+            stopStream();
+            spinner.stop();
+            warn(
+              tr(
+                "The model stopped thinking without answering — {why}. Sending the step again ({attempt}/{of}).",
+                "Модель закончила размышлять без ответа — {why}. Отправляю шаг заново ({attempt}/{of}).",
+                { why, attempt, of },
               ),
             );
             spinner.start();
@@ -1992,7 +2104,7 @@ export class App {
       this.session.save();
       this.lastTurnFailed = result.stoppedBecause !== "stop" && result.stoppedBecause !== "aborted";
       if (result.stoppedBecause === "stop") this.checkGoalComplete(result.finalText);
-      this.statusLine(Date.now() - started, result.steps, result.stoppedBecause);
+      this.statusLine(Date.now() - started, result.steps, result.stoppedBecause, bar.generationMs());
       // A finished, ordinary turn is the one calm moment in the transcript:
       // the answer above, the input below, and nobody waiting. A hint about a
       // feature the session has not touched goes here or nowhere.
@@ -2107,14 +2219,15 @@ export class App {
         // the host's full message, and saying it twice helps nobody.
         warn(
           tr(
-            `${providerLabel(splitModelId(opts.model).providerId)} refused this conversation — its content filter, not the request.`,
-            `${providerLabel(splitModelId(opts.model).providerId)} отклонил этот диалог — сработал контент-фильтр, дело не в запросе.`,
+            "{provider} refused this conversation — its content filter, not the request.",
+            "{provider} отклонил этот диалог — сработал контент-фильтр, дело не в запросе.",
+            { provider: providerLabel(splitModelId(opts.model).providerId) },
           ),
         );
         const answer = await this.exclusiveInput(() =>
           choose<"move" | "stop">(
             [
-              { value: "move", label: tr(`Continue on ${alt}`, `Продолжить на ${alt}`), key: "c", tone: "ok" },
+              { value: "move", label: tr("Continue on {model}", "Продолжить на {model}", { model: alt }), key: "c", tone: "ok" },
               { value: "stop", label: tr("Stop here", "Остановиться"), key: "n", tone: "danger" },
             ],
             { initial: "move", fallback: "stop" },
@@ -2129,7 +2242,7 @@ export class App {
         opts.effort = this.effort();
         this.rebuildTools();
         opts.tools = this.tools;
-        info(tr(`Continuing on ${alt}.`, `Продолжаю на ${alt}.`));
+        info(tr("Continuing on {model}.", "Продолжаю на {model}.", { model: alt }));
       }
     }
   }
@@ -2154,8 +2267,9 @@ export class App {
     if (!alts.length) return;
     hint(
       tr(
-        `The same model elsewhere: ${alts.map((id) => `/model ${id}`).join(" · ")}`,
-        `Та же модель на другом хосте: ${alts.map((id) => `/model ${id}`).join(" · ")}`,
+        "The same model elsewhere: {commands}",
+        "Та же модель на другом хосте: {commands}",
+        { commands: alts.map((id) => `/model ${id}`).join(" · ") },
       ),
     );
   }
@@ -2173,13 +2287,14 @@ export class App {
       const after = contextPressure(this.session, this.catalog).used;
       info(
         tr(
-          `History at ${Math.round(ratio * 100)}% of the window — trimmed ${light.trimmedMessages} old tool results and thinking blocks (~${fmtTokens(before)} → ~${fmtTokens(after)} tokens).`,
-          `История занимает ${Math.round(ratio * 100)}% окна — сократил старые результаты инструментов и размышления (${light.trimmedMessages}), ~${fmtTokens(before)} → ~${fmtTokens(after)} токенов.`,
+          "History at {percent}% of the window — trimmed {trimmed} old tool results and thinking blocks (~{before} → ~{after} tokens).",
+          "История занимает {percent}% окна — сократил старые результаты инструментов и размышления ({trimmed}), ~{before} → ~{after} токенов.",
+          { percent: Math.round(ratio * 100), trimmed: light.trimmedMessages, before: fmtTokens(before), after: fmtTokens(after) },
         ),
       );
       return false;
     }
-    info(tr(`History reached ~${fmtTokens(used)} tokens (${Math.round(ratio * 100)}% of the window) — compacting…`, `История доросла до ~${fmtTokens(used)} токенов (${Math.round(ratio * 100)}% окна) — сжимаю…`));
+    info(tr("History reached ~{tokens} tokens ({percent}% of the window) — compacting…", "История доросла до ~{tokens} токенов ({percent}% окна) — сжимаю…", { tokens: fmtTokens(used), percent: Math.round(ratio * 100) }));
     // The turn bar is already up (raised before this ran), so the label lands
     // on it and the input frame stays on screen for the whole compaction.
     const bar = this.bar;
@@ -2187,12 +2302,12 @@ export class App {
     try {
       const res = await compactSession(this.session, { catalog: this.catalog, signal: this.abort?.signal, level });
       if (!res.summary) return false;
-      info(tr(`Compacted ${res.droppedMessages} messages, ${res.keptMessages} left.`, `Сжато ${nOf(res.droppedMessages, ["message", "messages"], ["сообщение", "сообщения", "сообщений"])}, осталось ${res.keptMessages}.`));
+      info(tr("Compacted {dropped} messages, {kept} left.", "Сжато {droppedCount}, осталось {kept}.", { dropped: res.droppedMessages, droppedCount: nOf(res.droppedMessages, ["message", "messages"], ["сообщение", "сообщения", "сообщений"]), kept: res.keptMessages }));
       return true;
     } catch (err) {
       // The caller reports an interruption; here it is not a failure.
       if ((err as Error)?.name !== "AbortError") {
-        warn(tr(`Could not compact the context: ${(err as Error).message}`, `Не удалось сжать контекст: ${(err as Error).message}`));
+        warn(tr("Could not compact the context: {message}", "Не удалось сжать контекст: {message}", { message: (err as Error).message }));
       }
       return false;
     } finally {
@@ -2216,8 +2331,15 @@ export class App {
     return this.maybeAutoCompact();
   }
 
-  /** Per-turn footer. Context share and session total live under the input. */
-  statusLine(elapsedMs: number, steps: number, stopped: string): void {
+  /**
+   * Per-turn footer. Context share and session total live under the input.
+   *
+   * `genMs` is the time the model actually spent generating, measured by the
+   * turn bar. The speed is divided by that, not by the turn's wall clock: a
+   * turn that spends four minutes in tool calls produced 40 tok/s a minute, not
+   * the 4 the clock suggested.
+   */
+  statusLine(elapsedMs: number, steps: number, stopped: string, genMs = 0): void {
     const t = this.usage.turnTotals();
     const effort = this.effort();
 
@@ -2231,6 +2353,9 @@ export class App {
 
     // Which parts of the line the user wants to see — /settings unticks them.
     const on = this.cfg.statusFields ?? {};
+    // Generation time when the bar measured one; the turn's clock only stands in
+    // for the panels and commands that have no stream of their own.
+    const speedMs = genMs > 1000 ? genMs : elapsedMs;
     const bits = [
       on.model !== false
         ? c.brightYellow(this.session.model) +
@@ -2243,8 +2368,8 @@ export class App {
         : "",
       on.steps !== false ? c.gray(nOf(steps, ["step", "steps"], ["шаг", "шага", "шагов"])) : "",
       on.time !== false ? c.gray(fmtDuration(elapsedMs)) : "",
-      on.speed !== false && elapsedMs > 1000 && t.output
-        ? c.gray(`${fmtTokens(Math.round((t.output / elapsedMs) * 1000))} tok/s avg`)
+      on.speed !== false && speedMs > 1000 && t.output
+        ? c.gray(`${fmtTokens(Math.round((t.output / speedMs) * 1000))} tok/s avg`)
         : "",
     ].filter(Boolean);
 
@@ -2259,7 +2384,7 @@ export class App {
     if (stopped === "aborted") warn(tr("Interrupted.", "Прервано."));
     // Only reachable when a ceiling was configured: there is none by default.
     if (stopped === "max_steps") {
-      warn(tr(`Hit the ${this.cfg.maxSteps}-step limit — say "continue" to resume, or set "maxSteps": 0 to remove it.`, `Достигнут предел в ${this.cfg.maxSteps} шагов — скажите «продолжай», или уберите ограничение: "maxSteps": 0.`));
+      warn(tr("Hit the {steps}-step limit — say \"continue\" to resume, or set \"maxSteps\": 0 to remove it.", "Достигнут предел в {steps} шагов — скажите «продолжай», или уберите ограничение: \"maxSteps\": 0.", { steps: this.cfg.maxSteps }));
     }
     if (stopped === "looping") {
       warn(
@@ -2288,8 +2413,9 @@ export class App {
     padded(
       c.gray(
         tr(
-          `Resuming after ~${fmtDuration(idleMs)} — the provider cache has expired, so the first request pays for all ~${fmtTokens(used)} history tokens again. If the old context is no longer needed, /compact or /new is cheaper.`,
-          `Продолжение после паузы ~${fmtDuration(idleMs)} — кэш провайдера истёк, и первый запрос заново оплатит все ~${fmtTokens(used)} токенов истории. Если старый контекст уже не нужен, /compact или /new выйдет дешевле.`,
+          "Resuming after ~{duration} — the provider cache has expired, so the first request pays for all ~{tokens} history tokens again. If the old context is no longer needed, /compact or /new is cheaper.",
+          "Продолжение после паузы ~{duration} — кэш провайдера истёк, и первый запрос заново оплатит все ~{tokens} токенов истории. Если старый контекст уже не нужен, /compact или /new выйдет дешевле.",
+          { duration: fmtDuration(idleMs), tokens: fmtTokens(used) },
         ),
       ),
     );
@@ -2311,8 +2437,9 @@ export class App {
     padded(
       c.gray(
         tr(
-          `Only ${Math.round(share * 100)}% of this turn's input hit the provider cache — each step re-paid for the history. That is on the host serving ${this.session.model}; shorter sessions and /compact limit the damage.`,
-          `Лишь ${Math.round(share * 100)}% input этого хода попало в кэш провайдера — каждый шаг заново оплатил историю. Это на стороне хоста ${this.session.model}; короткие сессии и /compact ограничивают ущерб.`,
+          "Only {percent}% of this turn's input hit the provider cache — each step re-paid for the history. That is on the host serving {model}; shorter sessions and /compact limit the damage.",
+          "Лишь {percent}% input этого хода попало в кэш провайдера — каждый шаг заново оплатил историю. Это на стороне хоста {model}; короткие сессии и /compact ограничивают ущерб.",
+          { percent: Math.round(share * 100), model: this.session.model },
         ),
       ),
     );

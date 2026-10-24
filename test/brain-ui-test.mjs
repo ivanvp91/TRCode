@@ -67,6 +67,9 @@ Object.assign(app, {
   pending: [],
   // finishTurn empties the steering list on the way out (v0.1.10).
   steerQueue: [],
+  // startTurn clears the live helper list (the turn bar's subagent status).
+  subagentsRunning: new Map(),
+  activityLines: [],
   editor: null,
   effortOverride: undefined,
   status: () => ({ model: "mock-fast", cwdLabel: ".", contextUsed: 0, contextWindow: 128000 }),

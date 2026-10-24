@@ -90,12 +90,12 @@ export async function uiLibraryModal(app: App): Promise<void> {
             initial: "no",
             fallback: "no",
             cancel: () => {},
-            hint: t(`remove ${entry.title}?`, `удалить ${entry.title}?`),
+            hint: t("remove {title}?", "удалить {title}?", { title: entry.title }),
           },
         ),
       );
       if (sure === "yes" && deleteEntry(entry.slug)) {
-        success(t(`Removed ${entry.title}.`, `Удалено: ${entry.title}.`));
+        success(t("Removed {title}.", "Удалено: {title}.", { title: entry.title }));
       }
       continue;
     }
@@ -105,12 +105,12 @@ export async function uiLibraryModal(app: App): Promise<void> {
 /** The brief itself, rendered as the markdown it is. */
 export function showUiEntry(slug: string): void {
   const found = getEntry(slug);
-  if (!found) return void error(t(`No such entry: ${slug}`, `Такого макета нет: ${slug}`));
+  if (!found) return void error(t("No such entry: {slug}", "Такого макета нет: {slug}", { slug }));
   line();
   rule(c.brightCyan(` ${found.entry.title} `));
   for (const l of renderMarkdownBlock(found.brief, { width: contentWidth() })) line(l);
   line();
-  if (found.entry.source) hint(t(`from ${found.entry.source}`, `источник: ${found.entry.source}`));
+  if (found.entry.source) hint(t("from {source}", "источник: {source}", { source: found.entry.source }));
   hint(t("A design request will offer this style by itself.", "Запрос на дизайн предложит этот стиль сам."));
 }
 

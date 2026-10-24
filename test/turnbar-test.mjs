@@ -425,6 +425,52 @@ line("   after the turn");
   Object.defineProperty(process.stdout, "rows", { value: origRows, configurable: true });
 }
 
+// The helper list: one row per running subagent, above the spinner. It is its
+// own block, so the reasoning preview closing does not take it away.
+{
+  const { subagentRow } = await import("../dist/ui/render.js");
+  const { hasColor } = await import("../dist/ui/ansi.js");
+  const busy = new TurnBar({
+    status: () => ({ left: "model", hint: "esc", context: "ctx" }),
+    onInterrupt: () => {},
+  });
+  screen.reset();
+  busy.start();
+  const first = subagentRow({ id: 1, label: "a", model: "deepseek-v4.1-flash", steps: 7, maxSteps: 10, tokens: 25000 });
+  busy.setActivity([
+    first,
+    subagentRow({ id: 2, label: "b", model: "glm-5.3-flash", steps: 1, maxSteps: 40, tokens: 3200, line: "read src/a.ts" }),
+  ]);
+  busy.setThinking(["первая мысль"]);
+  await sleep(20);
+  {
+    const t = strip(screen.text());
+    check("each running helper gets a row", /1\. deepseek-v4\.1-flash 70% · 25k tok/.test(t), t);
+    check("the second row carries its own numbers", /2\. glm-5\.3-flash 3% · 3\.2k tok · read src\/a\.ts/.test(t), t);
+    check("the list sits above the input", t.indexOf("1. deepseek") < t.lastIndexOf("›"), t);
+    check("and above the reasoning preview", t.indexOf("1. deepseek") < t.indexOf("первая мысль"), t);
+    if (hasColor) {
+      // Same palette as the turn's stats line: model orange, numbers gray.
+      check(
+        "the model is orange and the counts gray",
+        /\x1b\[93mdeepseek-v4\.1-flash\x1b\[39m/.test(first) && /\x1b\[90m70% · 25k tok\x1b\[39m/.test(first),
+        JSON.stringify(first),
+      );
+    }
+  }
+  busy.endReasoning();
+  await sleep(20);
+  {
+    const t = strip(screen.text());
+    check("the answer starting does not clear the list", /1\. deepseek-v4\.1-flash/.test(t), t);
+    check("but the preview goes", !/первая мысль/.test(t), t);
+  }
+  busy.setActivity([]);
+  await sleep(20);
+  check("the last helper takes its rows with it", !/deepseek-v4\.1-flash/.test(strip(screen.text())), strip(screen.text()));
+  busy.stop();
+}
+
 // ── a frame reaches the terminal whole ──────────────────────────────────────
 // Flicker is a frame the terminal caught half-drawn: the bar erased, its
 // replacement not yet written. So each frame must be one write, must not blank

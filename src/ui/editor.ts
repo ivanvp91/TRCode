@@ -21,6 +21,7 @@ import {
   bottomDrawn,
   bottomGap,
   bottomPinned,
+  reclaimGap,
   takeFooterSlack,
   tailRows,
   screenHeight,
@@ -325,6 +326,8 @@ export class InputEditor {
   private pos = 0;
   private renderedRows = 0;
   private cursorRow = 0;
+  /** Rows this frame opened under the transcript to reach the bottom edge. */
+  private dropRows = 0;
   /** Rows of the conversation the menu overlay is covering, and what was there. */
   private overlayCount = 0;
   private overlaySaved: string[] = [];
@@ -462,6 +465,7 @@ export class InputEditor {
     this.menuIdx = 0;
     this.menuDismissed = false;
     this.lastMenuBuf = null;
+    this.dropRows = 0;
 
     return new Promise((resolve) => {
       setBracketedPaste(true);
@@ -483,6 +487,17 @@ export class InputEditor {
         this.pasteBuf = "";
         this.takePending();
         this.erase();
+        // The frame had been dropped to the bottom of the screen, and the rows
+        // it opened above itself are blank. Walking back up puts the cursor on
+        // the last line of the transcript, so the echo, the answer and any
+        // panel open right under the conversation instead of at the bottom of
+        // a mostly empty screen. The rows are owed to the next block, which
+        // opens them again when the input comes back.
+        if (this.dropRows) {
+          process.stdout.write(esc.up(this.dropRows));
+          reclaimGap(this.dropRows);
+          this.dropRows = 0;
+        }
         cursor.show();
         resolve(value);
       };
@@ -893,7 +908,10 @@ export class InputEditor {
     // The overlay puts back what it covers from the row log, so the blank rows
     // that hold the composer away from the transcript have to be in it: a menu
     // over a gap must restore a gap, not the last lines of the conversation.
-    if (drop > 0) noteBlankRows(drop);
+    if (drop > 0) {
+      this.dropRows += drop;
+      noteBlankRows(drop);
+    }
     let frame = esc.hide;
     if (prev) frame += esc.toColumn(1) + esc.up(this.cursorRow);
     // Only cleared footer rows are discarded. Moving the transcript with the

@@ -16,7 +16,7 @@ for (const [key, value] of Object.entries({ isTTY: true, columns: 120, rows: 50 
   Object.defineProperty(process.stdout, key, { value, configurable: true });
 }
 
-const { logoFrame, animateLogo, LOGO_PERIOD } = await import("../dist/ui/logo.js");
+const { logoFrame, animateLogo, LOGO_PERIOD, LOGO_HEIGHT } = await import("../dist/ui/logo.js");
 const { banner, logoIntro, setStartRow, setFooter, userEcho, line } = await import("../dist/ui/render.js");
 const { App } = await import("../dist/ui/repl.js");
 const { InputEditor } = await import("../dist/ui/editor.js");
@@ -32,10 +32,13 @@ for (const [cols, rows] of [[74, 13], [96, 20], [120, 22]]) {
     assert.equal(frame.length, rows);
     assert(frame.every(line => width(line) === cols));
     assert(frame.every(line => !/NaN|Infinity|undefined/.test(line)));
-    const colours = frame.join("").match(/\x1b\[38;2;\d+;\d+;\d+m/g);
-    assert(colours && new Set(colours).size === 1, "the entire logo uses one colour");
-    const channels = colours[0].slice(7, -1).split(";");
-    assert(channels.every(channel => channel === channels[0]), "the colour is neutral grey");
+    const colours = [...new Set(frame.join("").match(/\x1b\[38;2;\d+;\d+;\d+m/g) ?? [])];
+    assert(colours.length > 8, "the mark is shaded, not one flat grey");
+    const shades = colours.map(escape => escape.slice(7, -1).split(";").map(Number));
+    assert(shades.every(rgb => rgb[0] === rgb[1] && rgb[1] === rgb[2]), "the metal stays neutral silver");
+    assert(shades.every(rgb => rgb.every(value => value >= 0 && value <= 255 && value % 4 === 0)), "the palette stays in one smooth ramp");
+    const levels = shades.map(rgb => rgb[0]);
+    assert(Math.max(...levels) - Math.min(...levels) >= 24, "the travelling light leaves a brighter band on the metal");
     assert(!/\x1b\[48;/.test(frame.join("")), "the dots preserve the terminal background");
     const plain = frame.map(stripAnsi);
     assert(plain.every(line => line[0] === " " && line.at(-1) === " "), "geometry fits fixed bounds");
@@ -44,6 +47,12 @@ for (const [cols, rows] of [[74, 13], [96, 20], [120, 22]]) {
     frames.add(frame.join("\n"));
   }
   assert(frames.size > 10, "lighting keeps moving over stable geometry");
+  const shades = new Set();
+  for (const time of [0, 2, 4, 6, 8]) {
+    for (const level of logoFrame(cols, rows, time).join("").matchAll(/\x1b\[38;2;(\d+);\d+;\d+m/g)) shades.add(Number(level[1]));
+  }
+  const range = [...shades].sort((a, b) => a - b);
+  assert(range[0] <= 130 && range.at(-1) >= 200, "the ramp spans brushed steel and polished silver");
   for (const time of [0, 1.25, 2.5, 9.75]) {
     assert.deepEqual(logoFrame(cols, rows, time), logoFrame(cols, rows, time + LOGO_PERIOD), "the lighting cycle loops seamlessly");
   }
@@ -153,8 +162,11 @@ try {
   assert.deepEqual(after, before, "the logo silhouette stays stable while the light moves");
   assert(chunks.some(chunk => chunk.includes("\x1b7")), "lighting frames are drawn while input is ready");
   const patches = chunks.filter(chunk => chunk.includes("\x1b7"));
-  const fullFrameBytes = Buffer.byteLength(logoFrame(96, 12, 0.2).join("\n"));
-  assert(patches.every(patch => Buffer.byteLength(patch) < fullFrameBytes * 0.8), "animation patches only changed cells");
+  // The splash animates the full-height mark, so a patch is measured against a
+  // full repaint of that same geometry — a per-cell shaded frame, not a flat one.
+  const fullFrameBytes = Buffer.byteLength(logoFrame(96, LOGO_HEIGHT, 0.2).join("\n"));
+  const sizes = patches.map(patch => Buffer.byteLength(patch));
+  assert(sizes.every(size => size < fullFrameBytes * 0.8), "animation patches only changed cells");
   stdin.emit("data", Buffer.from("x"));
   const stoppedAt = chunks.length;
   await delay(180);
@@ -241,4 +253,4 @@ try {
   releaseStdin();
   process.stdout.write = realWrite;
 }
-console.log("PASS monochrome dot artwork, smooth patches, backpressure, input safety and splash dismissal");
+console.log("PASS brushed-silver dot artwork, smooth patches, backpressure, input safety and splash dismissal");

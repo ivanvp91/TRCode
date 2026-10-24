@@ -38,7 +38,7 @@ const check = (name, cond, detail = "") => {
   else { failed++; console.log("  FAIL " + name + (detail ? "\n       " + detail : "")); }
 };
 
-const catalog = [{ id: "mock-fast" }, { id: "mock-smart" }, { id: "mock-noeffort" }, { id: "mock-fixedtemp" }];
+const catalog = [{ id: "mock-fast" }, { id: "mock-smart" }, { id: "mock-noeffort" }, { id: "mock-fixedtemp" }, { id: "mock-steer" }, { id: "mock-greedy" }];
 const base = {
   task: "как ускорить сборку",
   finalModel: "mock-fast",
@@ -93,8 +93,90 @@ const base = {
   check("its answer is the answer", res.final.length > 0, res.final.slice(0, 40));
 }
 
-// The panel has no tools, so a question that names a file has to arrive with
-// the file in it — otherwise every model answers that it cannot read it.
+// The panel can look things up with the session's tools: a question about the
+// world or about this project is answered from what the models checked, not
+// from what happened to be pasted into the question.
+{
+  const calls = [];
+  const tools = [
+    {
+      name: "read",
+      risk: "read",
+      description: "read a file",
+      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      summarize: (a) => String(a.path),
+      async run(args) {
+        calls.push(String(args.path));
+        return { output: "{\"name\":\"trcode\"}" };
+      },
+    },
+  ];
+  const context = {
+    cwd: process.cwd(),
+    signal: new AbortController().signal,
+    depth: 0,
+    confirm: async () => true,
+    emit: () => {},
+    readFiles: new Set(),
+  };
+  // mock-steer answers with a tool call first and with text once the result is
+  // back, which is the whole shape a panelist's turn has to follow.
+  const activity = [];
+  const res = await runBrain({
+    ...base,
+    models: ["mock-steer"],
+    usage: new UsageTracker(),
+    tools,
+    context,
+    maxSteps: 4,
+    events: { onTool: (_m, line) => activity.push(line) },
+  });
+  check("a panelist calls a tool instead of guessing", calls.length === 1 && calls[0] === "package.json", JSON.stringify(calls));
+  check("and answers after the tool result", res.final.includes("Понял"), res.final);
+  check("the tool activity reaches the caller", activity.some((l) => l.includes("read")), activity.join(" | "));
+}
+
+// A panelist that would research forever: spending the step budget must produce
+// an answer, not the "let me check a few more facts" the cap landed in the
+// middle of. The live failure behind this: a 4.5-minute panel stored that
+// sentence as its final answer.
+{
+  const tools = [
+    {
+      name: "read",
+      risk: "read",
+      description: "read a file",
+      parameters: { type: "object", properties: { path: { type: "string" } }, required: ["path"] },
+      summarize: (a) => String(a.path),
+      async run() {
+        return { output: "{\"name\":\"trcode\"}" };
+      },
+    },
+  ];
+  const context = {
+    cwd: process.cwd(),
+    signal: new AbortController().signal,
+    depth: 0,
+    confirm: async () => true,
+    emit: () => {},
+    readFiles: new Set(),
+  };
+  const usage = new UsageTracker();
+  const res = await runBrain({
+    ...base,
+    models: ["mock-greedy"],
+    usage,
+    tools,
+    context,
+    maxSteps: 3,
+  });
+  check("a model that never stops searching still answers", res.final.includes("ОТВЕТ ПОСЛЕ ЛИМИТА"), res.final);
+  check("the answer is not a promise to answer later", !/проверю|let me/i.test(res.final), res.final);
+  check("and it costs exactly one request past the cap", usage.totals().requests === 4, JSON.stringify(usage.totals()));
+}
+
+// Without tools — a headless run — a question that names a file has to arrive
+// with the file in it, or every model answers that it cannot read it.
 {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "trc-brain-files-"));
   fs.writeFileSync(path.join(dir, "idea.md"), "СОДЕРЖИМОЕ ФАЙЛА ПРО РОУТЕР");

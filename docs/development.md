@@ -71,8 +71,8 @@ means repacking the archive — asar is a header of offsets followed by concaten
 so inserting one byte shifts everything after it. Replacing bytes with the *same number*
 of bytes is safe, which leaves one move: take over the slot of an agent you do not use.
 
-`scripts/orca-agent-patch.mjs` takes `cursor`, whose binary name (`cursor-agent`) and
-label (`Cursor`) are exactly as long as ours:
+`scripts/orca-agent-patch.mjs` takes `cursor`, whose binary name (`cursor-agent`), label
+(`Cursor`) and icon slot are exactly where ours fit:
 
 ```bash
 npm link                                   # provides the trcode-agent command
@@ -81,13 +81,22 @@ node scripts/orca-agent-patch.mjs           # apply, then restart Orca
 node scripts/orca-agent-patch.mjs --revert  # back to the backup it made
 ```
 
-Four strings change: the three that name the binary Orca looks for and launches, and the
-display name. The internal id stays `cursor`, so the hook route and the pane icon still
-belong to it — the icon will be Cursor's, the label will read Trcode. Orca stops offering
-Cursor, and every Orca update replaces `app.asar` and undoes this, so run it again after
-one. The script refuses to write if Electron's ASAR integrity fuse is on (a patched file
-would stop the app from starting), asserts the file size is unchanged before writing, and
-refreshes its backup from whatever the current build is.
+Three things change. In `out/preload/index.js` the agent table's `detectCmd` becomes
+`trcode-agent` — `launchCmd` and `expectedProcess` default to it, so one string moves the
+whole slot. In `out/renderer/assets/agent-catalog-*.js` the label `Cursor` becomes
+`Trcode`, and the 64×64 PNG that Orca inlines as a base64 data URI for that agent is
+replaced by `assets/branding/trcode-app-icon-64-indexed.png`, padded back to the very
+same byte count with an ancillary `tEXt` chunk so the base64 keeps its length.
+
+The internal id stays `cursor`, so the hook route and the pane icon slot still belong to
+it. The archive's own per-file SHA-256 (the header stores it twice per file) is rewritten
+to match, which the script only does when the old hash occurs exactly twice. Orca stops
+offering Cursor, and every Orca update replaces `app.asar` and undoes this, so run it
+again after one. The script refuses to write if Electron's ASAR integrity fuse is on (a
+patched file would stop the app from starting), asserts every file keeps its size before
+writing, and refreshes its backup from whatever the current build is. Orca's web and
+mobile-web bundles are built differently (icons there are separate PNG files), so only
+the desktop renderer is patched.
 
 ## Layout
 

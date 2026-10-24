@@ -104,5 +104,5 @@ export function warnIfIncompatible(app: App, id: string): void {
   const m = findModel(id, app.catalog);
   const why = m ? incompatibleReason(m) : null;
   if (!why) return;
-  warn(t(`${id} cannot be driven through /v1/chat/completions — ${why}. Requests to it will fail.`, `${id} нельзя вести через /v1/chat/completions — ${why}. Запросы к ней будут падать.`));
+  warn(t("{id} cannot be driven through /v1/chat/completions — {why}. Requests to it will fail.", "{id} нельзя вести через /v1/chat/completions — {why}. Запросы к ней будут падать.", { id, why }));
 }

@@ -58,7 +58,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
   if (!mode) {
     if (canOAuth && canKey) {
       line();
-      padded(c.bold(t(`Connect ${def.label}`, `Подключение ${def.label}`)));
+      padded(c.bold(t("Connect {label}", "Подключение {label}", { label: def.label })));
       hint(t("subscription — sign in with your account, quota comes from the plan", "подписка — вход в аккаунт, квота из тарифа"));
       hint(t("API key      — pay per token on the developer platform", "ключ API     — оплата за токены на платформе разработчика"));
       mode = await exclusive<"oauth" | "apikey">(() =>
@@ -75,7 +75,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
 
   if (mode === "apikey") {
     if (!canKey) {
-      error(t(`${def.label} has no API-key endpoint configured.`, `У ${def.label} не настроен эндпоинт для ключа API.`));
+      error(t("{label} has no API-key endpoint configured.", "У {label} не настроен эндпоинт для ключа API.", { label: def.label }));
       return FAILED;
     }
     // A provider with no account login of its own may still have a vendor CLI
@@ -88,7 +88,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
         warn(def.oauthWarning);
       }
       writeCredentials(def.id, inheritedKey);
-      info(t(`Reusing the ${def.label} CLI credential from ${inheritedKey.source}.`, `Переиспользую учётные данные ${def.label} CLI из ${inheritedKey.source}.`));
+      info(t("Reusing the {label} CLI credential from {source}.", "Переиспользую учётные данные {label} CLI из {source}.", { label: def.label, source: String(inheritedKey.source) }));
       // The credential is in hand; skip the key prompts below.
     } else {
       // A host that differs per account is asked for before the key: a wrong one
@@ -112,7 +112,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
     }
   } else {
     if (!def.oauth) {
-      error(t(`${def.label} does not support OAuth.`, `${def.label} не поддерживает OAuth.`));
+      error(t("{label} does not support OAuth.", "{label} не поддерживает OAuth.", { label: def.label }));
       return FAILED;
     }
     // Said before anything is reused or opened, not after: on Google's login
@@ -126,7 +126,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
     const inherited = opts.fresh ? null : def.importFrom && importVendorCredentials(def.importFrom);
     if (inherited) {
       writeCredentials(def.id, inherited);
-      info(t(`Reusing the ${def.label} CLI session from ${inherited.source}.`, `Переиспользую сессию ${def.label} CLI из ${inherited.source}.`));
+      info(t("Reusing the {label} CLI session from {source}.", "Переиспользую сессию {label} CLI из {source}.", { label: def.label, source: String(inherited.source) }));
     } else {
       if (!(await oauthLogin(def, exclusive))) return FAILED;
     }
@@ -143,7 +143,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
     // itself worked, and asking the user to repeat it would fix nothing.
     if ((check.status === 401 || check.status === 403) && !(def.id === "openai" && mode === "oauth")) {
       clearCredentials(def.id);
-      error(t(`${def.label} rejected the credential: ${check.detail}`, `${def.label} отклонил учётные данные: ${check.detail}`));
+      error(t("{label} rejected the credential: {detail}", "{label} отклонил учётные данные: {detail}", { label: def.label, detail: check.detail }));
       // A key is issued for one of this vendor's products and refused by the
       // others, and the refusal says nothing about that. Name the host it was
       // tried against, so the next attempt can change it rather than the key.
@@ -151,21 +151,22 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
         const host = modeConfig(def.id, "apikey")?.baseUrl;
         hint(
           t(
-            `Tried against ${host}. A key belongs to one host here — if it is for another product, run /login ${def.id} again and pick that host.`,
-            `Пробовал на ${host}. Ключ здесь привязан к одному серверу — если он от другого продукта, наберите /login ${def.id} снова и выберите нужный.`,
+            "Tried against {host}. A key belongs to one host here — if it is for another product, run /login {id} again and pick that host.",
+            "Пробовал на {host}. Ключ здесь привязан к одному серверу — если он от другого продукта, наберите /login {id} снова и выберите нужный.",
+            { host: String(host), id: def.id },
           ),
         );
       }
       return FAILED;
     }
-    warn(t(`${def.label} is connected, but not serving requests: ${check.detail}`, `${def.label} подключён, но запросы не обслуживает: ${check.detail}`));
-    hint(t(`The credential is saved. Disconnect with: trc auth logout --provider ${def.id}`, `Учётные данные сохранены. Отключить: trc auth logout --provider ${def.id}`));
+    warn(t("{label} is connected, but not serving requests: {detail}", "{label} подключён, но запросы не обслуживает: {detail}", { label: def.label, detail: check.detail }));
+    hint(t("The credential is saved. Disconnect with: trc auth logout --provider {id}", "Учётные данные сохранены. Отключить: trc auth logout --provider {id}", { id: def.id }));
     // Connected all the same: the models are known, and switching to it is the
     // user's call — a lapsed plan is fixed on the vendor's site, not here.
     await announceModels(def);
     return { connected: true, usable: false };
   }
-  success(t(`${def.label} connected — ${check.detail}`, `${def.label} подключён — ${check.detail}`));
+  success(t("{label} connected — {detail}", "{label} подключён — {detail}", { label: def.label, detail: check.detail }));
   await announceModels(def);
   return { connected: true, usable: true };
 }
@@ -198,7 +199,7 @@ export async function chooseHost(
     badge: h.url && h.url === current ? c.brightGreen("current") : h.url ? h.note ?? "" : "",
   }));
   const picked = await exclusive(() =>
-    pick({ title: t(`${def.label} — host`, `${def.label} — сервер`), items, initial: current }),
+    pick({ title: t("{label} — host", "{label} — сервер", { label: def.label }), items, initial: current }),
   );
   if (picked === null) return null;
   if (picked !== CUSTOM) return picked === current ? "" : picked;
@@ -253,7 +254,7 @@ async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig, profile?: Cred
         line();
         if (def.id === "openai") padded(c.bold("Continue with ChatGPT"));
         const visibleUrl = def.id === "openai" ? publicChatgptLoginUrl(url) : url;
-        padded(t(`Open ${c.brightCyan(visibleUrl)}`, `Откройте ${c.brightCyan(visibleUrl)}`));
+        padded(t("Open {url}", "Откройте {url}", { url: c.brightCyan(visibleUrl) }));
         hint(
           t(
             "approve it in the browser — this window finishes the sign-in by itself",
@@ -275,7 +276,7 @@ async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig, profile?: Cred
       warn(t("Sign-in cancelled.", "Вход отменён."));
       return null;
     }
-    error(t(`${def.label} login failed: ${(err as Error).message}`, `Вход в ${def.label} не удался: ${(err as Error).message}`));
+    error(t("{label} login failed: {message}", "Вход в {label} не удался: {message}", { label: def.label, message: (err as Error).message }));
     // A browser flow is the one that needs a hint when it cannot work: the
     // listener is on this machine, so a URL opened on another one never returns.
     if ((err as Error).name === "OAuthError") {
@@ -308,14 +309,14 @@ async function deviceLoginFlow(def: ProviderDef, cfg: DeviceFlowConfig): Promise
   try {
     code = await requestDeviceCode(cfg);
   } catch (err) {
-    error(t(`Could not start the ${def.label} login: ${(err as Error).message}`, `Не удалось начать вход в ${def.label}: ${(err as Error).message}`));
+    error(t("Could not start the {label} login: {message}", "Не удалось начать вход в {label}: {message}", { label: def.label, message: (err as Error).message }));
     return null;
   }
 
   const url = code.verificationUriComplete ?? code.verificationUri;
   line();
-  padded(t(`Open ${c.brightCyan(url)}`, `Откройте ${c.brightCyan(url)}`));
-  if (code.userCode) padded(t(`and enter the code ${c.bold(code.userCode)}`, `и введите код ${c.bold(code.userCode)}`));
+  padded(t("Open {url}", "Откройте {url}", { url: c.brightCyan(url) }));
+  if (code.userCode) padded(t("and enter the code {code}", "и введите код {code}", { code: c.bold(code.userCode) }));
   line();
   openBrowser(url);
 
@@ -335,7 +336,7 @@ async function deviceLoginFlow(def: ProviderDef, cfg: DeviceFlowConfig): Promise
       warn(t("Sign-in cancelled.", "Вход отменён."));
       return null;
     }
-    error(t(`${def.label} login failed: ${(err as Error).message}`, `Вход в ${def.label} не удался: ${(err as Error).message}`));
+    error(t("{label} login failed: {message}", "Вход в {label} не удался: {message}", { label: def.label, message: (err as Error).message }));
     return null;
   }
   sp.stop();
@@ -348,13 +349,13 @@ async function announceModels(def: ProviderDef): Promise<void> {
   const catalog = await fetchModels({ force: true });
   const mine = catalog.filter((m) => m.id.startsWith(`${def.id}:`));
   if (!mine.length) {
-    warn(t(`${def.label} returned no model list — name one explicitly, e.g. -m ${qualifyModelId(def.id, "<model>")}`, `${def.label} не вернул список моделей — укажите явно, например -m ${qualifyModelId(def.id, "<модель>")}`));
+    warn(t("{label} returned no model list — name one explicitly, e.g. -m {example}", "{label} не вернул список моделей — укажите явно, например -m {example}", { label: def.label, example: qualifyModelId(def.id, t("<model>", "<модель>")) }));
     return;
   }
   const primary = mine[0].id;
   saveConfig({ aliases: { [def.id]: primary } });
-  hint(t(`Models: ${mine.slice(0, 6).map((m) => m.id).join(", ")}${mine.length > 6 ? "…" : ""}`, `Модели: ${mine.slice(0, 6).map((m) => m.id).join(", ")}${mine.length > 6 ? "…" : ""}`));
-  hint(t(`Use it with: /model ${def.id}   (alias for ${primary})`, `Использовать: /model ${def.id}   (алиас для ${primary})`));
+  hint(t("Models: {list}{more}", "Модели: {list}{more}", { list: mine.slice(0, 6).map((m) => m.id).join(", "), more: mine.length > 6 ? "…" : "" }));
+  hint(t("Use it with: /model {id}   (alias for {primary})", "Использовать: /model {id}   (алиас для {primary})", { id: def.id, primary }));
 }
 
 /**

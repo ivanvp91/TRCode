@@ -167,7 +167,11 @@ try {
     const results = await Promise.all([1, 2].map(() => makeGenerateImageTool().run({ prompt: "test" }, ctx()))); for (const r of results) assert.ok(!r.isError, r.output);
     const paths = results.map((r) => /Saved (.+?\.png)/.exec(r.output)[1]); assert.notEqual(paths[0], paths[1]);
     for (const file of paths) { assert.equal(path.dirname(file), project); assert.ok(fs.existsSync(file)); }
-    assert.equal(fs.existsSync(path.join(project, ".tmp")), false, "finished one-off scratch folders are removed");
+    // .tmp may legitimately outlive a media run: session backups live there, so
+    // the guarantee is that the one-off scratch folders themselves are gone.
+    const scratch = path.join(project, ".tmp");
+    const leftover = fs.existsSync(scratch) ? fs.readdirSync(scratch).filter((name) => name !== "agent-backups") : [];
+    assert.deepEqual(leftover, [], "finished one-off scratch folders are removed");
   });
   await test("output conflicts are rejected before another paid POST", async () => { const n = posts(); const r = await makeGenerateImageTool().run({ prompt: "test", out: "wrong.png" }, ctx()); assert.ok(r.isError); assert.equal(posts(), n); });
   await test("MEDIA-07 invalid video duration is rejected before payment", async () => { const n = posts(); for (const duration of [-1.5, 0, "6", 301]) { const r = await makeGenerateVideoTool().run({ prompt: "test", duration }, ctx()); assert.ok(r.isError); } assert.equal(posts(), n); });

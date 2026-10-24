@@ -33,7 +33,9 @@ remembered, and later reads arrive as text only.
 Independent calls in one turn run in parallel (up to 4 at a time).
 
 `ask_user_question` lets the model collect 1–4 related decisions in the same bordered
-modal used by the model and provider pickers. Walk the options with ↑↓ and Enter;
+modal used by the model and provider pickers. The dialog opens directly above the input
+line — the conversation stays where it is and the input, spinner and status keep their
+place under it. Walk the options with ↑↓ and Enter;
 multi-select questions use Space to mark options. Every question also accepts your own
 answer — choose **Your answer** or start typing. **Back** keeps earlier answers editable.
 The last screen reviews the whole batch; only **Submit** sends it to the model and saves
@@ -162,10 +164,12 @@ Three ways to distribute agent work, using the same worker execution policy, plu
 
 - **`task`** — the model spawns subagents for subtasks itself. Several `task` calls in one
   turn run at once; each has its own context and model, and the lead agent sees only their
-  final text. `read_only: true` gives a scout with no write access. By default a subagent
-  runs on **the session's own model** — `/subagents` names other models it may be launched
-  on (a session left open once sent its reconnaissance to the cheapest id in an OpenRouter
-  catalog: 130 requests, 2.8M input tokens on a model nobody chose for this).
+  final text. A request with several independent parts is fanned out this way without being
+  asked, and the running helpers are listed in the turn bar with their model, step budget
+  used and tokens spent. `read_only: true` gives a scout with no write access. By default a
+  subagent runs on **the session's own model** — `/subagents` names other models it may be
+  launched on (a session left open once sent its reconnaissance to the cheapest id in an
+  OpenRouter catalog: 130 requests, 2.8M input tokens on a model nobody chose for this).
 - **`/orchestrate`** (`/orch`) — the task is split into 2-6 subtasks with dependencies.
   Independent steps run in parallel, dependent ones receive their predecessors' results,
   investigation steps are read-only, and writing steps run one at a time and last. The
@@ -191,8 +195,9 @@ Three ways to distribute agent work, using the same worker execution policy, plu
   interrupted is reported as incomplete and does not enter synthesis as a completed answer.
   Interrupted runs retain available worker text in the conversation, marked as unsynthesized.
 - **`/brain <question>`** — not agents but models talking: several answer the same
-  question alone, read each other's answers, revise, and one writes the final text. No
-  tools, no file changes — see [A panel of models](#a-panel-of-models).
+  question alone, read each other's answers, revise, and one writes the final text. They
+  have the session's tools under its approval rules, so a current fact can be looked up —
+  see [A panel of models](#a-panel-of-models).
 
 Chat, `/orchestrate`, `/swarm` and `/brain` keep the input frame and status line visible
 while running. Esc or a single Ctrl+C stops the active task. In chat, Enter steers the
@@ -248,8 +253,9 @@ Skills are looked up in `~/.trcode/skills/<name>/` (global) and
 description reach the system prompt — the body is loaded by the `skill` tool when it is
 actually needed.
 
-A skill may carry a description per language: `description_ru` is used while `/lang ru` is
-set, and the plain `description` is the fallback. Every bundled skill has one.
+A skill may carry a description per language: `description_ru` (or `description_de`, …) is
+used while that language is set, and the plain `description` is the fallback. Every bundled
+skill has a Russian one; other languages fall back to English until someone writes them.
 
 ### Auto-selection
 
@@ -391,8 +397,29 @@ vendor's habits, and the disagreement between a Qwen and a Claude is worth more 
 between two Qwens. That is why the picker's tabs are the providers rather than the output
 types — the models you can reach are spread over several keys.
 
-The panel has no tools and no session of its own — it is models talking, not agents
-working — so what it needs to answer travels with the question.
+Bare `/brain` opens the same panel as **checkboxes**: every row is a member, Space marks
+or unmarks it on any tab (`Active models`, `Favorites`, `All models`), and Enter saves the
+whole set at once — newly checked rows join the panel, unchecked rows leave it. A panel of
+ten is assembled in one visit, not ten. The question itself is the `Ask…` button, or
+`/brain <question>` on the command line.
+
+The panel has **the session's tools** — web search and fetch, reads, shell — under the same
+approval rules as an ordinary turn, and no session of its own. A question about a library's
+current behaviour is checked against the web instead of being guessed at, and a question
+about this project is answered from the files themselves. Three rounds of three models
+multiply every tool step by nine, so the budget is short: eight tool rounds for the
+answering round, four for revision and synthesis, and the panel is told to use them to
+find facts rather than to make changes — it is a discussion, not the agent's turn.
+
+**When the budget runs out, the model is asked for its answer anyway** — the same history,
+the tools taken away, one request. Without that a model that researches well stops on the
+sentence it was about to act on ("let me check a few more facts") and the panel carries
+that sentence into the final answer as if it were one: a four-minute run whose result was
+a promise to look something up.
+
+What it does **not** have is history. A question put mid-session still needs the recent
+conversation to resolve a pronoun — see below — and the files the question names travel
+with it.
 
 **The conversation goes with it.** A question asked mid-session is usually about the
 session: "обсудите идею" is three words and a pronoun, and what the pronoun points at is
@@ -427,6 +454,26 @@ one survives, its answer is the answer — a lone model is not asked to critique
 The `task` tool runs a subtask in its own context and returns only its final text, so the
 lead agent's history stays free of the intermediate steps. Several `task` calls in one
 turn run in parallel.
+
+The lead reaches for this on its own. A request that splits into independent parts — a
+translation into ten languages, a review per module, the same edit in many files — is a
+fan-out, not a queue: one `task` call per part in the same turn, without the user having
+to ask for subagents. Independent tool calls in general go out together.
+
+While helpers work, the turn bar lists them:
+
+```
+1. deepseek-v4.1-flash 70% · 25k tok · read src/agent/loop.ts
+2. glm-5.3-flash 12% · 3.2k tok · grep(task)
+```
+
+A row carries the model, the share of the helper's step budget it has used, the tokens it
+has spent so far, and its latest action. The percentage is measured against the same step
+ceiling the helper runs under — 100% is where it is stopped — so it caps at 99% while the
+helper is alive. A row leaves the list the moment its helper returns: the header and the
+result are already in the transcript, and the turn bar gives those rows back to the answer
+that follows. The row uses the stats line's palette: the model in orange, the numbers,
+the percentage and the action in gray.
 
 A subagent is paid for by the key this session is using, and it runs on **the session's own
 model by default**. `/subagents` is where that is decided — two modes, and the panel says

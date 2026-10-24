@@ -1,4 +1,4 @@
-/** Monochrome dotted TR monogram with a quiet, uniform breathing animation. */
+/** Dotted TR monogram in brushed silver, lit by a highlight that travels across it. */
 import { esc } from "./ansi.js";
 import { MONOGRAM, COMPACT_MONOGRAM } from "./logo-art.js";
 
@@ -7,33 +7,90 @@ export const LOGO_WIDTH = MONOGRAM[0].length;
 export const LOGO_HEIGHT = MONOGRAM.length + 3;
 export const LOGO_MIN_WIDTH = COMPACT_MONOGRAM[0].length;
 export const LOGO_MIN_HEIGHT = COMPACT_MONOGRAM.length + 2;
-export const LOGO_PERIOD = 12;
-const FRAME_MS = 1000 / 60;
+/** One full sweep of the light, in seconds: the only thing that moves. */
+export const LOGO_PERIOD = 10;
+const FRAME_MS = 1000 / 30;
 const RESET = "\x1b[39;49m";
 const EMPTY: Cell = { ch: " ", fg: "\x1b[39m", bg: "\x1b[49m" };
 
+// The mark keeps the grey it always had: a neutral ramp from deep steel on the
+// left to polished silver on the right, with a specular band that travels over
+// the surface. Nothing here has a hue, so the dots still read as one silver
+// material rather than as a coloured sticker.
+const STEEL = 0.42;         // darkest corner of the ramp
+const SILVER = 0.82;        // brightest corner, before the highlight
+const BAND_WIDTH = 0.36;    // share of the mark's width covered by the highlight
+const BAND_LIFT = 0.24;
+// Channels are rounded to 4-step shades: every frame then moves a shade by at
+// most one step (so the highlight glides instead of stepping), while cells that
+// sit on a smooth part of the ramp share an escape and travel as one run.
+const QUANTUM = 4;
+
+const palette = new Map<number, string>();
+
+function ink(lightness: number): string {
+  const channel = Math.min(1, Math.max(0, lightness));
+  // The ramp tops out below 255 so every shade stays an exact multiple of the step.
+  const level = Math.round(channel * 252 / QUANTUM) * QUANTUM;
+  let escape = palette.get(level);
+  if (!escape) {
+    escape = "\x1b[38;2;" + level + ";" + level + ";" + level + "m";
+    palette.set(level, escape);
+  }
+  return escape;
+}
+
+interface Region { left: number; top: number; width: number; height: number }
+
+/** How bright the metal is on a cell, in mark-relative coordinates. */
+function shade(u: number, v: number, seconds: number): string {
+  // The highlight starts mid-mark, crosses it, returns, and is periodic, so the
+  // loop is seamless and the very first frame already shows the sheen.
+  const sweep = 0.5 + 0.5 * Math.sin(seconds / LOGO_PERIOD * Math.PI * 2);
+  const edge = Math.max(0, 1 - Math.abs(u - sweep) / BAND_WIDTH);
+  const gleam = edge * edge * (3 - 2 * edge);
+  const ramp = 0.62 * u + 0.38 * (1 - v);
+  // A steep middle is what separates brushed metal from a flat wash: the
+  // extremes stay where the old grey was, only the transition tightens.
+  const shaded = ramp * ramp * (3 - 2 * ramp);
+  return ink(STEEL + (SILVER - STEEL) * shaded + BAND_LIFT * gleam);
+}
+
+function place(frame: Cell[][], text: string, y: number, region: Region, seconds: number): void {
+  const row = frame[y];
+  if (!row) return;
+  const left = Math.max(0, Math.floor((row.length - text.length) / 2));
+  const across = Math.max(1, region.width - 1);
+  const down = Math.max(1, region.height - 1);
+  for (let x = 0; x < text.length && left + x < row.length; x++) {
+    if (text[x] === " ") continue;
+    const u = Math.min(1, Math.max(0, (left + x - region.left) / across));
+    const v = Math.min(1, Math.max(0, (y - region.top) / down));
+    row[left + x] = { ch: text[x], fg: shade(u, v, seconds), bg: EMPTY.bg };
+  }
+}
+
 function logoCells(columns: number, rows: number, seconds: number): Cell[][] {
   const frame: Cell[][] = Array.from({ length: rows }, () => Array(columns).fill(EMPTY));
-  const level = Math.round(136 + 8 * Math.sin(seconds / LOGO_PERIOD * Math.PI * 2));
-  // A single foreground colour for the entire mark, with the terminal's own
-  // background visible between the dots. Geometry never moves or flashes.
-  const fg = "\x1b[38;2;" + level + ";" + level + ";" + level + "m";
-  const place = (text: string, y: number) => {
-    const left = Math.max(0, Math.floor((columns - text.length) / 2));
-    for (let x = 0; x < text.length && left + x < columns; x++) {
-      if (text[x] !== " ") frame[y][left + x] = { ch: text[x], fg, bg: EMPTY.bg };
-    }
-  };
   if (columns < LOGO_MIN_WIDTH || rows < LOGO_MIN_HEIGHT) {
-    if (rows) place("TRCode".slice(0, columns), Math.floor(rows / 2));
+    const name = "TRCode".slice(0, columns);
+    const row = Math.floor(rows / 2);
+    const left = Math.max(0, Math.floor((columns - name.length) / 2));
+    place(frame, name, row, { left, top: row, width: name.length, height: 1 }, seconds);
     return frame;
   }
   const full = columns >= LOGO_WIDTH && rows >= LOGO_HEIGHT;
   const artwork = full ? MONOGRAM : COMPACT_MONOGRAM;
   const height = full ? LOGO_HEIGHT : LOGO_MIN_HEIGHT;
   const top = Math.floor((rows - height) / 2);
-  for (let y = 0; y < artwork.length; y++) place(artwork[y], top + y);
-  place("T R C O D E", top + height - 1);
+  const region: Region = {
+    left: Math.max(0, Math.floor((columns - artwork[0].length) / 2)),
+    top,
+    width: artwork[0].length,
+    height,
+  };
+  for (let y = 0; y < artwork.length; y++) place(frame, artwork[y], top + y, region, seconds);
+  place(frame, "T R C O D E", top + height - 1, region, seconds);
   return frame;
 }
 

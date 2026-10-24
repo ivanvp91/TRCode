@@ -6,6 +6,8 @@ import { rememberCollapsed } from "./paste.js";
 import { highlight, langOf } from "./highlight.js";
 import { animateLogo, logoFrame, LOGO_MIN_WIDTH, LOGO_MIN_HEIGHT, LOGO_HEIGHT, type LogoAnimation } from "./logo.js";
 import { queryCursorRow } from "./stdin.js";
+import { fmtTokens } from "../usage.js";
+import type { SubagentProgress } from "../agent/subagent.js";
 
 // ── sticky footer ───────────────────────────────────────────────────────────
 
@@ -29,6 +31,19 @@ let footerCaretFn: FooterCaretFn | null = null;
  */
 type FooterCoverFn = () => number;
 let footerCoverFn: FooterCoverFn | null = null;
+/**
+ * Rows that belong directly above the bar, drawn as part of its frame.
+ *
+ * A question the model asks is a dialog over the conversation, not another
+ * paragraph in it: it needs the rows above the input line, and the input line
+ * has to stay where it is. Keeping both in one frame is what makes that work —
+ * the bar keeps the bottom edge, the dialog grows upwards over the transcript,
+ * and the erase/redraw/resize arithmetic never learns there are two blocks.
+ */
+type FooterAboveFn = () => string[];
+let footerAboveFn: FooterAboveFn | null = null;
+/** Rows of it the frame being built carried, for the caret offset. */
+let footerAboveRows = 0;
 /** Borrowed rows at the top of the frame on screen. */
 let footerCover = 0;
 /** Borrowed rows of the frame footerFrame() just built. */
@@ -62,6 +77,12 @@ let startRow: number | null = null;
 let pinned = false;
 /** Rows the block still has to open below itself to get back down there. */
 let pendingDrop = 0;
+/**
+ * Rows the idle composer opened under the transcript and gave back when the
+ * line was sent. The transcript is written into the hole they left, so the
+ * block has to open the remainder again to land on the last line.
+ */
+let owedGap = 0;
 /** Height of the block that was just taken off the screen. */
 let slackRows = 0;
 /** A fresh cursor probe after that block was removed, when available. */
@@ -74,6 +95,14 @@ let slackMark = 0;
 let rowsMoved = 0;
 /** Blank rows the bar owes at its own top after a shrink — see footerFrame(). */
 let footerPad = 0;
+/**
+ * Blank screen between the last line of the transcript and the top of the
+ * frame. A block that is dropped to the bottom edge leaves this air above
+ * itself; every printed line eats one row of it, and a frame drawn right under
+ * the conversation has none. It is what tells an overlay drawn over the rows
+ * above the frame whether it is covering text or nothing at all.
+ */
+let airAbove = 0;
 /** The pad the frame on screen was built with, for the caret. */
 let framePad = 0;
 let lastScreenRows = 0;
@@ -90,8 +119,10 @@ export function setStartRow(row: number | null, preserveFooterSlack = false): vo
   // they are counted from is fresher.
   if (!preserveFooterSlack) pinned = false;
   pendingDrop = 0;
+  owedGap = 0;
   rowsMoved = 0;
   footerPad = 0;
+  airAbove = 0;
   if (preserveFooterSlack) slackCursorRow = row;
   else {
     slackCursorRow = null;
@@ -127,6 +158,13 @@ function movedRows(text: string): void {
   // line: that is what puts the bar back on the conversation instead of leaving
   // a gap between the two.
   if (footerPad) footerPad = Math.max(0, footerPad - n);
+  // A line printed right under the air above the block lands on its last row,
+  // and the frame below slides down by that row: from here on the frame touches
+  // the conversation, and the air that is left sits further up.
+  airAbove = 0;
+  // Same for the hole the submitted composer left: the lines just written are
+  // the ones that fill it, so the next block owes exactly the remainder.
+  if (owedGap) owedGap = Math.max(0, owedGap - n);
   // A cursor that never answered the startup probe sat somewhere on the first
   // line, so that is the highest it can have started from.
   if (!pinned && (startRow ?? 1) - 1 + rowsMoved >= screenRows()) pinned = true;
@@ -143,9 +181,28 @@ function movedRows(text: string): void {
  * again whenever a taller window opens rows underneath.
  */
 export function bottomGap(rows: number): number {
-  if (pinned) return pendingDrop;
+  if (pinned) return pendingDrop + owedGap;
   if (startRow === null) return 0;
   return Math.max(0, screenRows() - startRow - rows + 1);
+}
+
+/**
+ * The rows a submitted composer opened under the transcript and gave back.
+ *
+ * Everything printed next — a command's output, a panel, the answer — starts on
+ * the row the transcript ends on instead of at the bottom of the screen, which
+ * is where the composer was standing. Without this a fresh session shows a
+ * wall of blank rows between the last message and whatever comes next: the
+ * input had been dropped to the last line, and only a scrolling transcript
+ * would ever fill the hole.
+ */
+export function reclaimGap(rows: number): void {
+  owedGap += Math.max(0, rows);
+}
+
+/** True while the transcript still owes rows to the hole a composer left. */
+export function gapPending(): boolean {
+  return owedGap > 0;
 }
 
 /** Records where the block ended up: from here on it is the bottom of the screen. */
@@ -156,6 +213,7 @@ export function bottomDrawn(rows: number, dropped = false): void {
   const reached = dropped || (startRow !== null && startRow > Math.floor(screenRows() / 2));
   if (rows > 0 && reached) pinned = true;
   pendingDrop = 0;
+  owedGap = 0;
   lastScreenRows = screenRows();
 }
 
@@ -222,6 +280,7 @@ function eraseSeq(): string {
   footerRows = 0;
   footerCursorRow = 0;
   footerCover = 0;
+  footerAboveRows = 0;
   lastFrame = null;
   // Hidden before it moves — a visible cursor walking to the erase point reads
   // as the caret jumping around the screen. Borrowed rows get their transcript
@@ -234,10 +293,17 @@ function eraseSeq(): string {
  * Writes back the transcript rows that the top `n` rows of the frame were
  * drawn over, from the cursor down, and leaves the cursor on the row under
  * them. The screen cannot be read back; the row log is what stood there.
+ *
+ * The bottom `airAbove` of those rows held nothing: a block dropped to the
+ * bottom edge starts below a stretch of blank screen, so the rows nearest it
+ * are air, not conversation, and putting the log's last lines there would
+ * print them a second time.
  */
 function uncoverSeq(n: number): string {
   if (n <= 0) return "";
-  return tailRows(n).map((l) => CLEAR_LINE + l).join("\n") + "\n";
+  const air = Math.min(airAbove, n);
+  const rows = [...tailRows(n - air), ...Array(air).fill("")];
+  return rows.map((l) => CLEAR_LINE + l).join("\n") + "\n";
 }
 
 /**
@@ -247,7 +313,9 @@ function uncoverSeq(n: number): string {
  */
 function caretSeq(lines: string[]): string {
   const caret = footerCaretFn?.() ?? null;
-  const row = caret ? caret.row + framePad : -1;
+  // The rows above the bar come first in the frame, so the caret's own row is
+  // that much further down.
+  const row = caret ? caret.row + framePad + footerAboveRows : -1;
   if (caret && row >= 0 && row < lines.length) {
     footerCursorRow = row;
     return esc.up(lines.length - 1 - row) + esc.toColumn(caret.col + 1) + esc.show;
@@ -272,6 +340,7 @@ function drawSeq(lines: string[]): string {
   footerCover = frameCover;
   lastFrame = lines;
   bottomDrawn(owned, drop > 0);
+  airAbove = drop;
   return body + caretSeq(lines);
 }
 
@@ -338,7 +407,16 @@ function eraseFooter(): void {
 function footerFrame(block: string[]): string[] {
   // Borrowing needs the bar on the bottom edge: only then is everything above
   // it transcript, the rows the log remembers.
-  const want = pinned && footerCoverFn ? Math.max(0, Math.min(footerCoverFn(), block.length)) : 0;
+  //
+  // The dialog rows above the bar are borrowed too. Grown as owned rows instead,
+  // a question that closed left the bar holding every row it had used: a band of
+  // air as tall as the dialog, eaten one row per transcript line and standing
+  // between the conversation and the bar until the turn printed enough to fill
+  // it. Drawn over the transcript and handed back from the log, the dialog costs
+  // the bar nothing, so closing it puts the bar exactly where it was.
+  const want = pinned
+    ? Math.max(0, Math.min((footerCoverFn?.() ?? 0) + footerAboveRows, block.length))
+    : 0;
   const own = block.length - want;
   const height = footerPad + own;
   if (footerRows) {
@@ -352,10 +430,25 @@ function footerFrame(block: string[]): string[] {
   return footerPad ? [...Array(footerPad).fill(""), ...block] : block;
 }
 
+/**
+ * The frame's rows: whatever belongs above the bar, then the bar itself.
+ *
+ * Returns null when there is nothing to draw. A dialog with no bar under it
+ * (a question asked outside a turn) is still drawn — it is simply the whole
+ * block then, and the rows above it are its own.
+ */
+function footerBlock(): string[] | null {
+  const above = footerAboveFn ? footerAboveFn() : [];
+  const own = footerFn ? footerFn() : [];
+  footerAboveRows = above.length;
+  const block = own.length ? (above.length ? [...above, ...own] : own) : above;
+  return block.length ? block : null;
+}
+
 function drawFooter(): void {
-  if (!footerFn || !process.stdout.isTTY) return;
-  const block = footerFn();
-  if (!block.length) return;
+  if (!process.stdout.isTTY) return;
+  const block = footerBlock();
+  if (!block) return;
   const lines = footerFrame(block);
   // A resize moved the last line of the screen: the bar has to come down to it,
   // and only a full redraw from above can do that.
@@ -399,6 +492,7 @@ export function setFooter(fn: FooterFn | null, caret?: FooterCaretFn | null, cov
     // Stopping: take the bar off the screen and leave the cursor visible.
     if (had) eraseFooter();
     footerRows = 0;
+    airAbove = 0;
     lastFrame = null;
     cursor.show();
     return;
@@ -411,8 +505,37 @@ export function setFooter(fn: FooterFn | null, caret?: FooterCaretFn | null, cov
   drawFooter();
 }
 
-/** True while a block that came off the screen still owes rows to the next one. */
-export function bottomSlackPending(): boolean {
+/**
+ * Rows to draw directly above the bar — the model's question dialog.
+ *
+ * Not a second footer: the rows join the bar's frame, so the bar stays on the
+ * last line of the screen while the dialog grows upwards over the conversation,
+ * the caret stays in the input band, and the existing erase/repaint arithmetic
+ * covers both. Passing null takes the dialog away and gives the rows back.
+ */
+export function setFooterAbove(fn: FooterAboveFn | null): void {
+  footerAboveFn = fn;
+  if (!process.stdout.isTTY) return;
+  // Without a bar under it the dialog is the whole block, so it still needs
+  // drawing — and the last rows of it erased when it goes.
+  if (!footerFn) {
+    // No bar means no frame to keep pinned: the rows a previous dialog carried
+    // are not owed to this one.
+    if (!footerRows) footerPad = 0;
+    if (fn) drawFooter();
+    else if (footerRows) {
+      eraseFooter();
+      footerRows = 0;
+      footerPad = 0;
+      lastFrame = null;
+      cursor.show();
+    }
+    return;
+  }
+  refreshFooter();
+}
+
+/** True while a block that came off the screen still owes rows to the next one. */export function bottomSlackPending(): boolean {
   return slackRows > 0;
 }
 
@@ -441,15 +564,15 @@ export function takeFooterSlack(rows: number): number {
 
 /** Redraws the bar in place — for the spinner tick and status updates. */
 export function refreshFooter(): void {
-  if (!footerFn || !process.stdout.isTTY) return;
+  if (!process.stdout.isTTY) return;
   // Mid-batch the transcript text is still held back, so the bar cannot be
   // redrawn yet: it would land above the lines that belong over it.
   if (batched) {
     batchWantsFooter = true;
     return;
   }
-  const block = footerFn();
-  if (!block.length) return;
+  const block = footerBlock();
+  if (!block) return;
   const lines = footerFrame(block);
   // Several callers can ask for the same frame between two spinner ticks
   // (a label change, a queued line, the tick itself). Drawing it twice costs
@@ -564,14 +687,15 @@ export function sealBlankRows(): void {
 function writeFrame(s: string): void {
   if (!s) return;
   logRows(s);
-  if (!footerFn || !process.stdout.isTTY) {
+  const block = footerBlock();
+  if (!block || !process.stdout.isTTY) {
     process.stdout.write(s);
     return;
   }
   // A partial line would put the bar on the same row as the text; leave the
   // redraw to the write that finishes the line. The bar is taken down first,
   // so the text lands in the rows it held, and drawn back under it.
-  paint(eraseSeq() + s + drawSeq(footerFrame(footerFn())));
+  paint(eraseSeq() + s + drawSeq(footerFrame(block)));
 }
 
 export function out(s = ""): void {
@@ -764,7 +888,7 @@ export function userEcho(text: string): void {
       bandRow(
         " ".repeat(left) +
           c.gray(
-            t(`… ${rest} more lines · ctrl+o to see all of it`, `… ещё строк: ${rest} · ctrl+o — показать целиком`),
+            t("… {rest} more lines · ctrl+o to see all of it", "… ещё строк: {rest} · ctrl+o — показать целиком", { rest }),
           ),
       ),
     );
@@ -862,8 +986,9 @@ export function toolDone(ok: boolean | null, detail: string, kind: "text" | "dif
         TOOL_INDENT +
           c.gray(
             t(
-              `  … +${all.length - 40} lines (ctrl+o to expand)`,
-              `  … ещё ${count(all.length - 40, ["line", "lines"], ["строка", "строки", "строк"])} (ctrl+o — показать)`,
+              "  … +{n} lines (ctrl+o to expand)",
+              "  … ещё {more} (ctrl+o — показать)",
+              { n: all.length - 40, more: count(all.length - 40, ["line", "lines"], ["строка", "строки", "строк"]) },
             ),
           ),
       );
@@ -888,8 +1013,9 @@ export function toolDone(ok: boolean | null, detail: string, kind: "text" | "dif
         "  " +
         c.gray(
           t(
-            `… +${rest} lines (ctrl+o to expand)`,
-            `… ещё ${count(rest, ["line", "lines"], ["строка", "строки", "строк"])} (ctrl+o — показать)`,
+            "… +{n} lines (ctrl+o to expand)",
+            "… ещё {more} (ctrl+o — показать)",
+            { n: rest, more: count(rest, ["line", "lines"], ["строка", "строки", "строк"]) },
           ),
         ),
     );
@@ -943,6 +1069,21 @@ export function success(s: string): void {
 /** Simple pluraliser: plural(2, "step", "steps") → "steps". */
 export function plural(n: number, one: string, many: string): string {
   return Math.abs(n) === 1 ? one : many;
+}
+
+/**
+ * One row of the live helper list: which subagent, on what model, how much of
+ * its step budget it has spent, what it has cost, and what it is doing now.
+ *
+ * Styled like the turn's stats line: the model in orange, everything that is
+ * not a name in gray.
+ */
+export function subagentRow(info: SubagentProgress): string {
+  const pct = info.maxSteps > 0 ? Math.min(99, Math.round((100 * info.steps) / info.maxSteps)) : 0;
+  const head =
+    `${c.gray(`${info.id}.`)} ${c.brightYellow(info.model)} ` +
+    c.gray(`${pct}% · ${fmtTokens(info.tokens)} tok`);
+  return info.line ? `${head} ${c.gray(`· ${info.line}`)}` : head;
 }
 
 export function truncate(s: string, max: number): string {
@@ -1057,8 +1198,9 @@ export class ThinkingStream {
             c.dim(t("thinking", "размышления")) +
             c.gray(
               t(
-                ` · ${count(this.emitted, ["line", "lines"], ["строка", "строки", "строк"])} hidden · /reasoning to show`,
-                ` · скрыто ${count(this.emitted, ["line", "lines"], ["строка", "строки", "строк"])} · /reasoning — показать`,
+                " · {lines} hidden · /reasoning to show",
+                " · скрыто {lines} · /reasoning — показать",
+                { lines: count(this.emitted, ["line", "lines"], ["строка", "строки", "строк"]) },
               ),
             ),
         );
@@ -1373,10 +1515,9 @@ export class Spinner {
       this.inTokens || this.outTokens
         ? ` · ↑ ${fmtCompact(this.inTokens)} ↓ ${fmtCompact(this.outTokens)}`
         : "";
-    const tps =
-      this.outTokens && Date.now() - this.started > 1000
-        ? ` · ${fmtCompact(Math.round(this.outTokens / ((Date.now() - this.started) / 1000)))} tok/s`
-        : "";
+    // No tok/s here: a bare spinner has no stream to time (nothing calls
+    // setTokens on it). The turn bar measures speed from the deltas themselves
+    // — see OutputRate.
     cursor.clearLine();
     cursor.toColumn(0);
     out(
@@ -1385,7 +1526,7 @@ export class Spinner {
         " " +
         // Same colour as the turn bar's label — see TurnBar.spinnerLine.
         c.brightCyan(this.label) +
-        c.gray(` (${elapsed}${counts}${tps})`) +
+        c.gray(` (${elapsed}${counts})`) +
         (this.cancelable ? c.gray("  esc to interrupt") : ""),
     );
   }
@@ -1483,7 +1624,7 @@ export function renderDiff(before: string, after: string, opts: { path?: string;
   const shown = rows.slice(0, MAX_DIFF_ROWS);
   const hidden = rows.length - shown.length;
   const tail = hidden
-    ? [c.gray(t(`… ${count(hidden, ["row", "rows"], ["строка", "строки", "строк"])} not shown`, `… ${count(hidden, ["row", "rows"], ["строка", "строки", "строк"])} не показано`))]
+    ? [c.gray(t("… {rows} not shown", "… {rows} не показано", { rows: count(hidden, ["row", "rows"], ["строка", "строки", "строк"]) }))]
     : [];
   // Unpadded: the caller decides the indent — the transcript and the
   // permission prompt put this block in different places.
@@ -1495,8 +1636,8 @@ function diffSummary(added: number, removed: number): string {
   const bits: string[] = [];
   // The colon keeps the Russian impersonal, so it agrees with 1 as well as 3 —
   // "Добавлено 1 строка" would need the feminine, "Добавлено: 1 строка" does not.
-  if (added) bits.push(t(`Added ${added} ${plural(added, "line", "lines")}`, `Добавлено: ${count(added, ["line", "lines"], ["строка", "строки", "строк"])}`));
-  if (removed) bits.push(t(`removed ${removed} ${plural(removed, "line", "lines")}`, `удалено: ${count(removed, ["line", "lines"], ["строка", "строки", "строк"])}`));
+  if (added) bits.push(t("Added {added} {lines}", "Добавлено: {count}", { added, lines: plural(added, "line", "lines"), count: count(added, ["line", "lines"], ["строка", "строки", "строк"]) }));
+  if (removed) bits.push(t("removed {removed} {lines}", "удалено: {count}", { removed, lines: plural(removed, "line", "lines"), count: count(removed, ["line", "lines"], ["строка", "строки", "строк"]) }));
   if (!bits.length) return t("No changes", "Без изменений");
   return bits.join(", ");
 }

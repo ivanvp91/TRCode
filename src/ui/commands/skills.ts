@@ -27,7 +27,7 @@ export async function openInEditor(app: App, file: string): Promise<boolean> {
         const child = spawn(editor, [file], { stdio: "inherit" });
         child.on("close", () => resolve());
         child.on("error", (err: Error) => {
-          error(t(`Could not launch ${editor}: ${err.message}`, `Не удалось запустить ${editor}: ${err.message}`));
+          error(t("Could not launch {editor}: {message}", "Не удалось запустить {editor}: {message}", { editor, message: err.message }));
           resolve();
         });
       }),
@@ -58,7 +58,7 @@ export function setSkillsEnabled(app: App, on: boolean): void {
 export async function editSkill(app: App, name: string | null): Promise<boolean> {
   const skill = app.skills.find((s) => s.name === name);
   if (!skill) {
-    error(t(`Skill not found: ${name ?? "(no name given)"}`, `Навык не найден: ${name ?? "(имя не указано)"}`));
+    error(t("Skill not found: {name}", "Навык не найден: {name}", { name: name ?? t("(no name given)", "(имя не указано)") }));
     return false;
   }
   const opened = await openInEditor(app, path.join(skill.dir, "SKILL.md"));
@@ -92,7 +92,7 @@ export function skillGenPrompt(task: string): string {
 export function checkSkills(app: App, name?: string, quietWhenClean = false): number {
   const list = name ? app.skills.filter((s) => s.name === name) : app.skills;
   if (name && !list.length) {
-    error(t(`Skill not found: ${name}`, `Навык не найден: ${name}`));
+    error(t("Skill not found: {name}", "Навык не найден: {name}", { name }));
     return 0;
   }
   let bad = 0;
@@ -104,7 +104,7 @@ export function checkSkills(app: App, name?: string, quietWhenClean = false): nu
     for (const p of problems) hint(`  · ${p}`);
   }
   if (!bad && !quietWhenClean) {
-    success(t(`${list.length} skill(s) checked — nothing to fix.`, `Проверено навыков: ${list.length} — править нечего.`));
+    success(t("{count} skill(s) checked — nothing to fix.", "Проверено навыков: {count} — править нечего.", { count: list.length }));
   }
   return bad;
 }
@@ -132,8 +132,9 @@ export async function skillsModal(app: App): Promise<void> {
         title: t("Skills", "Навыки"),
         subtitle: enabled
           ? t(
-              `On · ${withTriggers} of ${app.skills.length} fire on their own trigger words (⚡, auto-selection ${autoOn ? "on" : "off"}) · Enter edits`,
-              `Включены · ${withTriggers} из ${app.skills.length} срабатывают по своим словам (⚡, автовыбор ${autoOn ? "вкл" : "выкл"}) · Enter — правка`,
+              "On · {triggers} of {total} fire on their own trigger words (⚡, auto-selection {auto}) · Enter edits",
+              "Включены · {triggers} из {total} срабатывают по своим словам (⚡, автовыбор {auto}) · Enter — правка",
+              { triggers: withTriggers, total: app.skills.length, auto: autoOn ? t("on", "вкл") : t("off", "выкл") },
             )
           : t(
               "Off — nothing about them is sent with requests, so they cost nothing.",
@@ -173,7 +174,7 @@ export async function skillsModal(app: App): Promise<void> {
     }
     if (res.id === "auto") {
       app.cfg = saveConfig({ skillAuto: !autoOn });
-      success(t(`Skill auto-selection ${!autoOn ? "on" : "off"}.`, `Автовыбор навыков: ${!autoOn ? "вкл" : "выкл"}.`));
+      success(t("Skill auto-selection {state}.", "Автовыбор навыков: {state}.", { state: !autoOn ? t("on", "вкл") : t("off", "выкл") }));
       continue;
     }
     if (res.id === "edit") {
@@ -186,8 +187,8 @@ export async function skillsModal(app: App): Promise<void> {
       const description = (await app.exclusiveInput(() => askLine(t("When to apply it:", "Когда применять:"), ""))) ?? "";
       const { file, existed } = createSkill({ cwd: app.cwd, name: name.trim(), description, scope: "project" });
       app.rebuildTools();
-      if (existed) warn(t(`That skill already exists: ${file}`, `Такой навык уже есть: ${file}`));
-      else success(t(`Created ${file}`, `Создан ${file}`));
+      if (existed) warn(t("That skill already exists: {file}", "Такой навык уже есть: {file}", { file }));
+      else success(t("Created {file}", "Создан {file}", { file }));
       hint(
         t(
           "The description line is what matters: the model decides whether to load the skill from it.",

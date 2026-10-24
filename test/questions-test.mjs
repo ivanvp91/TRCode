@@ -233,6 +233,9 @@ try {
   });
   await test("permission rendering waits behind questions; nested exclusive callbacks work", async () => {
     const app = appFor();
+    // A conversation for the dialog to float over: the rows it covers are this
+    // test's own, so a repaint of them can never be mistaken for a render.
+    for (let i = 0; i < 24; i++) line(`transcript filler ${i}`);
     const ctx = app.toolContext();
     const first = ctx.askUser([qs[0]]);
     await until(() => screen().includes(qs[0].question));
@@ -245,6 +248,7 @@ try {
   });
   await test("cancelled queued permissions are refused before rendering", async () => {
     const app = appFor(); const controller = new AbortController();
+    for (let i = 0; i < 24; i++) line(`transcript filler ${i}`);
     const first = app.toolContext().askUser([qs[0]]);
     await until(() => screen().includes(qs[0].question));
     const gate = app.broker.confirm({ name: "write", risk: "write" }, {}, undefined, controller.signal);
