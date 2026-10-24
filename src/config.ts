@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 import type { SubagentRole } from "./agent/roles.js";
 
-export const VERSION = "0.2.0";
+export const VERSION = "0.2.1";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";
@@ -15,15 +15,27 @@ export type PermissionMode = "ask" | "allow" | "deny";
 export type Effort = "off" | "minimal" | "low" | "medium" | "high";
 
 /**
- * The language the agent answers in, and the one skill descriptions are shown
- * in. Adding one means a `LANGUAGES` entry and a `description_<code>` line in
+ * The language the agent answers in, the one the interface speaks, and the one
+ * skill descriptions are shown in. Adding one means a `LANGUAGES` entry, a
+ * catalogue in `src/i18n/<code>.ts`, and a `description_<code>` line in
  * whichever skills should speak it — nothing else is per-language.
  */
-export type Lang = "en" | "ru";
+export type Lang = "en" | "ru" | "zh" | "ja" | "de" | "fr" | "es" | "it" | "pt" | "uk" | "pl" | "ms" | "id";
 
 export const LANGUAGES: { code: Lang; label: string; native: string }[] = [
   { code: "en", label: "English", native: "English" },
   { code: "ru", label: "Russian", native: "Русский" },
+  { code: "zh", label: "Chinese", native: "中文" },
+  { code: "ja", label: "Japanese", native: "日本語" },
+  { code: "de", label: "German", native: "Deutsch" },
+  { code: "fr", label: "French", native: "Français" },
+  { code: "es", label: "Spanish", native: "Español" },
+  { code: "it", label: "Italian", native: "Italiano" },
+  { code: "pt", label: "Portuguese", native: "Português" },
+  { code: "uk", label: "Ukrainian", native: "Українська" },
+  { code: "pl", label: "Polish", native: "Polski" },
+  { code: "ms", label: "Malay", native: "Bahasa Melayu" },
+  { code: "id", label: "Indonesian", native: "Bahasa Indonesia" },
 ];
 
 export const EFFORT_LEVELS: Effort[] = ["off", "minimal", "low", "medium", "high"];
