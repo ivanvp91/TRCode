@@ -121,6 +121,12 @@ export function setStartRow(row: number | null, preserveFooterSlack = false): vo
   pendingDrop = 0;
   owedGap = 0;
   rowsMoved = 0;
+  // The count of written rows restarts here, so a slack recorded against the
+  // old one has to be re-based with it. Left standing, every row printed before
+  // this point counts as "printed since" with a minus sign, and the composer
+  // asks for a reclaim taller than the screen — which scrolls the answer off
+  // the top and leaves an empty terminal behind.
+  slackMark = 0;
   footerPad = 0;
   airAbove = 0;
   if (preserveFooterSlack) slackCursorRow = row;
@@ -546,20 +552,27 @@ export function setFooterAbove(fn: FooterAboveFn | null): void {
  */
 export function takeFooterSlack(rows: number): number {
   if (!slackRows) return 0;
-  const printed = rowsMoved - slackMark;
-  // The rows are owed because a footer came off the screen — that is enough
-  // evidence that the block below it can come down. `pinned` is not asked:
-  // the slack probe deliberately re-measures the position, which clears it.
+  // Rows printed since the bar came down — never negative: a probe that
+  // re-baselined the counter must not count the rows before it twice, and a
+  // negative here turns into a scroll of the whole screen.
+  const printed = Math.max(0, rowsMoved - slackMark);
   const slack = slackCursorRow !== null
     ? Math.max(0, screenRows() - slackCursorRow - rows + 1)
     : Math.max(0, slackRows - printed - rows + screenRows() - slackScreenRows);
   slackRows = 0;
   slackCursorRow = null;
-  if (slack) {
+  // The rows are owed because a footer came off the screen — that is enough
+  // evidence that the block below it can come down. `pinned` is not asked:
+  // the slack probe deliberately re-measures the position, which clears it.
+  //
+  // Never more than the screen holds: dragging it further buries the transcript
+  // in the scrollback and leaves nothing but background behind.
+  const move = Math.min(slack, Math.max(0, screenRows() - rows));
+  if (move) {
     pinned = true;
     pendingDrop = 0;
   }
-  return slack;
+  return move;
 }
 
 /** Redraws the bar in place — for the spinner tick and status updates. */

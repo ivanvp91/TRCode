@@ -916,7 +916,9 @@ export class InputEditor {
     if (prev) frame += esc.toColumn(1) + esc.up(this.cursorRow);
     // Only cleared footer rows are discarded. Moving the transcript with the
     // composer avoids converting the live spinner/preview height into a gap.
-    const freed = reclaimed + returned;
+    // Capped at the screen: scrolling further than that only pushes the
+    // conversation into the scrollback and leaves a blank terminal behind.
+    const freed = Math.min(reclaimed + returned, Math.max(0, screenHeight() - lines.length));
     if (freed) frame += esc.clearDown + esc.scrollDown(freed) + esc.down(freed);
     if (drop) frame += esc.clearDown + "\n".repeat(drop);
     // Column 1 first, then wipe the row: what a shortened line used to occupy

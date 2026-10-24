@@ -407,6 +407,50 @@ for (const [height, probe] of [[9, false], [15, false], [9, true], [15, true]]) 
   check(`draft survives the transition (${label})`, (await p) === "draft kept");
 }
 
+// ── a probe that never answers must not scroll the screen away ──────────────
+{
+  // The cursor probe fails when the terminal does not answer it (a pane behind
+  // an orchestrator, a terminal with the reply swallowed). The row counter is
+  // re-baselined anyway, so the rows printed earlier must not come back as
+  // "rows printed since" with a minus sign: that turned into a scroll of six
+  // hundred rows, which pushed the whole answer into the scrollback and left an
+  // empty window with nothing in it — not even the composer.
+  const fresh = new Screen(COLS, ROWS);
+  let raw = "";
+  process.stdout.write = (chunk) => { raw += String(chunk); fresh.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: ROWS, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: COLS, configurable: true });
+  process.stdout.emit("resize");
+
+  render.line("the answer");
+  render.setStartRow(fresh.row + 1);
+  // A long turn: tool output and reasoning, hundreds of rows of it.
+  for (let i = 0; i < 300; i++) render.line("turn row " + i);
+  render.setFooter(() => Array.from({ length: 9 }, (_, i) => "bar " + i));
+  render.setFooter(null);
+  render.line();
+  render.line("the turn's stats");
+
+  raw = "";
+  render.setStartRow(null);
+
+  const { InputEditor } = await import("../dist/ui/editor.js");
+  const ed = new InputEditor({
+    status: () => ({ left: "model", hint: "esc to interrupt", context: "context: 3%" }),
+    history: [],
+  });
+  const p = ed.read();
+  await new Promise((r) => setTimeout(r, 40));
+  const scrolled = [...raw.matchAll(new RegExp(ESC + "\\[(\\d+)T", "g"))].map((m) => Number(m[1]));
+  const lines = fresh.lines();
+  check("a failed probe does not scroll the screen away", scrolled.every((n) => n < ROWS), JSON.stringify(scrolled));
+  check("the answer is still on screen", lines.some((l) => l === "the answer" || /turn row 299/.test(l)), lines.join("\n"));
+  check("the composer is still drawn at the bottom", /context: 3%/.test(lines[ROWS - 1]), lines.join("\n"));
+
+  stdin.emit("data", Buffer.from("\r"));
+  await p;
+}
+
 // ── while reasoning streams: the live bar keeps its breathing room ────────
 {
   const fresh = new Screen(COLS, ROWS);
