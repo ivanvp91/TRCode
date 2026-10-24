@@ -6,7 +6,7 @@ import crypto from "node:crypto";
 import type { McpServerConfig, ModelPricing } from "./types.js";
 import type { SubagentRole } from "./agent/roles.js";
 
-export const VERSION = "0.2.1";
+export const VERSION = "0.2.2";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
 
 export type PermissionMode = "ask" | "allow" | "deny";

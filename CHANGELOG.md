@@ -6,6 +6,8 @@ All notable changes to TRCode are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.2.2] — 2026-10-25
+
 ### Fixed
 
 - **Ответ больше не пропадает вместе с экраном.** В конце хода композер забирает у
