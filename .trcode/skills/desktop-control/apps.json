@@ -1,0 +1,14 @@
+{
+  "default": "allow",
+  "allow": [],
+  "deny": [
+    "keepass",
+    "keepassxc",
+    "1password",
+    "bitwarden",
+    "lastpass",
+    "enpass",
+    "dashlane"
+  ]
+}
+

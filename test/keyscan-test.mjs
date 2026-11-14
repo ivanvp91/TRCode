@@ -25,7 +25,10 @@ send(ESC); send(ESC);   // выход
 const seen = await p;
 process.stdout.write = real;
 
-const strip = (s) => s.replace(new RegExp(ESC + "\[[0-9;]*[A-Za-z]", "g"), "");
+// Private modes are output as well — DECSET 1004 turns focus reporting on — so
+// the pattern has to take the "?"; without it the row they were written on never
+// matches and every check on it fails.
+const strip = (s) => s.replace(new RegExp(ESC + "\\[[?0-9;]*[A-Za-z]", "g"), "");
 const rows = strip(out).split("\n").filter((l) => l.trim());
 let failed = 0;
 const check = (name, cond) => { if (!cond) failed++; console.log(`${cond ? "  OK  " : "  FAIL"}  ${name}`); };

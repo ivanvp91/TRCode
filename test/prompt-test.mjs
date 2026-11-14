@@ -45,8 +45,10 @@ check("subagents get the same discipline", /grep first, then read around the hit
   const plain = estimateTokens(buildSystemPrompt({ ...opts, model: "anthropic/claude-opus-5" }));
   // The ceiling moves only when a section earns it — the image rules did, at
   // ~60 tokens, because the alternative is a model narrating a screenshot it
-  // never opened. Anything else that wants room here trims something first.
-  check(`the prompt stays small (${plain} tokens)`, plain < 980, String(plain));
+  // never opened; the server rules did, at ~68, because the alternative is an
+  // agent running commands on a production box nobody asked it to touch.
+  // Anything else that wants room here trims something first.
+  check(`the prompt stays small (${plain} tokens)`, plain < 1050, String(plain));
   const withNote = estimateTokens(buildSystemPrompt({ ...opts, model: "qwen/qwen3.8-max" }));
   check(`a model note costs little (${withNote - plain} tokens)`, withNote - plain < 90, String(withNote - plain));
   const sub = estimateTokens(buildSystemPrompt({ ...opts, subagent: true }));

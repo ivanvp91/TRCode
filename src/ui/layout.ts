@@ -20,7 +20,10 @@ export function padRight(): number {
 
 /** Width available to chat content between the margins. */
 export function contentWidth(): number {
-  return Math.max(30, fullWidth() - PAD_LEFT - padRight());
+  // The floors are what keeps a line readable on a wide terminal, not a licence
+  // to paint past the edge of a narrow one: a row wider than the pane wraps, and
+  // a wrapped row is one the frame arithmetic below cannot count.
+  return Math.max(10, fullWidth() - PAD_LEFT - padRight());
 }
 
 /**
@@ -29,7 +32,7 @@ export function contentWidth(): number {
  * cells short of the band above it reads as a stray paragraph instead of chrome.
  */
 export function statusWidth(): number {
-  return Math.max(30, fullWidth() - PAD_LEFT - 3);
+  return Math.max(10, fullWidth() - PAD_LEFT - 3);
 }
 
 /**
@@ -39,7 +42,7 @@ export function statusWidth(): number {
  * edge reads as clipped rather than filled.
  */
 export function bandTextWidth(): number {
-  return Math.max(10, fullWidth() - PAD_LEFT - 5);
+  return Math.max(4, fullWidth() - PAD_LEFT - 5);
 }
 
 export const indent = " ".repeat(PAD_LEFT);

@@ -8,22 +8,22 @@
  * a provider only decides the base URL, the headers and, when the host has no
  * catalog to ask, the dialect.
  */
-import { loadConfig, saveConfig, DEFAULT_BASE_URL, VERSION, type Effort } from "../config.js";
+import { loadConfig, saveConfig, DEFAULT_BASE_URL, ROUTER_PROVIDER, VERSION, type Effort } from "../config.js";
 import { CHATGPT_OAUTH, chatgptPlanEnabled, isChatgptRegistration, refreshChatgpt } from "./chatgpt.js";
+import { storeCredential } from "./accounts.js";
 import { isDrivable, protocolFor, protocolOfEndpoints, type Protocol } from "./protocol.js";
 import {
   deviceId,
   importVendorCredentials,
   isStale,
   readCredentials,
-  writeCredentials,
   type AuthMode,
   type Credentials,
 } from "./credentials.js";
 import { refreshToken, type FlowConfig } from "./oauth.js";
 import type { ModelInfo, ModelPricing } from "../types.js";
 
-export const DEFAULT_PROVIDER = "tokenrouter";
+export const DEFAULT_PROVIDER = ROUTER_PROVIDER;
 
 export interface SeedModel {
   id: string;
@@ -869,7 +869,7 @@ async function freshCredentials(def: ProviderDef, force = false): Promise<Creden
     // A login the vendor's own CLI already did counts as a login here too.
     const imported = def.importFrom ? importVendorCredentials(def.importFrom) : null;
     if (!imported) throw new Error(`${def.label} is not connected. Run: trc auth login --provider ${def.id}`);
-    creds = writeCredentials(def.id, imported);
+    creds = storeCredential(def.id, imported);
   }
   if (!def.modes[creds.mode]) {
     throw new Error(
@@ -890,7 +890,7 @@ async function freshCredentials(def: ProviderDef, force = false): Promise<Creden
   if (pending) return pending;
   const tried = creds;
   const job = (def.id === "openai" ? refreshChatgpt(creds, force) : refreshToken(def.oauth, creds))
-    .then((next) => def.id === "openai" ? next : writeCredentials(def.id, next))
+    .then((next) => def.id === "openai" ? next : storeCredential(def.id, next))
     .catch((err) => {
       // Another trc process may have renewed first: a host that rotates
       // refresh tokens then refuses ours as reused, while the fresh pair is

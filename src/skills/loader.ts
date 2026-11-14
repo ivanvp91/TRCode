@@ -219,12 +219,28 @@ export function validateSkill(skill: Skill, all: Skill[] = []): string[] {
   return out;
 }
 
-/** The catalogue block appended to the system prompt. */
+/**
+ * One scannable line for the catalogue. Descriptions are written for the model
+ * to choose by, but a large library in full comes to thousands of tokens on
+ * every request — the opening sentence carries the "when", and the rest of it
+ * is in the body, which is only paid for once a skill is loaded.
+ */
+export function catalogueLine(description: string, limit = 90): string {
+  const flat = description.replace(/\s+/g, " ").trim();
+  const first = /^(.{20,}?[.!?])(?=\s|$)/.exec(flat)?.[1] ?? flat;
+  if (first.length <= limit) return first;
+  const cut = first.slice(0, limit - 1);
+  const space = cut.lastIndexOf(" ");
+  const kept = space > limit * 0.6 ? cut.slice(0, space) : cut;
+  return kept.replace(/[\s,;:—–-]+$/, "") + "…";
+}
+
+/** The catalogue block of the system prompt. */
 export function skillsPromptSection(skills: Skill[]): string {
   if (!skills.length) return "";
-  const rows = skills.map((s) => `- ${s.name}: ${s.description}`).join("\n");
+  const rows = skills.map((s) => `- ${s.name}: ${catalogueLine(s.description)}`).join("\n");
   return `<skills>
-Skills are collapsed instructions for specific tasks. If a task matches a skill's description, CALL the skill tool with its name BEFORE starting work: the skill holds a proven procedure that outranks your default approach.
+Skills are collapsed instructions for specific tasks. Before the first tool call on a request, scan this list once, and CALL the skill tool for every skill whose description covers part of the task: the skill holds a proven procedure that outranks your default approach.
 - The user names a skill → load it, no judgement call. Several match → load each.
 - A skill serves the request it was loaded for; do not carry it into later, unrelated requests.
 - Load and read a skill yourself — do not delegate its instructions to a subagent.

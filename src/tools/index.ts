@@ -41,6 +41,12 @@ export interface RegistryOptions {
     confirmShell(command: string): Promise<boolean>;
     confirmWeb(kind: "search" | "fetch", target: string): Promise<boolean>;
   };
+  /**
+   * Plan mode: only tools that cannot change anything are offered. A filter on
+   * names rather than on risk classes — an MCP tool's class says nothing about
+   * whether it writes, so it is out.
+   */
+  planMode?: boolean;
 }
 
 function foregroundShell(): ToolDef {
@@ -79,6 +85,14 @@ export function buildTools(opts: RegistryOptions): ToolDef[] {
   tools.push(...mcpToolDefs());
 
   if (opts.subagentDeps) tools.push(makeTaskTool(opts.subagentDeps));
+
+  // Plan mode: reading, searching and asking only. The list is by name, so a
+  // tool added later is absent until it is deliberately allowed here — a
+  // forgotten tool can cost a plan, a leaked write tool costs the workspace.
+  if (opts.planMode) {
+    const safe = new Set(["read", "ls", "glob", "grep", "web_search", "fetch", "read_image", "todo", "ask_user_question", "memory", "skill"]);
+    return tools.filter((tool) => safe.has(tool.name));
+  }
 
   return tools;
 }

@@ -21,7 +21,7 @@ import { buildSystemPrompt } from "./prompt.js";
 import { stepCeiling } from "./loop.js";
 import { ApiError } from "../provider/client.js";
 import { UsageTracker, fmtTokens } from "../usage.js";
-import type { Effort } from "../config.js";
+import { loadConfig, type Effort } from "../config.js";
 import type { Message, ModelInfo, ToolDef } from "../types.js";
 import type { Skill } from "../skills/loader.js";
 
@@ -163,7 +163,7 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
         model: {
           type: "string",
           description:
-            "Model for the subagent, from this provider only. Defaults to the configured helper model, or the session's model in session mode. Omit unless told otherwise.",
+            "Model for the subagent, from the /subagents list — any connected provider, so a helper can run on another plan. Defaults to the first listed model, or the session's model in session mode. Omit unless told otherwise.",
           enum: modelIds.length ? modelIds : undefined,
         },
         read_only: {
@@ -231,8 +231,11 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
       const tag = `  ${c.brightBlue(`├ [${id}]`)}`;
       const act = deps.activity;
       // The bar measures progress against the same ceiling the run gets, so a
-      // helper that is about to be stopped reads ~100% rather than 40%.
-      const budget = stepCeiling(roleSteps(deps.maxSteps, role), 40);
+      // helper that is about to be stopped reads ~100% rather than 40%. The
+      // ceiling is the config's, not the session's: the main loop may be
+      // unlimited while a helper still needs a bound — or the other way round.
+      const ceiling = loadConfig().subagentSteps;
+      const budget = stepCeiling(roleSteps(deps.maxSteps, role), ceiling);
       const info: SubagentProgress = { id, label, model: wireModelId(model), steps: 0, maxSteps: budget, tokens: 0 };
       const spent = () => {
         const t = usage.totals();
@@ -270,7 +273,7 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
           catalog,
           usage,
           maxSteps: roleSteps(deps.maxSteps, role),
-          ceiling: 40,
+          ceiling,
           effort: role?.effort ?? deps.effortFor(model),
           systemPrompt,
           activity: step,
@@ -304,7 +307,8 @@ export function makeTaskTool(deps: SubagentDeps): ToolDef {
         }
         const capped =
           result.stoppedBecause === "max_steps"
-            ? `\n\n[the subagent hit its step limit — this result may be incomplete]`
+            ? `\n\n[the subagent stopped at its ${budget}-step ceiling — this result may be incomplete. ` +
+              `Send it a follow-up with agent_id ${id} to continue from here, or raise "subagentSteps" in the config.]`
             : result.stoppedBecause === "looping"
               ? `\n\n[the subagent was stopped: it kept repeating one tool call and made no progress — this result may be incomplete]`
             : "";

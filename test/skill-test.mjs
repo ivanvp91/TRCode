@@ -16,7 +16,7 @@ process.env.TRCODE_HOME = HOME;
 const REPO = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 
 const { discoverSkills } = await import("../dist/skills/loader.js");
-const { pickSkill, skillInjection, skillInterjector, stepText } = await import("../dist/skills/match.js");
+const { chooseSkills, pickSkill, skillChoice, skillInjection, skillInterjector, stepText } = await import("../dist/skills/match.js");
 
 let passed = 0;
 let failed = 0;
@@ -40,6 +40,17 @@ writeSkill("bodyless", "name: bodyless\ntriggers: nothing");
 // way a request is reduced ate the "a/b" and left a bare "тест", which then
 // matched — at full phrase score — every sentence that mentioned a test.
 writeSkill("experiments", "name: experiments\ndescription: Split tests\ntriggers: a/b тест, сплит-тест");
+// Two skills that a single short request fits equally well: the matcher must
+// not guess between them, it must hand the shortlist to the model.
+writeSkill("shots", "name: shots\ndescription: Capture the screen\ntriggers: скриншот, снимок экрана");
+writeSkill("screens", "name: screens\ndescription: Build a screen\ntriggers: экран, интерфейс");
+// A two-word trigger whose case the user has no reason to match. Russian puts
+// it in the accusative far more often than in the nominative.
+writeSkill("memory", "name: memory\ndescription: Find leaking memory\ntriggers: утечка памяти");
+// Nine characters, and a complete request.
+writeSkill("ci-fix", "name: ci-fix\ndescription: Fix failing checks\ntriggers: ci, почини ci");
+// A short stem that is also the beginning of an unrelated word.
+writeSkill("production", "name: production\ndescription: Check production hosts\ntriggers: прод");
 
 {
   const skills = discoverSkills(WORK);
@@ -62,11 +73,27 @@ writeSkill("experiments", "name: experiments\ndescription: Split tests\ntriggers
   check("a skill with auto: off never fires", pick("нужен деплой сервиса на прод") !== "quiet");
   check(
     "an already-loaded skill is not sent twice",
-    pickSkill(skills, "надо выкатить новую версию на прод", { exclude: new Set(["deploying"]) }) === null,
+    pickSkill(skills, "надо выкатить новую версию на прод", { exclude: new Set(["deploying"]) })?.skill.name !== "deploying",
   );
   check("no trigger, no pick", pick("посчитай сумму двух чисел в столбце") === null);
   check("a phrase trigger keeps the half that made it specific", pick("надо переписать тест на парсер конфига") === null);
   check("and still fires on the phrase itself", pick("давай запустим a/b тест лендинга на следующей неделе") === "experiments");
+  check("a phrase survives the case the request arrives in", pick("проанализируй утечку памяти") === "memory");
+  check("a short request still says what it wants", pick("почини ci") === "ci-fix");
+  check(
+    "a four-letter stem does not read as a longer, unrelated word",
+    pick("посмотри продажи за месяц и скажи как растём") === null,
+  );
+
+  // Two equally good procedures: neither body is sent, both go as a shortlist.
+  const tied = chooseSkills(skills, "сделай скриншот экрана");
+  const names = tied.rivals.map((r) => r.skill.name).sort();
+  check("a tie picks nothing", tied.pick === null, JSON.stringify(tied.pick?.skill.name));
+  check("a tie lists both contenders", names.join(",") === "screens,shots", names.join(","));
+  const offer = skillChoice(tied.rivals);
+  check("the shortlist names them for the model", offer.includes("shots") && offer.includes("screens"));
+  check("and tells it to call the skill tool", /CALL the skill tool/.test(offer));
+  check("a clear winner is still a pick, not a list", chooseSkills(skills, "надо выкатить новую версию на прод").rivals.length === 0);
 }
 
 // ── the shipped library, in both directions ─────────────────────────────────
@@ -179,6 +206,7 @@ writeSkill("experiments", "name: experiments\ndescription: Split tests\ntriggers
     session,
     skills: discoverSkills(REPO),
     loadedSkills: new Set(),
+    offeredSkills: new Set(),
   });
 
   quietly(() => app.autoLoadSkill("почини баг: падает с TypeError при пустом конфиге"));
@@ -191,10 +219,29 @@ writeSkill("experiments", "name: experiments\ndescription: Split tests\ntriggers
   quietly(() => app.autoLoadSkill("ещё один баг: падает на пустом конфиге, почини"));
   check("the same skill is not injected twice", session.messages.length === after);
 
+  // Two procedures fit equally: neither body goes, both names do. The repo
+  // library has no such pair at hand, so the fixtures from above are used.
+  app.skills = discoverSkills(WORK);
+  app.loadedSkills.clear();
+  app.offeredSkills.clear();
+  quietly(() => app.autoLoadSkill("сделай скриншот экрана"));
+  const offer = session.messages[session.messages.length - 1];
+  const offered = offer?.meta?.skillChoice ?? [];
+  check(
+    "a tie injects a shortlist instead of a body",
+    offered.includes("shots") && offered.includes("screens") && !offer?.meta?.skill,
+    JSON.stringify(offer?.meta),
+  );
+  check("the shortlist is not hidden from the model", !offer?.meta?.hidden);
+  const offeredAt = session.messages.length;
+  quietly(() => app.autoLoadSkill("сделай скриншот экрана"));
+  check("the same shortlist is not re-sent", session.messages.length === offeredAt);
+
   app.cfg.skillAuto = false;
   app.loadedSkills.clear();
+  const beforeOff = session.messages.length;
   quietly(() => app.autoLoadSkill("почини баг: падает с TypeError при пустом конфиге"));
-  check("skillAuto: false switches it off", session.messages.length === after);
+  check("skillAuto: false switches it off", session.messages.length === beforeOff);
 
   // The step-boundary half of the same wiring.
   app.cfg.skillAuto = true;

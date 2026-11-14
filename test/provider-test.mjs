@@ -302,7 +302,7 @@ ok("отсутствующий файл не роняет импорт", creds.i
       process.stdout.write = realWrite;
       app.exclusiveInput = realExclusive;
     }
-    ok("/login без имени берёт текущего провайдера", /Connect Kimi/.test(askedFor), askedFor.slice(0, 120));
+    ok("/login без имени берёт текущего провайдера", /Kimi — accounts/.test(askedFor), askedFor.slice(0, 160));
     ok("и не спрашивает ключ TokenRouter", !/TokenRouter key/.test(askedFor));
   }
 
@@ -961,6 +961,176 @@ ok("отсутствующий файл не роняет импорт", creds.i
     JSON.stringify(seen.map((b) => b.reasoning_effort)),
   );
   ok("и модель не записана как брезгующая", !client.modelRejectsEffort(model));
+
+  host.close();
+  creds.clearCredentials("opencode-go");
+  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
+}
+
+// ── обрывок JSON в аргументах вызова не отравляет ход ────────────────────
+// Muse обрывает вызов на середине объекта, а шаг, упёршийся в лимит вывода,
+// оставляет половину. Строгий хост отвечает на такой function_call 400
+// «`arguments` must be valid JSON» — и повторяет это КАЖДОМУ следующему шагу,
+// потому что фрагмент живёт в истории. История хранит фрагмент (модель видит
+// его в тексте ошибки), на провод уходит пустой объект.
+{
+  const seen = [];
+  const strictArgs = (body) => {
+    const calls = Array.isArray(body?.input)
+      ? body.input.filter((i) => i.type === "function_call").map((i) => i.arguments)
+      : (body?.messages ?? []).flatMap((m) => (m.tool_calls ?? []).map((tc) => tc.function?.arguments));
+    return calls.every((raw) => {
+      try {
+        const parsed = JSON.parse(raw ?? "");
+        return Boolean(parsed) && typeof parsed === "object" && !Array.isArray(parsed);
+      } catch {
+        return false;
+      }
+    });
+  };
+  const host = http.createServer((req, res) => {
+    let raw = "";
+    req.on("data", (d) => (raw += d));
+    req.on("end", () => {
+      const body = JSON.parse(raw);
+      seen.push({ url: req.url, body });
+      if (!strictArgs(body)) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        return res.end(JSON.stringify({ error: { code: "invalid_request_error", message: "`arguments` must be valid JSON" } }));
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify(
+          String(req.url ?? "").includes("/responses")
+            ? { status: "completed", output_text: "ок" }
+            : { choices: [{ message: { content: "ок" } }] },
+        ),
+      );
+    });
+  });
+  await new Promise((r) => host.listen(0, "127.0.0.1", r));
+
+  const savedKey = loadConfig().apiKey;
+  creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
+  saveConfig({ apiKey: "", providers: { "opencode-go": { baseUrl: `http://127.0.0.1:${host.address().port}` } } });
+
+  const client = await import("../dist/provider/client.js");
+  const messages = [
+    { role: "user", content: "почини сборку" },
+    { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "shell", arguments: '{"command":"cargo bu' } }] },
+    { role: "tool", tool_call_id: "c1", name: "shell", content: "Could not parse the arguments: invalid JSON" },
+    { role: "assistant", content: null, tool_calls: [{ id: "c2", type: "function", function: { name: "read", arguments: '{"path":"a.ts"}' } }] },
+    { role: "tool", tool_call_id: "c2", name: "read", content: "файл" },
+  ];
+
+  const chat = await client.complete({ model: "opencode-go:glm-5.3-flash", conversationId: "sess-broken-args", messages });
+  ok("chat: ход прошёл, хотя в истории обрывок", chat.content === "ок", JSON.stringify(chat.content));
+  const chatCalls = (seen[0]?.body?.messages ?? []).flatMap((m) => m.tool_calls ?? []);
+  ok("chat: обрывок заменён пустым объектом", chatCalls[0]?.function?.arguments === "{}", JSON.stringify(chatCalls[0]));
+  ok("chat: целые аргументы не тронуты", chatCalls[1]?.function?.arguments === '{"path":"a.ts"}', JSON.stringify(chatCalls[1]));
+
+  const muse = await client.complete({ model: "opencode-go:muse-spark-1.3-contributor", conversationId: "sess-broken-args-muse", messages });
+  ok("responses: ход прошёл, хотя в истории обрывок", muse.content === "ок", JSON.stringify(muse.content));
+  const respCalls = (seen[1]?.body?.input ?? []).filter((i) => i.type === "function_call");
+  ok("responses: обрывок заменён пустым объектом", respCalls[0]?.arguments === "{}", JSON.stringify(respCalls[0]));
+  ok("responses: целые аргументы не тронуты", respCalls[1]?.arguments === '{"path":"a.ts"}', JSON.stringify(respCalls[1]));
+
+  host.close();
+  creds.clearCredentials("opencode-go");
+  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
+}
+
+// ── лимит, который снимается через дни, не высиживается ──────────────────
+// Недельный лимит плана отвечает 429 «resets in 2d 6h» и Retry-After под
+// стать. Раньше клиент честно ждал эти сутки с лишним: в транскрипте висел
+// отсчёт «waiting ~54h 55m», терминал стоял без ответа, а после четырёх
+// минут тишины спрашивал «Keep waiting». Такую паузу не переждать в рамках
+// хода, поэтому она не берётся вовсе — ход сразу заканчивается словами хоста.
+{
+  let requests = 0;
+  const waits = [];
+  const host = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      requests++;
+      res.writeHead(429, { "Content-Type": "application/json", "Retry-After": String(54 * 3600 + 3000) });
+      res.end(
+        JSON.stringify({
+          error: {
+            message:
+              "OpenCode Go usage limit reached (weekly, resets in 2d 6h). To keep going now, turn on Extra Usage: https://opencode.ai/workspace/wrk_01/billing",
+          },
+        }),
+      );
+    });
+  });
+  await new Promise((r) => host.listen(0, "127.0.0.1", r));
+
+  const savedKey = loadConfig().apiKey;
+  creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
+  saveConfig({ apiKey: "", providers: { "opencode-go": { baseUrl: `http://127.0.0.1:${host.address().port}` } } });
+
+  const client = await import("../dist/provider/client.js");
+  const at = Date.now();
+  let thrown = null;
+  try {
+    await client.complete({
+      model: "opencode-go:glm-5.3-flash",
+      messages: [{ role: "user", content: "hi" }],
+      onRateWait: (ms, model) => waits.push({ ms, model }),
+    });
+  } catch (err) {
+    thrown = err;
+  }
+  const elapsed = Date.now() - at;
+
+  ok("отказ возвращается сразу, а не через сутки", elapsed < 3000, `${elapsed}ms`);
+  ok("и это 429", thrown?.status === 429, String(thrown?.status));
+  ok("сказано, сколько ждать по словам хоста", /wait 2d 6h/.test(thrown?.message ?? ""), thrown?.message);
+  ok("и что ждать бесполезно", /longer than a turn will wait/.test(thrown?.message ?? ""), thrown?.message);
+  ok("слова хоста о сбросе сохранены", /resets in 2d 6h/.test(thrown?.message ?? ""), thrown?.message);
+  ok("повторов не было", requests === 1, String(requests));
+  ok("ожидание не объявлялось", waits.length === 0, JSON.stringify(waits));
+
+  host.close();
+  creds.clearCredentials("opencode-go");
+  saveConfig({ apiKey: savedKey, providers: {} }, { replace: ["providers"] });
+}
+
+// Тот же лимит, но прокси срезал Retry-After: время сброса осталось только
+// словами. Восемь двадцатисекундных повторов тут ничего не выяснят — сброс
+// назван в тексте, и он за пределами хода.
+{
+  let requests = 0;
+  const host = http.createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      requests++;
+      res.writeHead(429, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          error: { message: "You have reached your weekly limit for this account. Try again in 18 hours." },
+        }),
+      );
+    });
+  });
+  await new Promise((r) => host.listen(0, "127.0.0.1", r));
+
+  const savedKey = loadConfig().apiKey;
+  creds.writeCredentials("opencode-go", { mode: "apikey", accessToken: "sk-go-key" });
+  saveConfig({ apiKey: "", providers: { "opencode-go": { baseUrl: `http://127.0.0.1:${host.address().port}` } } });
+
+  const client = await import("../dist/provider/client.js");
+  const at = Date.now();
+  let thrown = null;
+  try {
+    await client.complete({ model: "opencode-go:glm-5.3-flash", messages: [{ role: "user", content: "hi" }] });
+  } catch (err) {
+    thrown = err;
+  }
+  ok("сброс в тексте без Retry-After: отказ сразу", Date.now() - at < 3000, `${Date.now() - at}ms`);
+  ok("и названное время прочитано", /wait 18h/.test(thrown?.message ?? ""), thrown?.message);
+  ok("повторов и здесь не было", requests === 1, String(requests));
 
   host.close();
   creds.clearCredentials("opencode-go");

@@ -69,7 +69,7 @@ const { normalizePlan } = await import("../dist/agent/orchestrator.js");
 const { releaseStdin, hasConsumer } = await import("../dist/ui/stdin.js");
 const { createSpillStore } = await import("../dist/tools/spill.js");
 const { UsageTracker } = await import("../dist/usage.js");
-saveConfig({ toolConcurrency: 2, maxSteps: 5, skillsEnabled: false, autoCompact: false, subagentMode: { tokenrouter: "session" } });
+saveConfig({ toolConcurrency: 2, maxSteps: 5, skillsEnabled: false, autoCompact: false, subagentMode: "session" });
 let edits = 0;
 const toolCall = (name, id = name) => ({ id, type: "function", function: { name, arguments: "{}" } });
 const tools = [
@@ -115,8 +115,8 @@ function delegationApp() {
   return app;
 }
 function manualSubagents() {
-  saveConfig({ subagentAuto: { tokenrouter: false }, subagentMode: { tokenrouter: "session" }, subagentModels: {} },
-    { replace: ["subagentAuto", "subagentMode", "subagentModels"] });
+  saveConfig({ subagentAuto: { tokenrouter: false }, subagentMode: "session", subagentModels: [] },
+    { replace: ["subagentAuto"] });
 }
 let passed = 0;
 async function test(name, work) {
@@ -536,8 +536,8 @@ try {
   });
 
   await test("approval precedes missing-model selection; the selected helper model actually runs", async () => {
-    saveConfig({ subagentAuto: { tokenrouter: false }, subagentMode: {}, subagentModels: {} },
-      { replace: ["subagentAuto", "subagentMode", "subagentModels"] });
+    saveConfig({ subagentAuto: { tokenrouter: false }, subagentMode: undefined, subagentModels: [] },
+      { replace: ["subagentAuto"] });
     const app = delegationApp();
     handle = delegationProvider();
     const running = app.turn("inspect");
@@ -548,7 +548,7 @@ try {
     key("\x1b[B"); key(" "); key("\r");
     await running;
     finished(app);
-    assert.deepEqual(loadConfig().subagentModels.tokenrouter, ["mock-b"]);
+    assert.deepEqual(loadConfig().subagentModels, ["mock-b"]);
     assert.equal(calls.filter(isHelper)[0].model, "mock-b");
     const nextLead = calls.filter((p) => !isHelper(p)).at(-1);
     assert.deepEqual(nextLead.tools.find((t) => t.function.name === "task").function.parameters.properties.model.enum, ["mock-b"]);
@@ -556,8 +556,8 @@ try {
   });
 
   await test("explicit delegation opens missing-model selection without an extra approval", async () => {
-    saveConfig({ subagentAuto: { tokenrouter: false }, subagentMode: {}, subagentModels: {} },
-      { replace: ["subagentAuto", "subagentMode", "subagentModels"] });
+    saveConfig({ subagentAuto: { tokenrouter: false }, subagentMode: undefined, subagentModels: [] },
+      { replace: ["subagentAuto"] });
     const app = delegationApp();
     handle = delegationProvider();
     const running = app.turn("Use subagents to inspect the project");
@@ -565,7 +565,7 @@ try {
     assert(!approvalVisible());
     key("\r"); await running;
     finished(app);
-    assert.equal(loadConfig().subagentMode.tokenrouter, "session");
+    assert.equal(loadConfig().subagentMode, "session");
     assert.equal(calls.filter(isHelper)[0].model, "mock-a");
   });
 
@@ -584,8 +584,8 @@ try {
   });
 
   await test("cancelling required model selection launches no helper", async () => {
-    saveConfig({ subagentAuto: { tokenrouter: true }, subagentMode: {}, subagentModels: {} },
-      { replace: ["subagentAuto", "subagentMode", "subagentModels"] });
+    saveConfig({ subagentAuto: { tokenrouter: true }, subagentMode: undefined, subagentModels: [] },
+      { replace: ["subagentAuto"] });
     const app = delegationApp();
     handle = delegationProvider();
     const running = app.turn("inspect");

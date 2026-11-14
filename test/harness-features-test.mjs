@@ -25,14 +25,25 @@ const check = (name, cond, detail = "") => {
 // Every chat request is answered with one line of text, and its body kept.
 const bodies = [];
 let reply = "ГОТОВО";
+// >0: the answer is one more tool call, like a helper that never runs out of work.
+let toolMode = 0;
 globalThis.fetch = async (url, init) => {
   const body = JSON.parse(init?.body ?? "{}");
   bodies.push(body);
-  const sse = [
+  const text = [
     { choices: [{ index: 0, delta: { role: "assistant", content: reply }, finish_reason: null }] },
     { choices: [{ index: 0, delta: {}, finish_reason: "stop" }] },
     { choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } },
-  ].map((o) => `data: ${JSON.stringify(o)}\n\n`).join("") + "data: [DONE]\n\n";
+  ];
+  const call = toolMode > 0
+    ? [
+        { choices: [{ index: 0, delta: { role: "assistant", content: "Сейчас проверю ещё раз:" }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: `call_${toolMode--}`, type: "function", function: { name: "read", arguments: '{"path":"a.ts"}' } }] }, finish_reason: null }] },
+        { choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }] },
+        { choices: [], usage: { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 } },
+      ]
+    : text;
+  const sse = call.map((o) => `data: ${JSON.stringify(o)}\n\n`).join("") + "data: [DONE]\n\n";
   return new Response(sse, { status: 200, headers: { "content-type": "text/event-stream" } });
 };
 
@@ -122,6 +133,34 @@ const toolNames = (b) => (b.tools ?? []).map((t) => t.function?.name ?? t.name);
 
   registry.bind("session-a");
   check("a new session empties the registry", registry.ids().length === 0);
+}
+
+// ── the helper's step ceiling ─────────────────────────────────────────────
+// A delegated run is not capped by the session's maxSteps (0 by default), so
+// a helper used to stop dead at a hardcoded forty with a preamble for a result.
+// The ceiling is its own config key now, and a stopped helper says how to go on.
+{
+  const { stepCeiling } = await import("../dist/agent/loop.js");
+  const { loadConfig } = await import("../dist/config.js");
+  check("helpers are not capped by default", loadConfig().subagentSteps === 0);
+  check("a session ceiling reaches an uncapped helper", stepCeiling(20, 0) === 20 && stepCeiling(0, 0) === 0);
+  check("a helper's own ceiling holds under an unlimited session", stepCeiling(0, 40) === 40);
+  check("the tighter of the two wins", stepCeiling(20, 40) === 20 && stepCeiling(40, 20) === 20);
+
+  saveConfig({ subagentSteps: 2 }, { replace: ["subagentSteps"] });
+  const parent = new UsageTracker();
+  const tool = makeTaskTool({
+    cwd: WORK, catalog, skills: [], tools: () => [readTool, writeTool],
+    defaultModel: "mock-fast", effortFor: () => "off", maxSteps: 0, usage: parent,
+  });
+  toolMode = 5;
+  const capped = await tool.run({ description: "правка", prompt: "продолжай" }, ctx());
+  toolMode = 0;
+  check("a helper that spends its budget is not a hard failure", !capped.isError, capped.output);
+  check("the note names the ceiling it stopped at", /2-step ceiling/.test(capped.output), capped.output);
+  check("and says how to continue", /follow-up with agent_id \d+/.test(capped.output) && /subagentSteps/.test(capped.output), capped.output);
+  check("the last preamble is not passed off as an answer", /Сейчас проверю ещё раз/.test(capped.output) && /may be incomplete/.test(capped.output), capped.output);
+  saveConfig({ subagentSteps: 0 }, { replace: ["subagentSteps"] });
 }
 
 // ── registry cap ──────────────────────────────────────────────────────────

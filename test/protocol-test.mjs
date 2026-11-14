@@ -7,7 +7,7 @@ const ok = (name, cond, detail = "") => {
 };
 const results = [];
 
-const { toResponsesInput, buildResponsesBody, ResponsesStreamParser } = await import("../dist/provider/responses.js");
+const { toResponsesInput, buildResponsesBody, ResponsesStreamParser, parseResponsesResult } = await import("../dist/provider/responses.js");
 const { toAnthropicMessages, buildAnthropicBody, AnthropicStreamParser } = await import("../dist/provider/anthropic.js");
 const { protocolOf } = await import("../dist/provider/protocol.js");
 const { trimForRequest, historySize } = await import("../dist/session/trim.js");
@@ -39,6 +39,20 @@ ok("responses: инструменты плоские", rBody.tools?.[0]?.type ==
 ok("responses: reasoning.effort", JSON.stringify(rBody.reasoning) === '{"effort":"high"}');
 ok("responses: без messages", rBody.messages === undefined && Array.isArray(rBody.input));
 
+// The host refuses the whole request over a function_call whose `arguments` is
+// not JSON — Meta's Muse answers "`arguments` must be valid JSON" and then says
+// it to every later step too, because the fragment stays in the history.
+const brokenArgs = [
+  { role: "user", content: "почини сборку" },
+  { role: "assistant", content: null, tool_calls: [{ id: "c1", type: "function", function: { name: "shell", arguments: '{"command":"cargo bu' } }] },
+  { role: "tool", tool_call_id: "c1", name: "shell", content: "Could not parse the arguments" },
+  { role: "assistant", content: null, tool_calls: [{ id: "c2", type: "function", function: { name: "read", arguments: '{"path":"a.ts"}' } }] },
+  { role: "tool", tool_call_id: "c2", name: "read", content: "файл" },
+];
+const repaired = toResponsesInput(brokenArgs).input.filter((i) => i.type === "function_call");
+ok("responses: обрывок аргументов уходит пустым объектом", repaired[0]?.arguments === "{}", JSON.stringify(repaired[0]));
+ok("responses: целые аргументы не тронуты", repaired[1]?.arguments === '{"path":"a.ts"}', JSON.stringify(repaired[1]));
+
 const rp = new ResponsesStreamParser();
 const rText = [];
 for (const ev of rp.handle({ type: "response.output_text.delta", delta: "При" })) rText.push(ev.text);
@@ -51,6 +65,20 @@ const rRes = rp.result();
 ok("responses: текст собран", rText.join("") === "Привет", rText.join(""));
 ok("responses: tool-call собран", rRes.toolCalls[0]?.function?.arguments === '{"path":"a.ts"}', JSON.stringify(rRes.toolCalls));
 ok("responses: usage", rRes.usage?.prompt_tokens === 100 && rRes.usage?.completion_tokens === 20);
+
+// A host that forwards the model's own object instead of its JSON text used to
+// leave "[object Object]" in the call — unparseable, and replayed every step.
+const rpObj = new ResponsesStreamParser();
+rpObj.handle({ type: "response.output_item.added", item: { type: "function_call", id: "i2", call_id: "call_10", name: "shell" } });
+rpObj.handle({ type: "response.output_item.done", item: { type: "function_call", id: "i2", call_id: "call_10", name: "shell", arguments: { command: "ls" } } });
+rpObj.handle({ type: "response.completed", response: { status: "completed" } });
+const rObj = rpObj.result();
+ok("responses: аргументы объектом становятся JSON", rObj.toolCalls[0]?.function?.arguments === '{"command":"ls"}', JSON.stringify(rObj.toolCalls));
+const rFlat = parseResponsesResult({
+  status: "completed",
+  output: [{ type: "function_call", call_id: "c3", name: "shell", arguments: { command: "pwd" } }],
+});
+ok("responses: то же в не стримовом ответе", rFlat.toolCalls[0]?.function?.arguments === '{"command":"pwd"}', JSON.stringify(rFlat.toolCalls));
 
 // ── Anthropic ─────────────────────────────────────────────────────────────
 const a = toAnthropicMessages(history);

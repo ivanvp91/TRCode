@@ -18,7 +18,8 @@ import {
 import { buildResponsesBody, parseResponsesResult, ResponsesStreamParser } from "./responses.js";
 import { AnthropicStreamParser, buildAnthropicBody, parseAnthropicResult } from "./anthropic.js";
 import { DEFAULT_MAX_TOKENS, THINKING_BUDGET } from "./anthropic.js";
-import { normalizeToolSchema } from "./schema.js";
+import { normalizeToolSchema, wireToolArgs } from "./schema.js";
+import { accountsOf } from "./accounts.js";
 
 export interface ChatRequest {
   model: string;
@@ -35,8 +36,13 @@ export interface ChatRequest {
    * Asked when the stream has been silent for a while: true keeps waiting
    * (the connection stays open), false aborts. Without it the silence limit
    * is a hard cut — the right behaviour when there is nobody to ask.
+   *
+   * `resolved` aborts the moment the stream has data again: the question is
+   * then moot, and leaving it on screen means the next keypress lands in a
+   * prompt about a stall that is already over — under an answer that the
+   * prompt's own repaint then clears.
    */
-  onStall?: (idleMs: number) => Promise<boolean>;
+  onStall?: (idleMs: number, resolved: AbortSignal) => Promise<boolean>;
   /**
    * Called when the send is held back by a learned rate limit, so the UI can
    * show that a minute is being waited out instead of looking like a hang.
@@ -456,7 +462,14 @@ function wireMessages(messages: Message[], opts: { reasoningBack?: boolean } = {
       // never goes on the wire: "name" is not part of the tool-message schema,
       // and a strict gateway rejects the whole request over it (400 messages[3]:
       // "name" is not supported by this endpoint) instead of ignoring it.
-      if (m.tool_calls?.length) out.tool_calls = m.tool_calls;
+      // Same reason the Responses adapter fixes them: a fragment of JSON from a
+      // cut-off call is replayed forever, and a strict host refuses the whole
+      // request over it (400 "`arguments` must be valid JSON").
+      if (m.tool_calls?.length)
+        out.tool_calls = m.tool_calls.map((tc) => ({
+          ...tc,
+          function: { ...tc.function, arguments: wireToolArgs(tc.function.arguments) },
+        }));
       if (m.tool_call_id) out.tool_call_id = m.tool_call_id;
       // DeepSeek's thinking mode refuses a later step that does not carry back
       // what the assistant thought when it asked for tools: "The reasoning_content
@@ -625,6 +638,50 @@ function windowFromMessage(body: string): number | undefined {
   return Number.isFinite(ms) && ms > 0 ? ms : undefined;
 }
 
+/** "55m", "6h 04m", "2d 6h" — a named wait can be days, not minutes. */
+function waitWords(ms: number): string {
+  const total = Math.max(0, Math.round(ms / 1000));
+  if (total < 60) return `${total}s`;
+  const m = Math.floor(total / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return m % 60 ? `${h}h ${String(m % 60).padStart(2, "0")}m` : `${h}h`;
+  const d = Math.floor(h / 24);
+  return h % 24 ? `${d}d ${h % 24}h` : `${d}d`;
+}
+
+/**
+ * "resets in 2d 6h", "try again in 18 hours" — a day-scale wait named in prose.
+ * Some routers strip Retry-After; the plan limit still says when it lifts, and
+ * no retry inside a turn reaches that. Only days and hours count here: a window
+ * of minutes is a normal limit and is spelled out elsewhere.
+ */
+function dayScaleWait(body: string): number | undefined {
+  const m = /(?:reset(?:s)?|retry|try again|available)[^.\n]{0,24}?\b(\d+)\s*(days?|d|hours?|hrs?|h)\b/i.exec(body);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  return Number.isFinite(n) && n > 0 ? n * (/^d/i.test(m[2]) ? 86_400_000 : 3_600_000) : undefined;
+}
+
+/**
+ * A 429 whose named wait is longer than a turn can ever afford — a weekly plan
+ * limit states its reset, and hosts like OpenCode Go send a Retry-After to
+ * match. Retrying is not a thing that fixes this, so the wait is refused and
+ * the turn ends with the host's own words about when the limit lifts.
+ */
+function limitExhausted(waitMs: number, body: string, provider?: string): ApiError {
+  const detail = extractError(body);
+  const pool = provider && accountsOf(provider).length > 1
+    ? ` This provider has ${accountsOf(provider).length} credentials saved — switch with /accounts.`
+    : "";
+  return new ApiError(
+    `429 — the limit is reached and the host asks to wait ${waitWords(waitMs)} before the next request, longer than a turn will wait. ` +
+      `Switch models with /model, or send again after the limit resets.${pool}${detail ? ` (${detail})` : ""}`,
+    429,
+    body,
+  );
+}
+
 async function postWithRetry(
   model: string,
   path: string,
@@ -637,11 +694,13 @@ async function postWithRetry(
   const cfg = loadConfig();
   const maxUpstream = Math.max(0, cfg.upstreamRetries ?? UPSTREAM_RETRIES);
   const upstreamDelay = Math.max(0, cfg.upstreamRetryDelayMs ?? UPSTREAM_RETRY_DELAY_MS);
+  const providerId = splitModelId(model).providerId;
   let rateRetries = 0;
   let rateWaited = 0;
   let transientRetries = 0;
   let upstreamRetries = 0;
   let authRenewed = false;
+
   for (;;) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     let res: Response;
@@ -664,20 +723,24 @@ async function postWithRetry(
     // and resend before reporting the key as bad.
     if (res.status === 401 && !authRenewed) {
       authRenewed = true;
-      if (await abortable(renewRejectedToken(splitModelId(model).providerId), signal)) continue;
+      if (await abortable(renewRejectedToken(providerId), signal)) continue;
     }
     const err = new ApiError(describeStatus(res.status, text, model), res.status, text, res.headers.get("x-request-id") ?? undefined);
     if (!RETRYABLE.has(res.status)) throw err;
-    const rateLimited = res.status === 429;
-    if (rateLimited ? rateRetries >= RATE_LIMIT_RETRIES || rateWaited >= RATE_LIMIT_PATIENCE_MS : upstreamRetries >= maxUpstream) throw err;
-    if (rateLimited) {
+    if (res.status === 429) {
       // The host's own idea of "when" wins: Retry-After first, then the
-      // window spelled out in the message, then the fallback.
+      // window spelled out in the message, then a day-scale reset named in
+      // prose, then the fallback.
       const retryAfter = Number(res.headers.get("retry-after"));
-      const waitMs =
-        (Number.isFinite(retryAfter) && retryAfter > 0
-          ? retryAfter * 1000
-          : windowFromMessage(text) ?? RATE_LIMIT_FALLBACK_MS) + RATE_LIMIT_MARGIN_MS;
+      const named = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : windowFromMessage(text);
+      const waitMs = (named ?? dayScaleWait(text) ?? RATE_LIMIT_FALLBACK_MS) + RATE_LIMIT_MARGIN_MS;
+      if (rateRetries >= RATE_LIMIT_RETRIES || rateWaited >= RATE_LIMIT_PATIENCE_MS) throw err;
+      // Patience caps the wait itself, not merely its sum: a plan limit names
+      // days ("weekly, resets in 2d 6h", with a Retry-After to match), no
+      // amount of waiting inside a turn reaches that, and sleeping it leaves
+      // the user watching an hours-long countdown for an answer that cannot
+      // come. Say when it lifts and end the turn instead.
+      if (waitMs > RATE_LIMIT_PATIENCE_MS) throw limitExhausted(waitMs, text, providerId);
       rateRetries++;
       rateWaited += waitMs;
       // Only ever here: a wait the host asked for, after a refusal it sent.
@@ -685,6 +748,7 @@ async function postWithRetry(
       await sleep(waitMs, signal);
       continue;
     }
+    if (upstreamRetries >= maxUpstream) throw err;
     const retryAfter = Number(res.headers.get("retry-after"));
     const waitMs = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1000 : upstreamDelay;
     upstreamRetries++;
@@ -1004,31 +1068,46 @@ class ToolCallAccumulator {
 function withIdleWatchdog(
   external: AbortSignal | undefined,
   idleMs: number,
-  onStall?: (idleMs: number) => Promise<boolean>,
+  onStall?: (idleMs: number, resolved: AbortSignal) => Promise<boolean>,
 ) {
   const controller = new AbortController();
   let timer: NodeJS.Timeout | null = null;
   let timedOut = false;
+  let stopped = false;
   /** Bumped on every byte; a stall answer from before the bump is stale. */
   let gen = 0;
+  /** The question on screen, if any; its signal is how the screen lets it go. */
+  let asking: AbortController | null = null;
 
-  const onExternalAbort = () => controller.abort();
+  const dismiss = () => {
+    const q = asking;
+    asking = null;
+    q?.abort();
+  };
+
+  const onExternalAbort = () => {
+    dismiss();
+    controller.abort();
+  };
   external?.addEventListener("abort", onExternalAbort, { once: true });
   if (external?.aborted) controller.abort();
 
   const expire = async () => {
     if (onStall && !controller.signal.aborted) {
       const g = gen;
+      const resolved = new AbortController();
+      asking = resolved;
       let keep = false;
       try {
-        keep = await onStall(idleMs);
+        keep = await onStall(idleMs, resolved.signal);
       } catch {
         keep = false;
       }
-      // Data arrived while the question was on screen: the stall resolved
-      // itself, and an "abort" answer no longer refers to anything.
-      if (gen !== g) return;
-      if (keep && !controller.signal.aborted) {
+      if (asking === resolved) asking = null;
+      // Data arrived while the question was on screen, or the request is over:
+      // the answer no longer refers to anything.
+      if (stopped || gen !== g || controller.signal.aborted) return;
+      if (keep) {
         arm();
         return;
       }
@@ -1038,19 +1117,23 @@ function withIdleWatchdog(
   };
 
   const arm = () => {
+    if (stopped) return;
     if (timer) clearTimeout(timer);
     timer = setTimeout(() => void expire(), idleMs);
   };
 
   const kick = () => {
     gen++;
+    dismiss();
     arm();
   };
 
   const stop = () => {
+    stopped = true;
     if (timer) clearTimeout(timer);
     timer = null;
     external?.removeEventListener("abort", onExternalAbort);
+    dismiss();
   };
 
   arm();

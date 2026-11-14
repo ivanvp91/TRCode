@@ -7,16 +7,18 @@ import { error, hint, info, line, padded, plural, renderMarkdownBlock, rule, Spi
 import { pick } from "./picker.js";
 import { choose } from "./choice.js";
 import { toggleFavorite } from "./modelpicker.js";
-import { askSecret } from "./secret.js";
+import { askForm } from "./form.js";
+import { registerAccount } from "../provider/accounts.js";
 import { askLine } from "./prompt.js";
 import { scanKeys } from "./keyscan.js";
 import { setExtraNewlineKeys } from "./editor.js";
-import { loadConfig, saveConfig, configPath, rememberProjectState, VERSION, EFFORT_LEVELS, LANGUAGES, type Effort, type Lang } from "../config.js";
+import { loadConfig, saveConfig, configPath, rememberProjectState, VERSION, EFFORT_LEVELS, LANGUAGES, type Effort, type Lang, type PermissionMode } from "../config.js";
+import { validateRuleText } from "../permissionRules.js";
 import { fetchModels, resolveModelId, findModel } from "../provider/models.js";
 import { protocolFor } from "../provider/protocol.js";
 import { verifyKey, modelRejectsEffort, modelRejectsCache, resetEffortLearning } from "../provider/client.js";
-import { DEFAULT_PROVIDER, providerById, providers, rememberProviderState, wireModelId } from "../provider/registry.js";
-import { loginProvider } from "./login.js";
+import { DEFAULT_PROVIDER, modeFor, providerById, providers, rememberProviderState, wireModelId } from "../provider/registry.js";
+import { loginProvider, suggestName } from "./login.js";
 import { Session } from "../session/session.js";
 import { contextPressure } from "../session/compact.js";
 import { loadProjections } from "../session/projection.js";
@@ -44,7 +46,7 @@ import { allTipIds } from "./tips.js";
 import type { App } from "./repl.js";
 import { GROUP_ORDER, groupLabel, effortHint, txt, type Command, parseTokens, currentProviderId, setModel, warnIfIncompatible } from "./commands/shared.js";
 import { goalCommand } from "./commands/goal.js";
-import { switchToProvider, refreshCatalog, setDefaultProvider, setProviderHost, logoutFromProvider, settingsModal, runUpdate, modelModal, providerModal, favModal, setAutoCompact } from "./commands/providers.js";
+import { switchToProvider, refreshCatalog, setDefaultProvider, setProviderHost, logoutFromProvider, settingsModal, runUpdate, modelModal, providerModal, favModal, setAutoCompact, accountsModal } from "./commands/providers.js";
 import { brainPanel, brainNeedsPanel, brainPanelModal, brainModal, swarmPanelModal, swarmModal, addSubagentModel, setSubagentMode, setSubagentAuto, subagentsModal } from "./commands/agents.js";
 import { setSkillsEnabled, editSkill, skillGenPrompt, skillsModal, checkSkills } from "./commands/skills.js";
 import { statModal } from "./commands/stat.js";
@@ -52,6 +54,8 @@ import { uiLibraryModal, renderMatches, blendUiEntries, startBlendTurn, uilibCap
 import { openSession, browseSessions, eraseSessions, rewindTurn, forkTurn, compactNow, expandCollapsed, editTurn } from "./commands/sessions.js";
 import { ensureWriterChosen, chooseWriter } from "./commands/writer.js";
 import { mediaCommand, videoCommand } from "./commands/media.js";
+import { hooksCommand, commandsListCommand } from "./commands/hooks.js";
+import { discoverCustomCommands, expandCustomCommand, findCustomCommand } from "./commands/custom.js";
 export { rememberCurrent } from "./commands/providers.js";
 export { subagentsModal } from "./commands/agents.js";
 export { periodSlice, foldUsage } from "./commands/stat.js";
@@ -283,6 +287,23 @@ const COMMANDS: Command[] = [
       } else {
         success(t("YOLO off — confirmations are back.", "YOLO выключен — подтверждения вернулись."));
         hint(t("Shift+Tab flips it without typing a command.", "Shift+Tab переключает это без команды."));
+      }
+    },
+  },
+  {
+    name: "/plan",
+    group: "main",
+    args: () => t("[on|off]", "[on|off]"),
+    help: () => t("plan first: explore and propose, nothing changes until you approve", "сначала план: изучение и предложение, ничего не меняется до одобрения"),
+    async run(app, rest) {
+      const arg = rest.trim().toLowerCase();
+      const next = arg ? ["on", "1", "true", "yes"].includes(arg) : !app.planMode;
+      app.setPlanMode(next);
+      if (next) {
+        warn(t("Plan mode on — the agent reads and searches, then proposes a plan.", "Режим плана включён — агент читает и ищет, затем предлагает план."));
+        hint(t("Tools that change anything are not offered. Turn it off with /plan off.", "Инструменты, которые что-то меняют, не предлагаются. Выключить: /plan off."));
+      } else {
+        success(t("Plan mode off — the full tool set is back.", "Режим плана выключен — полный набор инструментов вернулся."));
       }
     },
   },
@@ -535,7 +556,7 @@ const COMMANDS: Command[] = [
       if (/^models?\s+\S/i.test(arg)) {
         return void addSubagentModel(app, arg.replace(/^models?\s+/i, "").trim());
       }
-      if (/^(session|reset|any|all)$/i.test(arg)) return void setSubagentMode(app, "session");
+      if (/^(session|reset)$/i.test(arg)) return void setSubagentMode(app, "session");
       if (/^lists?$/i.test(arg)) return void setSubagentMode(app, "list");
       await subagentsModal(app);
     },
@@ -1054,32 +1075,98 @@ const COMMANDS: Command[] = [
   {
     name: "/permissions",
     group: "settings",
-    args: () => t("[class] [ask|allow|deny]", "[класс] [ask|allow|deny]"),
-    help: () => t("confirmation rules", "правила подтверждений"),
+    args: () => t("[class] [ask|allow|deny] · [allow|ask|deny] <rule> · remove <rule|#> · clear", "[класс] [ask|allow|deny] · [allow|ask|deny] <правило> · remove <правило|#> · clear"),
+    help: () => t("confirmation rules: per class and per pattern", "правила подтверждений: по классам и по шаблонам"),
     async run(_app, rest) {
       const cfg = loadConfig();
-      const [risk, mode] = rest.trim().split(/\s+/);
-      if (!risk) {
-        line();
-        for (const [k, v] of Object.entries(cfg.permissions)) {
-          const color = v === "allow" ? c.green : v === "deny" ? c.red : c.yellow;
-          padded(`${k.padEnd(10)} ${color(v)}`);
-        }
-        line();
-        hint("Change with: /permissions shell allow");
-        return;
+      const words = rest.trim().split(/\s+/).filter(Boolean);
+      const [first, ...tail] = words;
+
+      // ── patterns ────────────────────────────────────────────────────────
+      if (first === "clear") {
+        saveConfig({ permissionRules: [] }, { replace: ["permissionRules"] });
+        return success(t("Permission rules cleared.", "Правила разрешений очищены."));
       }
-      if (!["read", "write", "shell", "network", "agent"].includes(risk)) return error(t("Unknown class: {risk}", "Неизвестный класс: {risk}", { risk }));
-      if (!["ask", "allow", "deny"].includes(mode)) return error(t("Mode must be ask, allow or deny", "Режим должен быть ask, allow или deny"));
-      saveConfig({ permissions: { ...cfg.permissions, [risk]: mode } as any });
-      success(`${risk} → ${mode}`);
+      if (first === "remove") {
+        const what = tail.join(" ").trim();
+        const rules = [...cfg.permissionRules];
+        const index = /^\d+$/.test(what) ? Number(what) - 1 : rules.findIndex((r) => r.rule === what);
+        if (index < 0 || index >= rules.length) return error(t("No such rule: {rule}", "Нет такого правила: {rule}", { rule: what }));
+        const [gone] = rules.splice(index, 1);
+        saveConfig({ permissionRules: rules }, { replace: ["permissionRules"] });
+        return success(t("Removed {rule}", "Удалено {rule}", { rule: gone.rule }));
+      }
+      if (first && ["allow", "ask", "deny"].includes(first) && tail.length) {
+        const rule = tail.join(" ").trim();
+        const bad = validateRuleText(rule);
+        if (bad) return error(t("Not a rule: {reason}", "Это не правило: {reason}", { reason: bad }));
+        const exists = cfg.permissionRules.some((r) => r.rule === rule && r.action === first);
+        if (!exists) saveConfig({ permissionRules: [...cfg.permissionRules, { action: first as PermissionMode, rule }] }, { replace: ["permissionRules"] });
+        return success(t("{action}: {rule}", "{action}: {rule}", { action: first, rule }));
+      }
+
+      // ── the listing, and the class modes ────────────────────────────────
+      const [risk, mode] = words;
+      if (risk && !mode) {
+        return error(t("Mode must be ask, allow or deny", "Режим должен быть ask, allow или deny"));
+      }
+      if (risk && !["read", "write", "shell", "network", "agent", "paidMedia"].includes(risk)) {
+        return error(t("Unknown class: {risk}", "Неизвестный класс: {risk}", { risk }));
+      }
+      if (risk) {
+        if (!["ask", "allow", "deny"].includes(mode)) return error(t("Mode must be ask, allow or deny", "Режим должен быть ask, allow или deny"));
+        saveConfig({ permissions: { ...cfg.permissions, [risk]: mode } as any });
+        return success(`${risk} → ${mode}`);
+      }
+      line();
+      for (const [k, v] of Object.entries(cfg.permissions)) {
+        const color = v === "allow" ? c.green : v === "deny" ? c.red : c.yellow;
+        padded(`${k.padEnd(10)} ${color(v)}`);
+      }
+      line();
+      padded(c.bold(t("Rules", "Правила")) + c.gray(t("  (checked deny → ask → allow, first match wins)", "  (проверяются deny → ask → allow, побеждает первое совпадение)")));
+      if (!cfg.permissionRules.length) {
+        padded(c.gray(t("  none — the class modes above decide everything", "  нет — решают только классы выше")));
+      } else {
+        cfg.permissionRules.forEach((r, i) => {
+          const color = r.action === "allow" ? c.green : r.action === "deny" ? c.red : c.yellow;
+          padded(`  ${c.gray(`${i + 1}.`)} ${color(r.action.padEnd(6))} ${r.rule}`);
+        });
+      }
+      line();
+      hint(t("Add: /permissions allow shell(git status:*)", "Добавить: /permissions allow shell(git status:*)"));
+      hint(t("Remove: /permissions remove 1", "Удалить: /permissions remove 1"));
+      line();
+    },
+  },
+  {
+    name: "/hooks",
+    group: "settings",
+    args: () => t("[reload]", "[reload]"),
+    help: () => t("lifecycle hooks and the turn notification", "хуки жизненного цикла и уведомление о конце хода"),
+    run: hooksCommand,
+  },
+  {
+    name: "/commands",
+    group: "settings",
+    args: () => t("[reload]", "[reload]"),
+    help: () => t("this project's own slash commands", "свои слэш-команды этого проекта"),
+    run: commandsListCommand,
+  },
+  {
+    name: "/accounts",
+    group: "settings",
+    args: () => t("[provider]", "[поставщик]"),
+    help: () => t("the keys and logins a provider holds, one of them active", "ключи и входы поставщика, один из них активный"),
+    async run(app, rest) {
+      await accountsModal(app, rest.trim());
     },
   },
   {
     name: "/login",
     group: "settings",
     args: () => t("[provider] [url]", "[поставщик] [url]"),
-    help: () => t("connect a provider — the one in use unless another is named", "подключить поставщика — текущего, если не указан другой"),
+    help: () => t("connect a provider, or manage the keys and logins it already holds", "подключить поставщика или разобрать его ключи и входы"),
     async run(app, rest) {
       const parts = rest.trim().split(/\s+/).filter(Boolean);
       // A host can be given straight away — `/login alibabacloud https://…` —
@@ -1093,6 +1180,12 @@ const COMMANDS: Command[] = [
         return error(t("Unknown provider: {name}. Available: {providers}", "Неизвестный поставщик: {name}. Доступны: {providers}", { name, providers: providers().map((p) => p.id).join(", ") }));
       }
 
+      // A connected provider opens its accounts instead of asking for a key:
+      // "which of my keys carries this session" is the same question as
+      // "connect one", and the panel can also add, rename and delete. A host
+      // named on the command line is a login, not a list.
+      if (!baseUrl && modeFor(def.id)) return accountsModal(app, def.id);
+
       // A third-party provider goes through the shared flow, which may need
       // the keyboard for a device code — hence exclusiveInput.
       if (def.id !== DEFAULT_PROVIDER) {
@@ -1104,15 +1197,33 @@ const COMMANDS: Command[] = [
         return;
       }
 
-      const key = await app.exclusiveInput(() => askSecret(`  ${def.keyHint}: `));
-      if (!key) return warn(t("Cancelled.", "Отменено."));
+      const answers = await app.exclusiveInput(() =>
+        askForm({
+          title: t("{label} — API key", "{label} — ключ API", { label: def.label }),
+          subtitle: t(
+            "Paste the key; Tab moves to its name, Enter verifies and saves it.",
+            "Вставьте ключ; Tab перейдёт к имени, Enter проверит и сохранит.",
+          ),
+          fields: [
+            { label: t("API key", "Ключ API"), secret: true, placeholder: def.keyHint },
+            { label: t("Name", "Имя"), value: suggestName(def.id, "apikey") },
+          ],
+          submit: t("Connect", "Подключить"),
+        }),
+      );
+      if (!answers) return warn(t("Cancelled.", "Отменено."));
+      const key = (answers[0] ?? "").trim();
+      if (!key) return warn(t("No key entered.", "Ключ не введён."));
       const cfg = loadConfig();
       const sp = new Spinner("verifying the key");
       sp.start();
       const check = await verifyKey(cfg.baseUrl, key);
       sp.stop();
       if (!check.ok) return error(t("Key rejected: {detail}", "Ключ отклонён: {detail}", { detail: check.detail }));
+      // One write, so the config and the account book never disagree about
+      // which key is carrying the session.
       saveConfig({ apiKey: key });
+      registerAccount(def.id, { mode: "apikey", accessToken: key, source: "pasted key" }, answers[1]);
       app.cfg = loadConfig();
       app.catalog = await fetchModels({ force: true });
       app.rebuildTools();
@@ -1493,7 +1604,7 @@ const COMMANDS: Command[] = [
     name: "/help",
     group: "other",
     help: () => t("full help", "полная справка"),
-    async run() {
+    async run(app) {
       line();
       rule(c.brightCyan(" commands "));
       for (const g of GROUP_ORDER) {
@@ -1504,6 +1615,17 @@ const COMMANDS: Command[] = [
         for (const cmd of inGroup) {
           const label = `${cmd.name}${cmd.args ? " " + txt(cmd.args) : ""}`;
           padded(`  ${c.bold(label.padEnd(34))} ${c.gray(txt(cmd.help))}`);
+        }
+      }
+      line();
+      // Command files are not built-ins: they belong to this repository, so
+      // they get their own heading at the end rather than a group of their own.
+      const custom = discoverCustomCommands(app.cwd);
+      if (custom.length) {
+        padded(c.bold(c.brightBlue(t("project", "проект").toUpperCase())));
+        for (const cmd of custom) {
+          const label = `${cmd.name}${cmd.argumentHint ? " " + cmd.argumentHint : ""}`;
+          padded(`  ${c.bold(label.padEnd(34))} ${c.gray(cmd.description)}`);
         }
       }
       line();
@@ -1538,22 +1660,29 @@ const ALIASES: Record<string, string> = {
   "/promtmodel": "/prompt_model",
 };
 
-export function commandNames(): string[] {
-  return [...COMMANDS.map((cmd) => cmd.name), ...Object.keys(ALIASES)].sort();
+export function commandNames(cwd?: string): string[] {
+  const custom = cwd ? discoverCustomCommands(cwd).map((cmd) => cmd.name) : [];
+  return [...COMMANDS.map((cmd) => cmd.name), ...Object.keys(ALIASES), ...custom].sort();
 }
 
 /**
  * Rows for the editor dropdown. Opens on a leading "/" and stays open only
- * while the first word is still being typed.
+ * while the first word is still being typed. A project's own command files are
+ * listed after the built-ins.
  */
-export function commandSuggestions(buffer: string): { value: string; hint: string }[] {
+export function commandSuggestions(buffer: string, cwd?: string): { value: string; hint: string }[] {
   if (!buffer.startsWith("/")) return [];
   if (/\s/.test(buffer)) return [];
   const q = buffer.toLowerCase();
   const ordered = GROUP_ORDER.flatMap((g) => COMMANDS.filter((cmd) => cmd.group === g));
-  return ordered
-    .filter((cmd) => cmd.name.startsWith(q))
-    .map((cmd) => ({ value: cmd.name, hint: cmd.args ? `${txt(cmd.args)}  —  ${txt(cmd.help)}` : txt(cmd.help) }));
+  const rows = ordered.map((cmd) => ({
+    value: cmd.name,
+    hint: cmd.args ? `${txt(cmd.args)}  —  ${txt(cmd.help)}` : txt(cmd.help),
+  }));
+  for (const cmd of cwd ? discoverCustomCommands(cwd) : []) {
+    rows.push({ value: cmd.name, hint: cmd.argumentHint ? `${cmd.argumentHint}  —  ${cmd.description}` : cmd.description });
+  }
+  return rows.filter((row) => row.value.toLowerCase().startsWith(q));
 }
 
 export function isCommand(text: string): boolean {
@@ -1570,7 +1699,7 @@ export function isShellLine(text: string): boolean {
 }
 
 /** Compact grouped listing shown when the user types just "/". */
-export function printCommandIndex(): void {
+export function printCommandIndex(cwd?: string): void {
   line();
   padded(c.bold(t("Commands", "Команды")) + c.gray(t("   /help for details", "   /help — подробно")));
   for (const g of GROUP_ORDER) {
@@ -1578,13 +1707,19 @@ export function printCommandIndex(): void {
     if (!names.length) continue;
     padded(c.gray(groupLabel(g).padEnd(11)) + names.map((n) => c.brightCyan(n)).join(c.gray(" · ")));
   }
+  // The project's own commands are files, not built-ins: listed separately so
+  // it is obvious where they come from and which repository added them.
+  const custom = cwd ? discoverCustomCommands(cwd) : [];
+  if (custom.length) {
+    padded(c.gray(t("project", "проект").padEnd(11)) + custom.map((cmd) => c.brightCyan(cmd.name)).join(c.gray(" · ")));
+  }
   line();
 }
 
 /** Returns false when the REPL should exit. */
 export async function runCommand(app: App, text: string): Promise<boolean> {
   if (text.trim() === "/") {
-    printCommandIndex();
+    printCommandIndex(app.cwd);
     return true;
   }
   const space = text.indexOf(" ");
@@ -1594,7 +1729,19 @@ export async function runCommand(app: App, text: string): Promise<boolean> {
 
   const cmd = COMMANDS.find((x) => x.name === name);
   if (!cmd) {
-    const near = commandNames().filter((n) => n.startsWith(rawName.slice(0, 3)));
+    // A command file stands for a prompt: expand it (arguments and !`cmd`
+    // placeholders) and run it as the user's own message.
+    const custom = findCustomCommand(app.cwd, name);
+    if (custom) {
+      const prompt = await expandCustomCommand(custom, rest, { cwd: app.cwd, sessionId: app.session.id });
+      if (!prompt.trim()) {
+        error(t("{name} expanded to nothing.", "{name} раскрылась в пустоту.", { name: custom.name }));
+        return true;
+      }
+      await app.turn(prompt);
+      return true;
+    }
+    const near = commandNames(app.cwd).filter((n) => n.startsWith(rawName.slice(0, 3)));
     error(t("Unknown command {name}{hint}", "Неизвестная команда {name}{hint}",
       { name: rawName, hint: near.length ? t(" — did you mean: {names}", " — возможно: {names}", { names: near.join(", ") }) : "" }));
     return true;

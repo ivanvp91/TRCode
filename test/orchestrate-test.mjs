@@ -51,8 +51,8 @@ check(
 
 // ── a shortlist, switched on ────────────────────────────────────────────────
 saveConfig({
-  subagentModels: { tokenrouter: ["moonshotai/kimi-k3-free", "z-ai/glm-5.3"] },
-  subagentMode: { tokenrouter: "list" },
+  subagentModels: ["moonshotai/kimi-k3-free", "z-ai/glm-5.3"],
+  subagentMode: "list",
 });
 const offered = stepModels(app);
 check("the shortlist is what the planner may choose from", offered.length === 3, JSON.stringify(ids(offered)));
@@ -62,17 +62,33 @@ check(
   ids(offered).includes("moonshotai/kimi-k3-free") && ids(offered).includes("z-ai/glm-5.3"),
   JSON.stringify(ids(offered)),
 );
-check("another provider's model is never offered", !ids(offered).includes("kimi:k3"), JSON.stringify(ids(offered)));
+check("an unmarked model of another provider is not offered", !ids(offered).includes("kimi:k3"), JSON.stringify(ids(offered)));
 check("nor a model that cannot answer", !ids(offered).includes("wan2.7-image"), JSON.stringify(ids(offered)));
 
+// Marked, it is offered: helpers cross providers, and the mark is what keeps
+// the list deliberate.
+saveConfig({
+  subagentModels: ["moonshotai/kimi-k3-free", "kimi:k3"],
+  subagentMode: "list",
+});
+check(
+  "a marked model of another provider is offered instead",
+  ids(stepModels(app)).includes("kimi:k3"),
+  JSON.stringify(ids(stepModels(app))),
+);
+saveConfig({
+  subagentModels: ["moonshotai/kimi-k3-free", "z-ai/glm-5.3"],
+  subagentMode: "list",
+});
+
 // ── the same list, switched off ─────────────────────────────────────────────
-saveConfig({ subagentMode: { tokenrouter: "session" } });
+saveConfig({ subagentMode: "session" });
 check(
   "a list left off narrows the offer back to the session's model",
   JSON.stringify(ids(stepModels(app))) === JSON.stringify([SESSION]),
   JSON.stringify(ids(stepModels(app))),
 );
-saveConfig({ subagentMode: { tokenrouter: "list" } });
+saveConfig({ subagentMode: "list" });
 
 // ── what a plan's "model" resolves to ───────────────────────────────────────
 check("an id from the offer is taken as it is", resolveStepModel(offered, "z-ai/glm-5.3", SESSION) === "z-ai/glm-5.3");

@@ -204,7 +204,7 @@ try {
   await test("session saving is atomic and a damaged current file recovers", async () => { const s = new Session({ cwd: project, model: "m" }); s.add({ role: "user", content: "first" }); s.save(); s.add({ role: "assistant", content: "second" }); s.save(); assert.equal(s.saveError, null); fs.writeFileSync(s.file(), "{broken"); const restored = Session.load(project, s.id); assert.ok(restored); assert.equal(restored.messages[0].content, "first"); });
   await test("catastrophic grep expressions have an execution deadline", async () => { const file = path.join(project, "backtracking.txt"); fs.writeFileSync(file, "a".repeat(20000) + "!"); const start = Date.now(); const r = await grepTool.run({ path: file, pattern: "(a+)+$" }, ctx()); assert.ok(r.isError); assert.ok(Date.now() - start < 1500); });
   const orchestrationApp = () => {
-    saveConfig({ subagentMode: { tokenrouter: "session" } });
+    saveConfig({ subagentMode: "session" });
     const app = new App({ cwd: project, model: "audit-orchestration", autoApprove: true });
     app.catalog = [{ id: "audit-orchestration", chatCapable: true }];
     app.effortOverride = "off";

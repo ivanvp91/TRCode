@@ -8,7 +8,7 @@
  */
 import type { Message, StreamEvent, ToolCall, ToolDef, Usage } from "../types.js";
 import type { Effort } from "../config.js";
-import { normalizeToolSchema } from "./schema.js";
+import { normalizeToolSchema, wireToolArgs } from "./schema.js";
 import { DEFAULT_MAX_TOKENS, THINKING_BUDGET } from "./anthropic.js";
 
 /** The same ceiling the Anthropic dialect has; see buildAnthropicBody. */
@@ -60,7 +60,7 @@ export function toResponsesInput(messages: Message[]): { instructions: string; i
           type: "function_call",
           call_id: tc.id,
           name: tc.function.name,
-          arguments: tc.function.arguments || "{}",
+          arguments: wireToolArgs(tc.function.arguments),
         });
       }
       continue;
@@ -112,6 +112,24 @@ interface CallSlot {
   args: string;
 }
 
+/**
+ * Arguments are a JSON string on the wire, but a host that forwards what its
+ * model produced may hand them back already parsed. The old String() turned
+ * such an item into "[object Object]" — an unparseable call the history then
+ * replayed, and strict hosts refuse the whole request over it.
+ */
+function argsText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value && typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return "";
+    }
+  }
+  return "";
+}
+
 /** Turns a Responses SSE event into our internal stream events. */
 export class ResponsesStreamParser {
   private calls = new Map<string, CallSlot>();
@@ -134,19 +152,19 @@ export class ResponsesStreamParser {
       this.calls.set(key, {
         id: String(json.item.call_id ?? json.item.id ?? key),
         name: String(json.item.name ?? ""),
-        args: String(json.item.arguments ?? ""),
+        args: argsText(json.item.arguments),
       });
     } else if (type === "response.function_call_arguments.delta") {
       const key = String(json.item_id ?? json.id ?? "");
       const slot = this.calls.get(key) ?? { id: key, name: "", args: "" };
-      slot.args += String(json.delta ?? "");
+      slot.args += argsText(json.delta);
       this.calls.set(key, slot);
     } else if (type === "response.output_item.done" && json.item?.type === "function_call") {
       const key = String(json.item.id ?? json.item.call_id ?? "");
       const slot = this.calls.get(key) ?? { id: "", name: "", args: "" };
       slot.id = String(json.item.call_id ?? slot.id ?? key);
       slot.name = String(json.item.name ?? slot.name);
-      if (json.item.arguments) slot.args = String(json.item.arguments);
+      if (json.item.arguments) slot.args = argsText(json.item.arguments);
       this.calls.set(key, slot);
     } else if (type === "response.completed" || type === "response.incomplete" || type === "response.failed") {
       const r = json.response ?? {};
@@ -207,7 +225,7 @@ export function parseResponsesResult(json: any): {
       toolCalls.push({
         id: String(item.call_id ?? item.id ?? ""),
         type: "function",
-        function: { name: String(item.name ?? ""), arguments: String(item.arguments ?? "{}") },
+        function: { name: String(item.name ?? ""), arguments: argsText(item.arguments) || "{}" },
       });
     }
   }

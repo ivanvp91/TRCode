@@ -747,7 +747,7 @@ export async function editTurn(app: App, rest: string): Promise<void> {
   const msgs = app.session.messages;
   const mine = msgs
     .map((m, i) => ({ m, i }))
-    .filter(({ m }) => m.role === "user" && !m.meta?.hidden && !m.meta?.skill && typeof m.content === "string");
+    .filter(({ m }) => m.role === "user" && !m.meta?.hidden && !m.meta?.skill && !m.meta?.skillChoice && typeof m.content === "string");
   if (!mine.length) {
     return info(t("Nothing to edit — you have not said anything yet.", "Править нечего — вы ещё ничего не написали."));
   }

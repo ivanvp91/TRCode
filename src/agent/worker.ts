@@ -1,8 +1,8 @@
 /** Shared execution policy for task helpers, orchestration steps and swarm workers. */
 import { loadConfig, type Effort } from "../config.js";
 import { servesModality, usableModels } from "../provider/models.js";
-import { splitModelId, wireModelId } from "../provider/registry.js";
-import { pickSkill, skillInjection, skillInterjector } from "../skills/match.js";
+import { wireModelId } from "../provider/registry.js";
+import { chooseSkills, skillChoice, skillInjection, skillInterjector } from "../skills/match.js";
 import type { Skill } from "../skills/loader.js";
 import { forkSpillStore } from "../tools/spill.js";
 import type { Message, ModelInfo, ToolContext, ToolDef } from "../types.js";
@@ -10,19 +10,24 @@ import type { UsageTracker } from "../usage.js";
 import { runAgent, stepCeiling, type AgentEvents, type RunResult } from "./loop.js";
 import { buildSystemPrompt } from "./prompt.js";
 
-export function subagentMode(providerId: string): "session" | "list" {
+export function subagentMode(): "session" | "list" {
   const cfg = loadConfig();
-  const saved = cfg.subagentMode?.[providerId];
-  if (saved === "session" || saved === "list") return saved;
-  return (cfg.subagentModels?.[providerId] ?? []).length ? "list" : "session";
+  if (cfg.subagentMode === "session" || cfg.subagentMode === "list") return cfg.subagentMode;
+  return cfg.subagentModels.length ? "list" : "session";
+}
+
+/**
+ * What any connected provider can run a helper on. Hosts are not a boundary:
+ * a helper on a second plan is the cheap way to widen a fan-out, and the lead
+ * only ever names an id that this catalogue lists.
+ */
+function helperPool(catalog: ModelInfo[]): ModelInfo[] {
+  return usableModels(catalog).filter((m) => m.chatCapable !== false && servesModality(m, "text"));
 }
 
 export function workerModels(catalog: ModelInfo[], dflt: string): ModelInfo[] {
-  const home = splitModelId(dflt).providerId;
-  const runnable = usableModels(catalog).filter(
-    (m) => m.chatCapable !== false && servesModality(m, "text") && splitModelId(m.id).providerId === home,
-  );
-  const list = subagentMode(home) === "list" ? loadConfig().subagentModels?.[home] ?? [] : [];
+  const runnable = helperPool(catalog);
+  const list = subagentMode() === "list" ? loadConfig().subagentModels : [];
   const shortlist = runnable.filter((m) => list.includes(m.id));
   return shortlist.length
     ? [...runnable.filter((m) => m.id === dflt), ...shortlist.filter((m) => m.id !== dflt)]
@@ -31,19 +36,16 @@ export function workerModels(catalog: ModelInfo[], dflt: string): ModelInfo[] {
 
 /** Task helpers prefer the configured list; the lead remains the planner's fallback. */
 export function taskModels(catalog: ModelInfo[], dflt: string): ModelInfo[] {
-  const provider = splitModelId(dflt).providerId;
   const models = workerModels(catalog, dflt);
-  const chosen = subagentMode(provider) === "list" ? loadConfig().subagentModels?.[provider] ?? [] : [];
+  const chosen = subagentMode() === "list" ? loadConfig().subagentModels : [];
   const configured = models.filter((m) => chosen.includes(m.id));
   return configured.length ? configured : models;
 }
 
-export function subagentModelsConfigured(catalog: ModelInfo[], dflt: string): boolean {
-  const provider = splitModelId(dflt).providerId;
+export function subagentModelsConfigured(catalog: ModelInfo[]): boolean {
   const cfg = loadConfig();
-  if (subagentMode(provider) === "session") return cfg.subagentMode?.[provider] === "session";
-  const selected = cfg.subagentModels?.[provider] ?? [];
-  return workerModels(catalog, dflt).some((m) => selected.includes(m.id));
+  if (subagentMode() === "session") return cfg.subagentMode === "session";
+  return helperPool(catalog).some((m) => cfg.subagentModels.includes(m.id));
 }
 
 export function resolveWorkerModel(offered: ModelInfo[], want: string | undefined, dflt: string): string {
@@ -79,11 +81,18 @@ export async function runWorker(opts: WorkerOptions): Promise<RunResult> {
   const loaded = new Set(messages.map((m) => m.meta?.skill).filter((s): s is string => Boolean(s)));
   const skills = cfg.skillsEnabled && cfg.skillAuto !== false ? opts.skills : [];
   if (messages.length === 1) {
-    const opening = pickSkill(skills, opts.prompt);
-    if (opening) {
-      loaded.add(opening.skill.name);
-      messages.push({ role: "user", content: skillInjection(opening.skill), meta: { skill: opening.skill.name } });
-      activity(`skill ${opening.skill.name}`);
+    const choice = chooseSkills(skills, opts.prompt);
+    if (choice.pick) {
+      loaded.add(choice.pick.skill.name);
+      messages.push({ role: "user", content: skillInjection(choice.pick.skill), meta: { skill: choice.pick.skill.name } });
+      activity(`skill ${choice.pick.skill.name}`);
+    } else if (choice.rivals.length) {
+      messages.push({
+        role: "user",
+        content: skillChoice(choice.rivals),
+        meta: { skillChoice: choice.rivals.map((r) => r.skill.name) },
+      });
+      activity(`skills ${choice.rivals.map((r) => r.skill.name).join(" / ")}`);
     }
   }
   return await runAgent({

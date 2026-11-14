@@ -39,7 +39,7 @@ export interface ModelPickerOptions {
   /**
    * The favorites tab: on for every place a person picks one model — leaving
    * it off there would make a star they cannot reach. Set-lists that act per
-   * row instead (the brain panel, the subagent pool) drop it: their tabs are
+   * row instead (the brain panel, the prompt writer) drop it: their tabs are
    * already scoped by provider.
    */
   favoritesTab?: boolean;

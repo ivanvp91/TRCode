@@ -9,10 +9,10 @@ import { resolveModelId, groupByVendor, incompatibleReason, servesModality, usab
 import { providerLabel, splitModelId, wireModelId } from "../../provider/registry.js";
 import { configuredRoster, runSwarm, swarmMain, swarmRoster } from "../../agent/swarm.js";
 import { subagentMode } from "../../agent/subagent.js";
-import { t, count } from "../../i18n.js";
+import { t } from "../../i18n.js";
 import type { ModelInfo } from "../../types.js";
 import type { App } from "../repl.js";
-import { currentProviderId, providerModels } from "./shared.js";
+import { currentProviderId } from "./shared.js";
 import { refreshCatalog } from "./providers.js";
 
 // ── /brain ────────────────────────────────────────────────────────────────
@@ -453,24 +453,61 @@ export async function swarmModal(app: App): Promise<void> {
 
 // ── /subagents ────────────────────────────────────────────────────────────
 
-/** Only what this key can actually launch a subagent on — the tool's own rule. */
-export function subagentPool(app: App, providerId: string) {
-  return providerModels(app, providerId).filter((m) => m.chatCapable !== false && servesModality(m, "text"));
+/** Only what this client can actually launch a subagent on — the tool's own rule. */
+export function subagentPool(app: App) {
+  return app.catalog.filter((m) => m.chatCapable !== false && servesModality(m, "text"));
 }
 
-export function noSubagentModels(providerId: string): void {
-  error(
-    t("{provider} has no model a subagent could run on.", "У {provider} нет моделей для субагентов.", {
-      provider: providerLabel(providerId),
+/**
+ * The marked list minus models no connected provider serves any more. A
+ * catalogue moves under a saved config: a retired model would otherwise be
+ * counted in the panel's subtitle, be preselected in a row that is not there,
+ * and be printed back in the "Subagents: …" line as if it could still run. An
+ * empty pool means the catalogue has not loaded yet — then nothing is judged.
+ */
+export function liveSubagentModels(app: App): string[] {
+  const saved = loadConfig().subagentModels;
+  const pool = subagentPool(app);
+  if (!pool.length) return saved;
+  const ids = new Set(pool.map((m) => m.id));
+  return saved.filter((id) => ids.has(id));
+}
+
+/** Forgets the models whose rows are gone; returns the list and what went. */
+function pruneSubagentModels(app: App): { list: string[]; dropped: string[] } {
+  const saved = loadConfig().subagentModels;
+  const list = liveSubagentModels(app);
+  const dropped = saved.filter((id) => !list.includes(id));
+  if (!dropped.length) return { list, dropped };
+  saveConfig({ subagentModels: list });
+  // An emptied list cannot mean "run on the list" any more.
+  if (!list.length && subagentMode() === "list") {
+    saveConfig({ subagentMode: "session" });
+  }
+  app.cfg = loadConfig();
+  app.rebuildTools();
+  return { list, dropped };
+}
+
+function droppedSubagentModels(dropped: string[]): void {
+  warn(
+    t("Dropped from the subagent list ({n}) — no longer offered: {models}", "Убрано из списка субагентов ({n}) — больше не предлагаются: {models}", {
+      n: dropped.length,
+      models: dropped.map(wireModelId).join(", "),
     }),
+  );
+}
+
+export function noSubagentModels(): void {
+  error(
+    t("No connected provider has a model a subagent could run on.", "Ни у одного подключённого поставщика нет модели для субагентов."),
   );
 }
 
 /** Puts one more model on the list without walking the whole catalogue. */
 export function addSubagentModel(app: App, named: string): void {
-  const provider = currentProviderId(app);
-  const pool = subagentPool(app, provider);
-  if (!pool.length) return noSubagentModels(provider);
+  const pool = subagentPool(app);
+  if (!pool.length) return noSubagentModels();
 
   let added: string;
   try {
@@ -480,24 +517,16 @@ export function addSubagentModel(app: App, named: string): void {
   }
   if (!pool.some((m) => m.id === added)) {
     return void error(
-      t(
-        "{model} is not a model of {provider} a subagent could run on.",
-        "{model} — не модель {provider}, на которой может работать субагент.",
-        { model: added, provider: providerLabel(provider) },
-      ),
+      t("{model} is not a model a subagent could run on.", "{model} — не модель, на которой может работать субагент.", { model: added }),
     );
   }
-  const current = loadConfig().subagentModels?.[provider] ?? [];
+  const current = liveSubagentModels(app);
   // Adding a model to the list is asking for the list to be used.
-  saveConfig({
-    subagentModels: { [provider]: [...new Set([...current, added])] },
-    subagentMode: { [provider]: "list" },
-  });
+  saveConfig({ subagentModels: [...new Set([...current, added])], subagentMode: "list" });
   app.cfg = loadConfig();
   app.rebuildTools();
   success(
-    t("{provider}: subagents also run on {model}.", "{provider}: субагенты работают также на {model}.", {
-      provider: providerLabel(provider),
+    t("Subagents also run on {model}.", "Субагенты работают также на {model}.", {
       model: wireModelId(added),
     }),
   );
@@ -509,56 +538,37 @@ export function addSubagentModel(app: App, named: string): void {
  * coming back to a list of five costs one keystroke instead of five choices.
  */
 export function setSubagentMode(app: App, mode: "session" | "list"): void {
-  const provider = currentProviderId(app);
-  const list = loadConfig().subagentModels?.[provider] ?? [];
+  const { list, dropped } = pruneSubagentModels(app);
+  if (dropped.length) droppedSubagentModels(dropped);
   if (mode === "list" && !list.length) {
-    warn(
-      t("{provider} has no list yet — mark the models first.", "У {provider} ещё нет списка — сначала отметьте модели.", {
-        provider: providerLabel(provider),
-      }),
-    );
+    warn(t("There is no subagent list yet — mark the models first.", "Списка субагентов ещё нет — сначала отметьте модели."));
     return void hint(t("Space marks a model, Enter saves.", "Пробел отмечает модель, Enter сохраняет."));
   }
-  saveConfig({ subagentMode: { [provider]: mode } });
+  saveConfig({ subagentMode: mode });
   app.cfg = loadConfig();
   app.rebuildTools();
   if (mode === "session") {
     return void success(
-      t(
-        "{provider}: subagents run on the session's model{kept}.",
-        "{provider}: субагенты работают на модели сессии{keptRu}.",
-        {
-          provider: providerLabel(provider),
-          kept: list.length ? ` — the list of ${list.length} is kept, unused` : "",
-          keptRu: list.length ? ` — список из ${list.length} сохранён, но не используется` : "",
-        },
-      ),
+      t("Subagents run on the session's model{kept}.", "Субагенты работают на модели сессии{keptRu}.", {
+        kept: list.length ? ` — the list of ${list.length} is kept, unused` : "",
+        keptRu: list.length ? ` — список из ${list.length} сохранён, но не используется` : "",
+      }),
     );
   }
   success(
-    t("Subagents on {provider}: {models}", "Субагенты у {provider}: {models}", {
-      provider: providerLabel(provider),
+    t("Subagents: {models}", "Субагенты: {models}", {
       models: list.map(wireModelId).join(", "),
     }),
   );
 }
 
-/** Forgets the list for this provider, and with it the choice of using one. */
+/** Forgets the list, and with it the choice of using one. */
 export function clearSubagentModels(app: App): void {
-  const provider = currentProviderId(app);
-  const models = { ...loadConfig().subagentModels };
-  const modes = { ...loadConfig().subagentMode };
-  delete models[provider];
-  delete modes[provider];
-  saveConfig({ subagentModels: models, subagentMode: modes }, { replace: ["subagentModels", "subagentMode"] });
+  saveConfig({ subagentModels: [], subagentMode: "session" });
   app.cfg = loadConfig();
   app.rebuildTools();
   success(
-    t(
-      "{provider}: the list is gone — subagents run on the session's model.",
-      "{provider}: список удалён — субагенты работают на модели сессии.",
-      { provider: providerLabel(provider) },
-    ),
+    t("The subagent list is gone — subagents run on the session's model.", "Список субагентов удалён — субагенты работают на модели сессии."),
   );
 }
 
@@ -575,23 +585,27 @@ export function setSubagentAuto(app: App, enabled: boolean): void {
 }
 
 export async function subagentsModal(app: App, required = false): Promise<void> {
+  // A catalogue that has moved on since the list was written is corrected
+  // before the panel draws, so no count and no checkbox refers to a row that
+  // is not on screen.
+  const pruned = pruneSubagentModels(app);
+  if (pruned.dropped.length) droppedSubagentModels(pruned.dropped);
   for (;;) {
-    const provider = currentProviderId(app);
-    const pool = subagentPool(app, provider);
-    if (!pool.length) return noSubagentModels(provider);
-    const current = loadConfig().subagentModels?.[provider] ?? [];
+    const pool = subagentPool(app);
+    if (!pool.length) return noSubagentModels();
+    const current = liveSubagentModels(app);
     // Two ways to get a model, and the panel says which one is in force: the
     // marks stay on screen in either, so the list is never lost to a mode.
-    const mode = subagentMode(provider);
+    const provider = currentProviderId(app);
+    const mode = subagentMode();
     const auto = loadConfig().subagentAuto?.[provider] === true;
     const onSession = t("the session's model", "модель сессии");
-    const onList = t("the {count} marked below", "{count} отмеченных ниже", { count: current.length });
+    const onList = t("the {count} marked below, from any provider", "{count} отмеченных ниже, у любого поставщика", { count: current.length });
 
     const res = await app.exclusiveInput(() =>
       openModelsModal({
-        // No favoritesCatalog here: a subagent runs on the key the session is
-        // using, so the task tool only ever offers this provider's models — a
-        // star from another host would be marked and then silently dropped.
+        // Every host at once: a helper may run on another plan, and the
+        // provider tabs are how a model from another host gets marked.
         catalog: pool,
         current: app.session.model,
         defaultModel: app.session.model,
@@ -600,7 +614,7 @@ export async function subagentsModal(app: App, required = false): Promise<void> 
         title: required ? t("Choose models to launch subagents", "Выберите модели для запуска субагентов") : t("Models for subagents", "Модели для субагентов"),
         subtitle: t(
           "{provider} · auto {auto} · subagents run on {target}{kept} · Space marks a model, Enter saves and uses the list.",
-          "{provider} · auto {auto} · субагенты работают на: {target}{keptRu} · Пробел отмечает модель, Enter сохраняет и включает список.",
+          "{provider} · авто {auto} · субагенты работают на: {target}{keptRu} · Пробел отмечает модель, Enter сохраняет и включает список.",
           {
             provider: providerLabel(provider),
             auto: auto ? "on" : "off",
@@ -648,21 +662,22 @@ export async function subagentsModal(app: App, required = false): Promise<void> 
     }
 
     // Marking models is choosing to use them; marking none is the other mode.
+    // Anything the catalogue stopped serving is left out of the saved set, so a
+    // stale mark cannot ride along with the ones on screen.
+    const offered = new Set(pool.map((m) => m.id));
+    const marked = res.values.filter((id) => offered.has(id));
     saveConfig({
-      subagentModels: { [provider]: res.values },
-      subagentMode: { [provider]: res.values.length ? "list" : "session" },
+      subagentModels: marked,
+      subagentMode: marked.length ? "list" : "session",
     });
     app.cfg = loadConfig();
     app.rebuildTools();
-    if (!res.values.length) {
-      return void success(
-        t("{provider}: the session's model only.", "{provider}: только модель сессии.", { provider: providerLabel(provider) }),
-      );
+    if (!marked.length) {
+      return void success(t("Only the session's model.", "Только модель сессии."));
     }
     return void success(
-      t("Subagents on {provider}: {models}", "Субагенты у {provider}: {models}", {
-        provider: providerLabel(provider),
-        models: res.values.map(wireModelId).join(", "),
+      t("Subagents: {models}", "Субагенты: {models}", {
+        models: marked.map(wireModelId).join(", "),
       }),
     );
   }

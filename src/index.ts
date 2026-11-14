@@ -11,6 +11,7 @@ import {
   configPath,
   VERSION,
   DEFAULT_BASE_URL,
+  ROUTER_PROVIDER,
   EFFORT_LEVELS,
   type Effort,
 } from "./config.js";
@@ -31,6 +32,7 @@ import {
   splitModelId,
 } from "./provider/registry.js";
 import { importVendorCredentials, readCredentials } from "./provider/credentials.js";
+import { accountsOf, activeAccount, clearAccounts, registerAccount } from "./provider/accounts.js";
 import { isChatgptRegistration } from "./provider/chatgpt.js";
 import { latestRelease, isNewer, applyUpdate } from "./update.js";
 import { sweepMediaTmp } from "./tools/mediaworkspace.js";
@@ -40,6 +42,8 @@ interface Args {
   model?: string;
   effort?: Effort;
   preset?: "standard" | "minimal";
+  /** Start in plan mode: read-only until the user approves a plan. */
+  plan: boolean;
   baseUrl?: string;
   cwd: string;
   headless: boolean;
@@ -56,6 +60,7 @@ function parseArgs(argv: string[]): Args {
     cwd: process.cwd(),
     headless: false,
     autoApprove: false,
+    plan: false,
     continueLast: false,
     json: false,
     rest: [],
@@ -99,6 +104,9 @@ function parseArgs(argv: string[]): Args {
       case "--dangerously-allow-all":
         args.autoApprove = true;
         break;
+      case "--plan":
+        args.plan = true;
+        break;
       case "-h":
       case "--help":
         args.command = "help";
@@ -141,12 +149,14 @@ function printHelp(): void {
   line("    -p, --print                  headless mode");
   line("        --json                   headless: JSON output");
   line("        --yolo                   no confirmation prompts (careful)");
+  line("        --plan                   start read-only, propose a plan first");
   line("    -v, --version                version");
   line();
   line(c.bold("  Commands"));
   line("    trc auth login               connect the provider in use");
   line("    trc auth login --provider kimi   connect a specific one");
   line("    trc auth login --base-url U  key for a different endpoint");
+  line("    trc auth login --name work   file the credential under a name");
   line("    trc auth status              check every connected provider");
   line("    trc auth logout [--provider P]   disconnect");
   line("    trc models                   list models");
@@ -201,16 +211,20 @@ async function cmdAuthStatus(): Promise<number> {
 }
 
 function describeCredential(providerId: string): string {
+  // Several credentials on one provider is the normal case once a plan's quota
+  // has run out once: say which one is carrying the session.
+  const accounts = accountsOf(providerId);
+  const pool = accounts.length > 1 ? ` · ${accounts.length} accounts, "${activeAccount(providerId)?.name ?? ""}" active` : "";
   if (providerId === DEFAULT_PROVIDER) {
     const cfg = loadConfig();
-    return `${cfg.baseUrl} · ${cfg.apiKey ? maskKey(cfg.apiKey) : "no key"}`;
+    return `${cfg.baseUrl} · ${cfg.apiKey ? maskKey(cfg.apiKey) : "no key"}${pool}`;
   }
   const creds = readCredentials(providerId);
   if (!creds) return "no credential";
   const expiry = creds.expiresAt
     ? `expires ${new Date(creds.expiresAt).toLocaleString()}${creds.refreshToken ? ", auto-renewed" : ""}`
     : "does not expire";
-  return `${maskKey(creds.accessToken)} · ${expiry}${creds.email ? ` · ${creds.email}` : ""}${creds.source ? ` · from ${creds.source}` : ""}`;
+  return `${maskKey(creds.accessToken)} · ${expiry}${creds.email ? ` · ${creds.email}` : ""}${creds.source ? ` · from ${creds.source}` : ""}${pool}`;
 }
 
 async function cmdAuth(rest: string[]): Promise<number> {
@@ -237,6 +251,7 @@ async function cmdAuth(rest: string[]): Promise<number> {
       // confusable, and typing the flag for a one-word answer is a chore.
       key: positional.find((a) => !isUrl(a)),
       baseUrl: flagUrl ?? positional.find(isUrl),
+      name: flagValue(rest, "--name"),
     });
     // Connecting is what this command promises; an inactive plan is reported
     // but is not a failure of the login.
@@ -290,6 +305,7 @@ async function cmdAuth(rest: string[]): Promise<number> {
       info(`Host changed: ${baseUrl} → ${chosenUrl}`);
     }
     saveConfig({ apiKey: key, baseUrl: chosenUrl });
+    registerAccount(ROUTER_PROVIDER, { mode: "apikey", accessToken: key, source: "pasted key" }, flagValue(rest, "--name"));
     success(`Saved to ${configPath()}${res.ok ? ` — ${res.detail}` : " (unverified)"}`);
 
     // Switching endpoints usually renames every model; repoint a stale default
@@ -316,6 +332,7 @@ async function cmdAuth(rest: string[]): Promise<number> {
   if (sub === "logout") {
     if (def.id === DEFAULT_PROVIDER) {
       saveConfig({ apiKey: undefined });
+      clearAccounts(def.id);
       success("Key removed from the config.");
       return 0;
     }
@@ -437,6 +454,7 @@ async function headless(args: Args): Promise<number> {
   const app = new App({ cwd: args.cwd, model: args.model, autoApprove: args.autoApprove });
   app.broker.interactive = false;
   if (args.preset) app.presetOverride = args.preset;
+  if (args.plan) app.planMode = true;
   await app.init();
   if (args.effort) app.effortOverride = args.effort;
 
@@ -578,6 +596,7 @@ async function main(): Promise<void> {
 
   const app = new App({ cwd: args.cwd, model: args.model, autoApprove: args.autoApprove, session });
   if (args.preset) app.presetOverride = args.preset;
+  if (args.plan) app.planMode = true;
   await app.init();
   if (args.effort) app.effortOverride = args.effort;
 

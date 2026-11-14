@@ -5,6 +5,9 @@ const noColor =
   process.env.TERM === "dumb" ||
   (!process.stdout.isTTY && process.env.FORCE_COLOR === undefined);
 
+/** The last width the terminal really reported — see termWidth(). */
+let lastColumns = 0;
+
 function wrap(open: number, close: number) {
   return (s: string) => (noColor ? s : `\x1b[${open}m${s}\x1b[${close}m`);
 }
@@ -129,7 +132,80 @@ export function cutToWidth(s: string, max: number): { text: string; width: numbe
 }
 
 export function stripAnsi(s: string): string {
-  return s.replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+  // OSC first: a hyperlink carries its URL as plain-looking text, and counting
+  // it as visible cells is what made a linked build log wrap off the edge.
+  return s.replace(/\x1b\][\s\S]*?(?:\x07|\x1b\\)/g, "").replace(/\x1b\[[0-9;]*[A-Za-z]/g, "");
+}
+
+/** SGR parameters a transcript row may keep: colour, weight and slant. */
+function sgrSafe(body: string): boolean {
+  const parts = body === "" ? ["0"] : body.split(";");
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] === "") return false;
+    const n = Number(parts[i]);
+    if (!Number.isInteger(n)) return false;
+    if (n === 38 || n === 48) {
+      const mode = Number(parts[i + 1]);
+      if (mode === 5) { i += 2; continue; }
+      if (mode === 2) { i += 4; continue; }
+      return false;
+    }
+    const ok =
+      n === 0 || n === 1 || n === 2 || n === 3 || n === 22 || n === 23 || n === 39 || n === 49 ||
+      (n >= 30 && n <= 37) || (n >= 40 && n <= 47) || (n >= 90 && n <= 97) || (n >= 100 && n <= 107);
+    if (!ok) return false;
+  }
+  return true;
+}
+
+/**
+ * Text that came from outside — a compiler, a test runner, a package manager.
+ *
+ * It arrives coloured, and some of it arrives linked: rustc wraps every crate
+ * it names in an OSC 8 hyperlink to docs.rs. Transcript rows are cut to the
+ * terminal's width, and a cut landing inside a sequence leaves the terminal
+ * holding whatever that sequence opened — an open link is drawn as an underline
+ * under every row that follows, so the whole screen turns into dashed lines and
+ * nothing printed afterwards takes them away. Cursor control is worse: a child
+ * that clears the screen would erase the conversation above it.
+ *
+ * Only colour survives the crossing. No links, no cursor moves, no underline,
+ * reverse or blink, and every line ends closed, so one bad row cannot colour
+ * the rows under it.
+ */
+export function sanitizeOutput(s: string): string {
+  if (!s.includes("\x1b")) return s;
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (ch === "\x1b") {
+      const next = s[i + 1];
+      if (next === "[") {
+        const seq = /^\x1b\[([0-9;?]*)([@-~])/.exec(s.slice(i));
+        if (seq) {
+          if (seq[2] === "m" && !noColor && sgrSafe(seq[1])) out += seq[0];
+          i += seq[0].length - 1;
+          continue;
+        }
+        continue;
+      }
+      if (next === "]") {
+        const bel = s.indexOf("\x07", i + 2);
+        const st = s.indexOf("\x1b\\", i + 2);
+        const end = st >= 0 && (bel < 0 || st < bel) ? st + 2 : bel >= 0 ? bel + 1 : -1;
+        // Unterminated, an OSC runs to the end of the row and swallows it.
+        if (end < 0) break;
+        i = end - 1;
+        continue;
+      }
+      i += 1; // a two-byte escape — a charset select, not ours to keep
+      continue;
+    }
+    if (ch.charCodeAt(0) < 32 && ch !== "\n" && ch !== "\t") continue;
+    out += ch;
+  }
+  if (!out.includes("\x1b")) return out;
+  return out.split("\n").map((l) => (l.includes("\x1b") ? l + "\x1b[0m" : l)).join("\n");
 }
 
 /**
@@ -210,9 +286,20 @@ export const cursor = {
   clearScreen: () => process.stdout.write(esc.clearScreen),
 };
 
-/** Real terminal width; margins are applied by the layout module. */
+/**
+ * Real terminal width; margins are applied by the layout module.
+ *
+ * A pane that is not on screen can report a width that is no width at all — 0,
+ * or a stale number from another size. Laying the UI out for a guess paints rows
+ * past the edge of a pane nobody can see, and the terminal wraps each of them
+ * into two; back on screen the block is taller than the lines it was drawn from,
+ * which is how a second copy of the bar survives an erase. An implausible report
+ * is therefore ignored in favour of the last one that was real.
+ */
 export function termWidth(): number {
-  return Math.max(48, process.stdout.columns || 100);
+  const w = process.stdout.columns || 0;
+  if (w >= 20) lastColumns = w;
+  return lastColumns || 100;
 }
 
 /**

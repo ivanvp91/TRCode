@@ -10,12 +10,14 @@ import { spawn } from "node:child_process";
 import { saveConfig } from "../config.js";
 import { verifyProvider } from "../provider/client.js";
 import { clearCredentials, importVendorCredentials, readCredentials, savedChatgptProfiles, writeCredentials, type Credentials } from "../provider/credentials.js";
+import { accountsOf, activateAccount, activeAccountId, clearAccounts, registerAccount, removeAccount } from "../provider/accounts.js";
 import { chatgptPlanEnabled, loginChatgpt, logoutChatgpt, publicChatgptLoginUrl } from "../provider/chatgpt.js";
 import { fetchModels } from "../provider/models.js";
 import { pollForToken, requestDeviceCode, webLogin, type DeviceFlowConfig, type WebFlowConfig } from "../provider/oauth.js";
-import { modeConfig, qualifyModelId, rememberBaseUrl, type ProviderDef } from "../provider/registry.js";
+import { DEFAULT_PROVIDER, modeConfig, qualifyModelId, rememberBaseUrl, type ProviderDef } from "../provider/registry.js";
 import { c } from "./ansi.js";
 import { choose } from "./choice.js";
+import { askForm } from "./form.js";
 import { askLine } from "./prompt.js";
 import { pick } from "./picker.js";
 import { error, hint, info, line, padded, Spinner, success, warn } from "./render.js";
@@ -30,6 +32,11 @@ export interface LoginOptions {
   fresh?: boolean;
   /** Key supplied on the command line instead of typed. */
   key?: string;
+  /**
+   * What to call the credential in the account book. Unnamed means a default
+   * ("Key 2", or the account's own email for a subscription).
+   */
+  name?: string;
   /**
    * Host for this provider, saved as config → providers.<id>.baseUrl. Only
    * providers whose endpoint is per-account need it; the rest have one host.
@@ -53,6 +60,10 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
   const exclusive: <T>(fn: () => Promise<T>) => Promise<T> = opts.exclusive ?? ((fn) => fn());
   const canOAuth = Boolean(def.oauth && def.modes.oauth);
   const canKey = Boolean(def.modes.apikey);
+  /** The account this run filed, so a rejected credential can be un-filed. */
+  let registered: string | null = null;
+  /** Who carried the provider before this attempt — where a refusal goes back. */
+  const previousActive = activeAccountId(def.id);
 
   let mode = opts.mode ?? (opts.key ? "apikey" : undefined);
   if (!mode) {
@@ -87,7 +98,7 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
         line();
         warn(def.oauthWarning);
       }
-      writeCredentials(def.id, inheritedKey);
+      registered = registerAccount(def.id, inheritedKey, opts.name).id;
       info(t("Reusing the {label} CLI credential from {source}.", "Переиспользую учётные данные {label} CLI из {source}.", { label: def.label, source: String(inheritedKey.source) }));
       // The credential is in hand; skip the key prompts below.
     } else {
@@ -103,12 +114,43 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
         }
         if (url) rememberBaseUrl(def.id, url);
       }
-      const key = (opts.key ?? (await exclusive(() => askSecret(`  ${def.keyHint}: `)))).trim();
+      let key = (opts.key ?? "").trim();
+      let name = opts.name ?? "";
+      if (!key) {
+        // A pipe has no panel to draw in: the plain secret prompt reads one
+        // line and gives up, which is what a scripted login needs.
+        if (!process.stdin.isTTY) {
+          key = (await exclusive(() => askSecret(`  ${def.keyHint}: `))).trim();
+        } else {
+          // The key and its name in one panel, key first: a paste lands there,
+          // Enter accepts the suggested name.
+          const answers = await exclusive(() =>
+            askForm({
+              title: t("{label} — API key", "{label} — ключ API", { label: def.label }),
+              subtitle: t(
+                "Paste the key; Tab moves to its name, Enter connects. Keys are pooled — the client moves to the next one when a host refuses this one.",
+                "Вставьте ключ; Tab перейдёт к имени, Enter подключит. Ключи складываются в набор — клиент перейдёт на следующий, если хост откажет этому.",
+              ),
+              fields: [
+                { label: t("API key", "Ключ API"), secret: true, placeholder: def.keyHint },
+                { label: t("Name", "Имя"), value: suggestName(def.id, "apikey") },
+              ],
+              submit: t("Connect", "Подключить"),
+            }),
+          );
+          if (!answers) {
+            error(t("Cancelled.", "Отменено."));
+            return FAILED;
+          }
+          key = answers[0] ?? "";
+          name = answers[1] ?? "";
+        }
+      }
       if (!key) {
         error(t("No key entered.", "Ключ не введён."));
         return FAILED;
       }
-      writeCredentials(def.id, { mode: "apikey", accessToken: key, source: "pasted key" });
+      registered = registerAccount(def.id, { mode: "apikey", accessToken: key, source: "pasted key" }, name).id;
     }
   } else {
     if (!def.oauth) {
@@ -125,10 +167,12 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
     // A login the vendor's own CLI already performed is the same login.
     const inherited = opts.fresh ? null : def.importFrom && importVendorCredentials(def.importFrom);
     if (inherited) {
-      writeCredentials(def.id, inherited);
+      registered = registerAccount(def.id, inherited, opts.name ?? inherited.email).id;
       info(t("Reusing the {label} CLI session from {source}.", "Переиспользую сессию {label} CLI из {source}.", { label: def.label, source: String(inherited.source) }));
     } else {
       if (!(await oauthLogin(def, exclusive))) return FAILED;
+      const signed = readCredentials(def.id);
+      if (signed) registered = registerAccount(def.id, signed, await askAccountName(def, signed, opts, exclusive)).id;
     }
   }
 
@@ -142,7 +186,21 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
     // A rejected token is worth deleting; a lapsed plan is not — the login
     // itself worked, and asking the user to repeat it would fix nothing.
     if ((check.status === 401 || check.status === 403) && !(def.id === "openai" && mode === "oauth")) {
-      clearCredentials(def.id);
+      // The credential leaves the book with the file: a rejected key listed in
+      // /accounts is a key the user would try again and be refused again. What
+      // was active before this attempt takes the provider back — and its file
+      // must not be deleted with the rejected one.
+      if (registered) {
+        const others = accountsOf(def.id).filter((a) => a.id !== registered);
+        removeAccount(def.id, registered);
+        // The router keeps its key in the config rather than in the auth
+        // directory, so the file removal that fits every other provider has
+        // to be a config write here.
+        const forget = () => (def.id === DEFAULT_PROVIDER ? saveConfig({ apiKey: undefined }) : clearCredentials(def.id));
+        if (!others.length) forget();
+        else if (previousActive && previousActive !== registered) activateAccount(def.id, previousActive);
+      } else if (def.id === DEFAULT_PROVIDER) saveConfig({ apiKey: undefined });
+      else clearCredentials(def.id);
       error(t("{label} rejected the credential: {detail}", "{label} отклонил учётные данные: {detail}", { label: def.label, detail: check.detail }));
       // A key is issued for one of this vendor's products and refused by the
       // others, and the refusal says nothing about that. Name the host it was
@@ -172,6 +230,42 @@ export async function loginProvider(def: ProviderDef, opts: LoginOptions = {}): 
 }
 
 const FAILED: LoginResult = { connected: false, usable: false };
+
+/**
+ * What a new credential is called when nobody typed a name: keys are numbered
+ * ("Key 2"), subscriptions are "Account 2" until the host tells us the email.
+ */
+export function suggestName(provider: string, mode: "oauth" | "apikey"): string {
+  const n = accountsOf(provider).length + 1;
+  return mode === "apikey" ? t("Key {n}", "Ключ {n}", { n }) : t("Account {n}", "Аккаунт {n}", { n });
+}
+
+/**
+ * The name a subscription login is filed under. Asked rather than assumed —
+ * two ChatGPT workspaces of one person are told apart by nothing else — but
+ * prefilled with the account's email, so Enter is the whole answer.
+ */
+async function askAccountName(
+  def: ProviderDef,
+  creds: Credentials,
+  opts: LoginOptions,
+  exclusive: <T>(fn: () => Promise<T>) => Promise<T>,
+): Promise<string> {
+  const suggested = opts.name ?? creds.email ?? creds.orgName ?? suggestName(def.id, creds.mode);
+  if (!process.stdin.isTTY) return suggested;
+  const answers = await exclusive(() =>
+    askForm({
+      title: t("{label} — account name", "{label} — имя аккаунта", { label: def.label }),
+      subtitle: t(
+        "Accounts are pooled: when this one runs out of quota or is refused, the next one carries the session.",
+        "Аккаунты складываются в набор: когда у этого кончится квота или хост его отклонит, запросы понесёт следующий.",
+      ),
+      fields: [{ label: t("Name", "Имя"), value: suggested, placeholder: suggested }],
+      submit: t("Save", "Сохранить"),
+    }),
+  );
+  return answers?.[0]?.trim() || suggested;
+}
 
 /**
  * Which host to talk to, for the providers that have several. Returns the URL
@@ -295,6 +389,7 @@ async function webLoginFlow(def: ProviderDef, cfg: WebFlowConfig, profile?: Cred
 }
 
 export async function disconnectProvider(providerId: string): Promise<boolean> {
+  clearAccounts(providerId);
   if (providerId !== "openai") return clearCredentials(providerId);
   const result = await logoutChatgpt();
   if (!result.revoked) warn(t(

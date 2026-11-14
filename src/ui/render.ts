@@ -1,11 +1,12 @@
 /** Transcript rendering: markdown-ish streaming, banners, spinners, diffs. */
-import { c, cursor, cutToWidth, esc, hasColor, stripAnsi, width, wrapAnsi } from "./ansi.js";
+import { c, clipAnsi, cursor, cutToWidth, esc, hasColor, sanitizeOutput, stripAnsi, termWidth, width, wrapAnsi } from "./ansi.js";
 import { PAD_LEFT, contentWidth, fmtDuration, fullWidth, indent, pad } from "./layout.js";
 import { t, count } from "../i18n.js";
 import { rememberCollapsed } from "./paste.js";
 import { highlight, langOf } from "./highlight.js";
 import { animateLogo, logoFrame, LOGO_MIN_WIDTH, LOGO_MIN_HEIGHT, LOGO_HEIGHT, type LogoAnimation } from "./logo.js";
-import { queryCursorRow } from "./stdin.js";
+import { onTerminalFocus, queryCursorRow } from "./stdin.js";
+import { trace } from "./trace.js";
 import { fmtTokens } from "../usage.js";
 import type { SubagentProgress } from "../agent/subagent.js";
 
@@ -51,6 +52,16 @@ let frameCover = 0;
 let footerRows = 0;
 /** The row the cursor was parked on after the last draw, for the next erase. */
 let footerCursorRow = 0;
+/** The cell column the caret sat in — a rewrapped line may have carried it down. */
+let footerCaretCol = 0;
+/** The frame as it was painted, needed to count its rows again after a rewrap. */
+let footerPainted: string[] = [];
+/** Width the frame on screen was built for, when the terminal rewrapped since. */
+let reflowedFrom = 0;
+/** The raw width the terminal last reported, trusted or not — see the resize hook. */
+let lastReportedCols = process.stdout.isTTY ? process.stdout.columns || 0 : 0;
+/** Rows the rewrapped frame still reaches below the fresh one — see drawSeq(). */
+let reflowSlack = 0;
 
 // Hiding the cursor is terminal state, not process state: exiting while it is
 // hidden leaves the user's shell without a caret. Restored on the way out,
@@ -61,6 +72,8 @@ if (process.stdout.isTTY) {
 
 /** The frame drawn last, so a repaint that would change nothing is skipped. */
 let lastFrame: string[] | null = null;
+/** Width the frame on screen was painted at. */
+let footerWidth = 0;
 
 // ── the block sits on the last line of the screen ───────────────────────────
 //
@@ -106,9 +119,39 @@ let airAbove = 0;
 /** The pad the frame on screen was built with, for the caret. */
 let framePad = 0;
 let lastScreenRows = 0;
+/** The last height the terminal really reported — see screenRows(). */
+let lastGoodRows = 0;
 
 function screenRows(): number {
-  return Math.max(10, process.stdout.rows || 24);
+  const reported = process.stdout.rows || 0;
+  if (reported >= 5) lastGoodRows = reported;
+  return lastGoodRows || 24;
+}
+
+function screenCols(): number {
+  return termWidth();
+}
+
+/**
+ * Rows between a painted frame's top and its caret, as the screen counts them.
+ *
+ * One painted line is one row only for as long as the window keeps its width.
+ * A narrower one wraps the long lines into two rows, a wider one joins them
+ * back, and the frame no longer occupies the rows it has. Walking up by the
+ * line count then stops inside it: the erase starts too low and leaves the top
+ * of the old frame behind as a ghost block stacked over the real one — what a
+ * switched pane leaves on screen.
+ */
+export function wrappedRowOffset(lines: string[], upto: number, caretCol: number, cols = screenCols()): number {
+  return wrappedRows(lines, upto, caretCol, Math.max(10, cols));
+}
+
+/** Rows a painted frame takes once the terminal has rewrapped it to `cols`. */
+function wrappedRows(lines: string[], upto: number, caretCol: number, cols: number): number {
+  let rows = 0;
+  for (let i = 0; i < upto && i < lines.length; i++) rows += Math.max(1, Math.ceil(width(lines[i]) / cols));
+  // The caret's own line can have carried it down a wrapped continuation.
+  return rows + Math.floor(Math.max(0, caretCol) / cols);
 }
 
 /** Tells the bar where the prompt is about to be drawn, so it can reach the bottom. */
@@ -129,6 +172,8 @@ export function setStartRow(row: number | null, preserveFooterSlack = false): vo
   slackMark = 0;
   footerPad = 0;
   airAbove = 0;
+  reflowSlack = 0;
+  reflowedFrom = 0;
   if (preserveFooterSlack) slackCursorRow = row;
   else {
     slackCursorRow = null;
@@ -242,14 +287,81 @@ export function writtenRows(): number {
 if (process.stdout.isTTY) {
   process.stdout.on("resize", () => {
     const rows = screenRows();
+    // A window that changes width rewraps what is already on the screen. The
+    // frame we drew is not the frame the terminal shows any more: it may hold
+    // two rows where we painted one. Counting our lines to find its top then
+    // stops inside it, and the rows above that point stay behind as a ghost
+    // bar stacked over the real one — the thing a switched pane leaves on
+    // screen. Remember the width so the next erase counts physical rows.
+    const cols = screenCols();
+    // A pane that is put away and brought back is fitted to a width it cannot
+    // use — a column, or none — and fitted back before anything is drawn. That
+    // width is not the layout's (it is remembered sane, see termWidth), but the
+    // terminal did reflow its buffer to it and back while nobody was looking,
+    // and rows were lost on the way. The frame drawn before is then taller or
+    // shorter on screen than the lines we painted, and the rows above the point
+    // our count reaches stay behind as a second copy of the bar. So a column
+    // report that differs from the one before it — trusted or not — makes the
+    // next paint write the whole area again from the top. A new height alone
+    // reflows nothing: the same rows are there, and pendingDrop walks the block
+    // down to the new last line.
+    const reportedCols = process.stdout.columns || 0;
+    const refitted = reportedCols > 0 && reportedCols !== lastReportedCols;
+    if (reportedCols > 0) lastReportedCols = reportedCols;
+    if (footerRows && footerPainted.length && (cols !== footerWidth || refitted)) reflowedFrom = footerWidth || cols;
     // Only growth matters: a taller window opens rows under the block, and it
     // has to follow them down. A shorter one takes rows off the bottom, which
     // the next scroll already handles.
     if (pinned) pendingDrop += Math.max(0, rows - lastScreenRows);
     lastScreenRows = rows;
     lastFrame = null;
+    trace("resize", {
+      cols,
+      rows,
+      footerRows,
+      footerWidth,
+      footerPad,
+      cover: footerCover,
+      pinned: pinned ? 1 : 0,
+      pendingDrop,
+      startRow: startRow ?? -1,
+      reflowedFrom,
+      refit: refitted ? 1 : 0,
+    });
   });
 }
+
+// How long after a pane takes the focus its buffer may still be laid out again.
+const FOCUS_REFLOW_MS = 250;
+let focusReanchor: NodeJS.Timeout | null = null;
+
+// A pane that comes back to the front has been re-laid out while it was hidden,
+// and the terminal says nothing about it: no resize, no reflow notice, just the
+// screen as it stood before it went away. The frame drawn then is not the frame
+// on screen any more, so the area is written again — see reanchorSeq.
+onTerminalFocus((focused) => {
+  trace("focus", { focused: focused ? 1 : 0, cols: screenCols(), rows: screenRows(), footerRows, footerWidth });
+  if (focusReanchor) {
+    clearTimeout(focusReanchor);
+    focusReanchor = null;
+  }
+  if (!focused) return;
+  if (!footerRows) return;
+  reflowedFrom = footerWidth || screenCols();
+  refreshFooter();
+  // The pane can lay its buffer out a second time on the way in — after this
+  // paint, not before it. The frame written now is then rewrapped into a height
+  // it was not counted at, which is the same ghost the first pass was for. One
+  // more pass, once the layout has settled, leaves the screen right either
+  // way; the two are far enough apart not to flicker.
+  focusReanchor = setTimeout(() => {
+    focusReanchor = null;
+    if (!footerRows) return;
+    reflowedFrom = footerWidth || screenCols();
+    if (reflowedFrom) refreshFooter();
+  }, FOCUS_REFLOW_MS);
+  focusReanchor.unref?.();
+});
 
 // A terminal is free to repaint between two writes, and it does: split a frame
 // across several of them and it gets caught half-drawn — the footer erased, its
@@ -280,13 +392,25 @@ export function paintFrame(frame: string): void {
 
 /** Takes the footer off the screen; empty when there is nothing to erase. */
 function eraseSeq(): string {
-  if (!footerRows) return "";
-  const from = footerCursorRow;
-  const cover = footerCover;
+  if (!footerRows) {
+    trace("erase-none");
+    return "";
+  }
+  // The rows between the frame's top and the cursor as the screen counts them:
+  // after a rewrap that is not the number of lines we painted.
+  const from = reflowedFrom ? wrappedRowOffset(footerPainted, footerCursorRow, footerCaretCol) : footerCursorRow;
+  // Rewrapped rows cannot be given back to the transcript one by one — the
+  // text that stood there is not what the log remembers. They are cleared with
+  // the rest of the frame.
+  const cover = reflowedFrom ? 0 : footerCover;
+  trace("erase", { from, cover, rows: footerRows, caretRow: footerCursorRow, caretCol: footerCaretCol, reflow: reflowedFrom ? 1 : 0 });
   footerRows = 0;
   footerCursorRow = 0;
+  footerCaretCol = 0;
   footerCover = 0;
   footerAboveRows = 0;
+  footerPainted = [];
+  reflowedFrom = 0;
   lastFrame = null;
   // Hidden before it moves — a visible cursor walking to the erase point reads
   // as the caret jumping around the screen. Borrowed rows get their transcript
@@ -324,26 +448,62 @@ function caretSeq(lines: string[]): string {
   const row = caret ? caret.row + framePad + footerAboveRows : -1;
   if (caret && row >= 0 && row < lines.length) {
     footerCursorRow = row;
+    footerCaretCol = caret.col;
     return esc.up(lines.length - 1 - row) + esc.toColumn(caret.col + 1) + esc.show;
   }
   footerCursorRow = lines.length - 1;
+  footerCaretCol = 0;
   return esc.hide;
 }
 
 /** Writes the footer where the cursor stands — for a screen without one. */
-function drawSeq(lines: string[]): string {
+/**
+ * The frame as it may be written: no row wider than the terminal.
+ *
+ * A row one cell too wide is wrapped by the terminal into two, and the frame
+ * then stands taller than the lines it was built from. Every erase and repaint
+ * counts lines, so the extra row is never given back: the top of the old frame
+ * stays on screen, and the live bar is drawn below a stale copy of itself —
+ * the spinner of a minute ago sitting above the spinner of now. Whoever builds
+ * a frame out of rows laid out for another width is caught here, once, for both
+ * drawing paths.
+ */
+function frameLines(lines: string[]): string[] {
+  const cols = screenCols();
+  let clipped = false;
+  const out = lines.map((l) => {
+    if (width(l) <= cols) return l;
+    clipped = true;
+    return clipAnsi(l, cols);
+  });
+  return clipped ? out : lines;
+}
+
+function drawSeq(lines: string[], cursorAtTop = false): string {
+  lines = frameLines(lines);
   // The rows opened here are the ones that put the bar's last line on the last
   // line of the screen; after this draw the bar keeps its place by scrolling.
   // Borrowed rows are not owed: they go over the transcript above the cursor.
   const owned = lines.length - frameCover;
-  const drop = bottomGap(owned);
+  // Rows the vanished frame still occupies after a rewrap come off before the
+  // fresh one goes in, or the bar lands short of the last line.
+  const drop = bottomGap(owned) + reflowSlack;
+  trace("draw", { h: lines.length, own: owned, cover: frameCover, pad: footerPad, drop, pinned: pinned ? 1 : 0, startRow: startRow ?? -1 });
+  reflowSlack = 0;
+  reflowedFrom = 0;
   const body =
     esc.hide +
     (drop ? "\n".repeat(drop) : "") +
-    esc.up(frameCover) +
+    // After a reanchor the cursor already stands on the frame's first row —
+    // walking up the borrowed rows again would take it above the frame and the
+    // block would be written from the top of the screen, its last line short of
+    // the bottom by exactly those rows.
+    (cursorAtTop ? "" : esc.up(frameCover)) +
     lines.map((l) => CLEAR_LINE + l).join("\n");
   footerRows = lines.length;
   footerCover = frameCover;
+  footerPainted = lines;
+  footerWidth = screenCols();
   lastFrame = lines;
   bottomDrawn(owned, drop > 0);
   airAbove = drop;
@@ -356,6 +516,7 @@ function drawSeq(lines: string[]): string {
  * in which the bottom of the screen is blank.
  */
 function repaintSeq(lines: string[]): string {
+  lines = frameLines(lines);
   const prev = footerRows;
   // A taller bar needs rows that do not exist yet, and where it takes them
   // from is the whole question. Starting `grow` rows higher took them from the
@@ -392,8 +553,26 @@ function repaintSeq(lines: string[]): string {
   if (owned < prevOwned) body += pinned ? esc.clearDown : "\n" + esc.clearDown + esc.up(1);
   footerRows = lines.length;
   footerCover = frameCover;
+  footerPainted = lines;
+  footerWidth = screenCols();
   lastFrame = lines;
   return body + caretSeq(lines);
+}
+
+/**
+ * True when the terminal is narrower or wider than the frame on screen was
+ * drawn for.
+ *
+ * A width change is the one size change that rewrites rows the frame was
+ * counted from: the frame painted for the old width holds more rows now, so
+ * erasing it by the line count stops inside it and leaves its top half above
+ * the fresh copy. A resize report normally says so; this is the check for a
+ * report that never came. A height change is not asked: the rows are the same
+ * ones, and the block follows the last line down on its own (pendingDrop).
+ */
+function sizeDrifted(): boolean {
+  if (!footerRows || !footerPainted.length) return false;
+  return footerWidth > 0 && screenCols() !== footerWidth;
 }
 
 function eraseFooter(): void {
@@ -451,18 +630,85 @@ function footerBlock(): string[] | null {
   return block.length ? block : null;
 }
 
+/**
+ * Writes the screen area again after the window changed width.
+ *
+ * A narrower or wider pane rewraps — or cuts — what the terminal already shows,
+ * and which of the two it does is its own business: xterm.js truncates a row it
+ * never soft-wrapped, other terminals wrap it into two rows. Counting our lines
+ * to walk back to the top of the old block is therefore wrong in one direction
+ * or the other: too high and it takes conversation with it, too low and the top
+ * of the old block stays behind as a second copy of the bar. So nothing is
+ * counted here. The area is cleared from the first row of the screen and written
+ * again — the transcript tail from the row log, then the block, ending exactly
+ * on the last row. Cleared rows are refilled in place, so the scrollback does
+ * not grow and no row is written twice.
+ *
+ * Leaves the cursor on the first row of the frame it is about to receive.
+ */
+export function reanchorSeq(frame: string[]): string {
+  const rows = screenRows();
+  const room = Math.max(0, rows - frame.length);
+  trace("reanchor", { cols: screenCols(), rows, frame: frame.length, room });
+  const tail = tailRows(room);
+  return (
+    esc.toColumn(1) +
+    esc.up(rows) +
+    esc.clearDown +
+    (tail.length ? tail.map((l) => CLEAR_LINE + l).join("\n") + "\n" : "")
+  );
+}
+
+/**
+ * Rebuilds the frame from scratch: the old one is forgotten rather than erased,
+ * because after a width change its position on screen is no longer known.
+ * Leaves the cursor where drawSeq expects it — at the first row of the frame.
+ */
+function reanchoredFrame(block: string[]): string[] {
+  footerRows = 0;
+  footerCover = 0;
+  footerPad = 0;
+  reflowedFrom = 0;
+  reflowSlack = 0;
+  pendingDrop = 0;
+  owedGap = 0;
+  // The frame ends on the last row by construction, and it borrows nothing: the
+  // rows above it are handed back by the reprint, not by uncoverSeq.
+  pinned = true;
+  return footerFrame(block);
+}
+
 function drawFooter(): void {
   if (!process.stdout.isTTY) return;
   const block = footerBlock();
   if (!block) return;
+  if (footerRows && (reflowedFrom || sizeDrifted())) {
+    const lines = reanchoredFrame(block);
+    paint(reanchorSeq(lines) + drawSeq(lines, true));
+    return;
+  }
   const lines = footerFrame(block);
   // A resize moved the last line of the screen: the bar has to come down to it,
   // and only a full redraw from above can do that.
-  if (footerRows && pendingDrop > 0) {
+  if (footerRows && (pendingDrop > 0 || reflowedFrom)) {
+    reflowSlack = reflowSlackFor(lines);
     paint(eraseSeq());
     footerRows = 0;
   }
   paint(footerRows ? repaintSeq(lines) : drawSeq(lines));
+}
+
+/**
+ * Rows the frame on screen still holds below the one about to replace it.
+ *
+ * Only a rewrapped frame can be taller than the frame drawn for the same
+ * content, and those rows have to be stepped over before the new frame goes
+ * in — otherwise it ends above them instead of on the last line of the screen.
+ */
+function reflowSlackFor(lines: string[]): number {
+  if (!reflowedFrom || !footerPainted.length) return 0;
+  const height = wrappedRows(footerPainted, footerPainted.length, 0, screenCols());
+  return Math.max(0, height - (lines.length - frameCover));
 }
 
 function sameFrame(lines: string[]): boolean {
@@ -493,6 +739,7 @@ export function setFooter(fn: FooterFn | null, caret?: FooterCaretFn | null, cov
   footerFn = fn;
   footerCaretFn = fn ? (caret ?? null) : null;
   footerCoverFn = fn ? (cover ?? null) : null;
+  trace(fn ? "bar-on" : "bar-off", { cols: screenCols(), rows: screenRows(), had: had ? 1 : 0, footerRows });
   if (fn) { slackRows = 0; slackCursorRow = null; footerPad = 0; }
   if (!fn) {
     // Stopping: take the bar off the screen and leave the cursor visible.
@@ -586,14 +833,20 @@ export function refreshFooter(): void {
   }
   const block = footerBlock();
   if (!block) return;
+  if (footerRows && (reflowedFrom || sizeDrifted())) {
+    const lines = reanchoredFrame(block);
+    paint(reanchorSeq(lines) + drawSeq(lines, true));
+    return;
+  }
   const lines = footerFrame(block);
   // Several callers can ask for the same frame between two spinner ticks
   // (a label change, a queued line, the tick itself). Drawing it twice costs
   // a repaint the eye can catch, and changes nothing.
-  if (footerRows && pendingDrop <= 0 && sameFrame(lines)) return;
+  if (footerRows && pendingDrop <= 0 && !reflowedFrom && sameFrame(lines)) return;
   // A resize moved the last line of the screen: the bar has to come down to it,
   // and only a full redraw from above can do that.
-  if (footerRows && pendingDrop > 0) {
+  if (footerRows && (pendingDrop > 0 || reflowedFrom)) {
+    reflowSlack = reflowSlackFor(lines);
     paint(eraseSeq());
     footerRows = 0;
   }
@@ -697,12 +950,56 @@ export function sealBlankRows(): void {
   gapRows = 0;
 }
 
+/**
+ * The idle composer, for writes that happen while it is on screen.
+ *
+ * The composer draws itself instead of hanging in the footer slot, so a line
+ * the app prints between two keystrokes has nowhere to go but the row the caret
+ * stands on — the input band and the status under it. It steps out of the way
+ * for the write and comes back under it, the way a footer is taken down and
+ * drawn again.
+ */
+export interface IdleComposer {
+  /** Escape sequence that lifts the frame, cursor left on its top row. */
+  erase: () => string;
+  /** Puts the frame back, under whatever was just printed. */
+  replace: () => void;
+}
+
+let idleComposer: IdleComposer | null = null;
+
+export function setIdleComposer(composer: IdleComposer | null): void {
+  idleComposer = composer;
+}
+
 function writeFrame(s: string): void {
   if (!s) return;
   logRows(s);
   const block = footerBlock();
+  trace("write", { cols: screenCols(), rows: screenRows(), footerRows, frame: block ? block.length : 0, chars: s.length });
   if (!block || !process.stdout.isTTY) {
-    process.stdout.write(s);
+    // Nothing sits below the transcript, but the idle composer does: it is
+    // lifted for the write so the line lands where the transcript ends, and
+    // drawn back under it. A partial line keeps the old behaviour — the
+    // composer cannot stand on the row that text is still arriving on.
+    const idle = process.stdout.isTTY && s.endsWith("\n") ? idleComposer : null;
+    const away = idle ? idle.erase() : "";
+    if (!away) {
+      process.stdout.write(s);
+      return;
+    }
+    paint(away + s);
+    idle?.replace();
+    return;
+  }
+  // The terminal is not the size the frame was drawn for: its rows are no
+  // longer where the count says they are, so the area is written again from
+  // the top rather than walked back over. The text just logged is already in
+  // the row log, so the reprint carries it — writing it a second time would
+  // put it on screen twice.
+  if (footerRows && s.endsWith("\n") && (reflowedFrom || sizeDrifted())) {
+    const lines = reanchoredFrame(block);
+    paint(reanchorSeq(lines) + drawSeq(lines, true));
     return;
   }
   // A partial line would put the bar on the same row as the text; leave the
@@ -1012,14 +1309,17 @@ export function toolDone(ok: boolean | null, detail: string, kind: "text" | "dif
     return;
   }
   const mark = ok === null ? c.gray("└ ") : ok ? c.green("└ ") : c.red("└ ");
-  const all = detail.split("\n");
+  // A tool's output is a foreign stream: a compiler's colours are welcome, its
+  // links and cursor control are not (see sanitizeOutput). The cleaned text is
+  // what gets remembered too, so ctrl+o replays the same rows.
+  const all = sanitizeOutput(detail).split("\n");
   // The corner marks the block, not every line of it: a run of results reads
   // as one thing when only the first line carries the gutter.
   for (const [i, l] of all.slice(0, TOOL_LINES).entries()) {
     line(pad(TOOL_INDENT + (i === 0 ? mark : "  ") + c.dim(clip(l, contentWidth() - 10))));
   }
   if (all.length > TOOL_LINES) {
-    rememberCollapsed(detail);
+    rememberCollapsed(all.join("\n"));
     const rest = all.length - TOOL_LINES;
     padded(
       TOOL_INDENT +
@@ -1092,10 +1392,13 @@ export function plural(n: number, one: string, many: string): string {
  * not a name in gray.
  */
 export function subagentRow(info: SubagentProgress): string {
-  const pct = info.maxSteps > 0 ? Math.min(99, Math.round((100 * info.steps) / info.maxSteps)) : 0;
-  const head =
-    `${c.gray(`${info.id}.`)} ${c.brightYellow(info.model)} ` +
-    c.gray(`${pct}% · ${fmtTokens(info.tokens)} tok`);
+  // An unbounded helper has no share to show: the rounds it has spent are the
+  // honest progress, not a percentage of a ceiling that is not there.
+  const counts =
+    info.maxSteps > 0
+      ? `${Math.min(99, Math.round((100 * info.steps) / info.maxSteps))}% · ${fmtTokens(info.tokens)} tok`
+      : `${info.steps} steps · ${fmtTokens(info.tokens)} tok`;
+  const head = `${c.gray(`${info.id}.`)} ${c.brightYellow(info.model)} ` + c.gray(counts);
   return info.line ? `${head} ${c.gray(`· ${info.line}`)}` : head;
 }
 

@@ -9,6 +9,7 @@ import { clip, line, padded, rule, truncate } from "./render.js";
 import { contentWidth } from "./layout.js";
 import { choose } from "./choice.js";
 import { loadConfig, type PermissionMode } from "../config.js";
+import { evaluateRules } from "../permissionRules.js";
 import type { ToolDef } from "../types.js";
 
 const CTRL_C = "\u0003";
@@ -17,12 +18,20 @@ const ESC = "\u001b";
 export class PermissionBroker {
   /** Tool names granted for the rest of the session. */
   private sessionAllow = new Set<string>();
+  /**
+   * Tools granted for calls that reach another machine. Kept apart from the set
+   * above so a grant given for ordinary work never silently covers ssh: the
+   * prompt for such a call asks its own question, in its own words.
+   */
+  private sessionAllowRemote = new Set<string>();
   /** Serialises prompts. */
   private chain: Promise<unknown> = Promise.resolve();
   /** When true, everything is auto-approved (--yolo). */
   autoApprove = false;
   /** When false, risky tools are refused without asking (headless default). */
   interactive = true;
+  /** Where relative paths in permission rules are resolved. */
+  cwd?: string;
   /** Hands the prompt sole ownership of stdin; set by the REPL. */
   private exclusive: <T>(fn: () => Promise<T>) => Promise<T> = (fn) => fn();
   /** Told when a prompt is up, so a pane can show "needs attention". */
@@ -38,24 +47,28 @@ export class PermissionBroker {
     opts: {
       autoApprove?: boolean;
       interactive?: boolean;
+      cwd?: string;
       exclusive?: <T>(fn: () => Promise<T>) => Promise<T>;
     } = {},
   ) {
     this.autoApprove = opts.autoApprove ?? false;
     this.interactive = opts.interactive ?? true;
+    this.cwd = opts.cwd;
     if (opts.exclusive) this.exclusive = opts.exclusive;
   }
 
-  allowForSession(toolName: string): void {
-    this.sessionAllow.add(toolName);
+  allowForSession(toolName: string, remote = false): void {
+    if (remote) this.sessionAllowRemote.add(toolName);
+    else this.sessionAllow.add(toolName);
   }
 
-  isAllowed(toolName: string): boolean {
-    return this.sessionAllow.has(toolName);
+  isAllowed(toolName: string, remote = false): boolean {
+    return remote ? this.sessionAllowRemote.has(toolName) : this.sessionAllow.has(toolName);
   }
 
   reset(): void {
     this.sessionAllow.clear();
+    this.sessionAllowRemote.clear();
     this.shown.clear();
   }
 
@@ -81,26 +94,37 @@ export class PermissionBroker {
     return (tool.paidMedia ? cfg.permissions.paidMedia : cfg.permissions[tool.risk]) ?? "ask";
   }
 
-  async confirm(tool: ToolDef, args: Record<string, any>, preview?: string, signal?: AbortSignal): Promise<boolean> {
+  async confirm(tool: ToolDef, args: Record<string, any>, preview?: string, signal?: AbortSignal, force = false): Promise<boolean> {
     if (signal?.aborted) return false;
-    if (this.autoApprove) return true;
+    // Rules are consulted before anything automatic: a refusal is a refusal
+    // even under --yolo, and a permission written for one command silences the
+    // question the class mode would have asked.
+    const verdict = evaluateRules(loadConfig().permissionRules, tool, args, this.cwd);
+    if (verdict?.action === "deny") return false;
+    if (this.autoApprove && !force) return true;
     const mode = this.mode(tool);
-    if (mode === "allow") return true;
+    if (mode === "allow" && !force) return true;
     if (mode === "deny") return false;
-    if (this.sessionAllow.has(tool.name)) return true;
+    // An allow rule is a statement about this call, not about the whole class:
+    // it applies to ordinary calls only, never to one that reaches another
+    // machine.
+    if (verdict?.action === "allow" && !force) return true;
+    // A remote call is refused every automatic path: mode, --yolo and a grant
+    // made for local work all fall through to the prompt. Its own grant does not.
+    if (force ? this.sessionAllowRemote.has(tool.name) : this.sessionAllow.has(tool.name)) return true;
     if (!this.interactive) return false;
 
     // Queue: one prompt at a time, in arrival order.
-    const run = this.chain.then(() => this.prompt(tool, args, preview, signal));
+    const run = this.chain.then(() => this.prompt(tool, args, preview, signal, force));
     this.chain = run.catch(() => undefined);
     return run;
   }
 
-  private prompt(tool: ToolDef, args: Record<string, any>, preview?: string, signal?: AbortSignal): Promise<boolean> {
-    return this.exclusive(() => signal?.aborted ? Promise.resolve(false) : this.showPrompt(tool, args, preview));
+  private prompt(tool: ToolDef, args: Record<string, any>, preview?: string, signal?: AbortSignal, force = false): Promise<boolean> {
+    return this.exclusive(() => signal?.aborted ? Promise.resolve(false) : this.showPrompt(tool, args, preview, force));
   }
 
-  private async showPrompt(tool: ToolDef, args: Record<string, any>, preview?: string): Promise<boolean> {
+  private async showPrompt(tool: ToolDef, args: Record<string, any>, preview?: string, force = false): Promise<boolean> {
     const title =
       tool.risk === "shell"
         ? t("Run this command?", "Выполнить эту команду?")
@@ -118,6 +142,9 @@ export class PermissionBroker {
     // this pane is blocked on a human.
     this.onWaiting?.(tool.name, String(target || title));
     if (target) padded(c.dim(truncate(String(target), 100)));
+    if (force) {
+      padded(c.gray(t("This command reaches another machine — it is confirmed even with YOLO on.", "Команда уходит на другую машину — подтверждение нужно даже при включённом YOLO.")));
+    }
     if (preview) {
       line();
       this.noteShown(preview);
@@ -135,7 +162,14 @@ export class PermissionBroker {
     const answer = await choose<"once" | "always" | "reject">(
       [
         { value: "once", label: t("Allow", "Разрешить"), key: "y", tone: "ok" },
-        { value: "always", label: t("Always allow {name} this session", "Всегда разрешать {name} в этой сессии", { name: tool.name }), key: "a", tone: "warn" },
+        {
+          value: "always",
+          label: force
+            ? t("Always allow remote commands this session", "Всегда разрешать команды на другие машины в этой сессии")
+            : t("Always allow {name} this session", "Всегда разрешать {name} в этой сессии", { name: tool.name }),
+          key: "a",
+          tone: "warn",
+        },
         { value: "reject", label: t("Reject", "Отклонить"), key: "n", tone: "danger" },
       ],
       { initial: "once", fallback: "reject", cancel: () => this.onCancel?.() },
@@ -144,7 +178,7 @@ export class PermissionBroker {
     this.onAnswered?.();
 
     if (answer === "always") {
-      this.sessionAllow.add(tool.name);
+      this.allowForSession(tool.name, force);
       return true;
     }
     return answer === "once";

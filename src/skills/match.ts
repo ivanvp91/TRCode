@@ -9,8 +9,9 @@
  *
  * Scoring is deliberately blunt: a trigger word carries the decision, the name
  * helps, the description only breaks ties. When two skills come out close the
- * pick is dropped rather than guessed — a wrong procedure is worse than none,
- * and the model can still load one itself.
+ * pick is dropped rather than guessed — a wrong procedure is worse than none —
+ * and the model is handed the shortlist instead (`chooseSkills`), so the
+ * decision moves to where the evidence actually is: the request read in full.
  *
  * Matching happens twice: on the request, and again at every step boundary of
  * the turn. A task rarely announces everything it will need in its first
@@ -19,7 +20,7 @@
  * that never arrived. See `skillInterjector`.
  */
 import type { Message, ToolCall } from "../types.js";
-import type { Skill } from "./loader.js";
+import { catalogueLine, type Skill } from "./loader.js";
 
 export interface Pick {
   skill: Skill;
@@ -44,8 +45,21 @@ const STEP_THRESHOLD = 5;
 /** How far the winner must be ahead of the runner-up to be unambiguous. */
 const MARGIN = 1.5;
 
-/** Below this a request is too short to carry intent ("ok", "go on"). */
-const MIN_CHARS = 12;
+/**
+ * Below this a request is too short to carry intent ("ok", "go on"). Low
+ * enough for the way people actually type a command — "почини ci" is nine
+ * characters and says exactly what is wanted — while a bare word ("деплой",
+ * "тесты") is still left to the model: no verb, no task.
+ */
+const MIN_CHARS = 8;
+
+/**
+ * A word this many skills claim cannot decide between them, so it only ranks.
+ * Two or three sharing a word is ordinary — "prd" belongs to the spec skills,
+ * "экран" to the UI ones — and demoting those to a tie made every such request
+ * fire nothing at all.
+ */
+const GENERIC_CLAIMANTS = 4;
 
 /**
  * Openers that mark a conversation rather than a request for work. They are
@@ -131,6 +145,18 @@ function normalizeTrigger(trigger: string): string {
   return trigger.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 }
 
+/**
+ * A phrase trigger, read word by word rather than as a substring. Russian
+ * inflects the words a request arrives in — "утечку памяти" against the
+ * trigger "утечка памяти" — and a literal `includes` missed every case but
+ * the one the trigger happened to be written in.
+ */
+function phraseHit(trigger: string, raw: string[]): boolean {
+  const parts = normalizeTrigger(trigger).split(" ").filter(Boolean);
+  if (parts.length < 2) return false;
+  return parts.every((p) => raw.some((t) => t === p || related(t, p)));
+}
+
 function words(text: string): string[] {
   return normalize(text)
     .split(" ")
@@ -149,6 +175,12 @@ function related(a: string, b: string): boolean {
   let shared = 0;
   while (shared < n && a[shared] === b[shared]) shared++;
   if (shared < 4) return false;
+  // A four-letter stem is short enough that a two-letter tail is a different
+  // word, not an ending: "прод" (production) read as "продаж" (sales) pulled
+  // the server skill into a request about a sales chart. One extra letter is
+  // an ending ("тест / тесты", "план / планы"); more is a derivation the stem
+  // is too short to carry.
+  if (n === 4 && (a.length - shared > 1 || b.length - shared > 1)) return false;
   // Only the ending may differ — "дублирование" against "дублирования". A
   // longer shared stem earns more slack, because that is where the long
   // Russian endings are; four shared letters and two different tails is a
@@ -164,8 +196,8 @@ interface Scored extends Pick {
 
 function scoreSkill(
   skill: Skill,
-  text: string,
   tokens: string[],
+  raw: string[],
   phrases: string[],
   generic: Set<string>,
 ): Scored {
@@ -180,7 +212,7 @@ function scoreSkill(
   for (const trigger of skill.triggers) {
     // A phrase is worth more than a word because it is far harder to hit by
     // accident: "ревью дизайна" means one thing, "дизайн" means several.
-    if (trigger.includes(" ") && text.includes(normalizeTrigger(trigger))) {
+    if (trigger.includes(" ") && phraseHit(trigger, raw)) {
       score += 5;
       triggered = true;
       matched.push(trigger);
@@ -216,16 +248,28 @@ function scoreSkill(
   return { skill, score, matched, triggered };
 }
 
-/**
- * The skill a request calls for, or null when nothing matches clearly.
- * `exclude` holds the skills already loaded in this session — a procedure is
- * worth sending once, not on every turn that mentions the same word.
- */
-export function pickSkill(
+export interface SkillChoice {
+  /** The one match that came out clearly ahead, if there was one. */
+  pick: Pick | null;
+  /**
+   * Genuine contenders, when there was no clear winner. Sending one of two
+   * bodies would be a guess with a few thousand tokens behind it; the names
+   * and one-line descriptions cost a fraction of that and let the model — which
+   * reads the whole request, not a bag of trigger words — decide.
+   */
+  rivals: Pick[];
+}
+
+interface Ranked {
+  ranked: Scored[];
+  threshold: number;
+}
+
+function rank(
   skills: Skill[],
   request: string,
-  opts: { exclude?: Set<string>; threshold?: number } = {},
-): Pick | null {
+  opts: { exclude?: Set<string>; threshold?: number },
+): Ranked | null {
   const threshold = opts.threshold ?? THRESHOLD;
   const text = normalize(request);
   if (text.length < MIN_CHARS) return null;
@@ -239,35 +283,73 @@ export function pickSkill(
   if (!tokens.length) return null;
 
   const candidates = skills.filter((s) => s.auto && !opts.exclude?.has(s.name));
+  const raw = text.split(" ").filter(Boolean);
 
   // Phrases are collected across all candidates first: which of them the text
   // hit decides whether a bare word elsewhere counts as its own evidence.
   const phrases: string[] = [];
   for (const s of candidates) {
     for (const t of s.triggers) {
-      if (t.includes(" ") && text.includes(normalizeTrigger(t))) phrases.push(normalizeTrigger(t));
+      if (t.includes(" ") && phraseHit(t, raw)) phrases.push(normalizeTrigger(t));
     }
   }
 
-  // A word that several skills claim cannot decide between them: "дизайн",
-  // "тест", "план" belong to half the catalogue, and a sentence containing one
-  // says nothing about which procedure the request needs.
+  // A word that half the catalogue claims cannot decide between them: "дизайн",
+  // "тест", "план" belong to many skills, and a sentence containing one says
+  // nothing about which procedure the request needs.
   const claims = new Map<string, number>();
   for (const s of candidates) {
     for (const t of new Set(s.triggers)) if (!t.includes(" ")) claims.set(t, (claims.get(t) ?? 0) + 1);
   }
-  const generic = new Set([...claims].filter(([, n]) => n >= 3).map(([t]) => t));
+  const generic = new Set([...claims].filter(([, n]) => n >= GENERIC_CLAIMANTS).map(([t]) => t));
 
   const ranked = candidates
-    .map((s) => scoreSkill(s, text, tokens, phrases, generic))
+    .map((s) => scoreSkill(s, tokens, raw, phrases, generic))
     .sort((a, b) => b.score - a.score);
 
-  const [best, second] = ranked;
+  return { ranked, threshold };
+}
+
+/**
+ * The best clear match, or null with the contenders it could not separate.
+ * `exclude` holds the skills already loaded in this session — a procedure is
+ * worth sending once, not on every turn that mentions the same word.
+ */
+export function chooseSkills(
+  skills: Skill[],
+  request: string,
+  opts: { exclude?: Set<string>; threshold?: number } = {},
+): SkillChoice {
+  const result = rank(skills, request, opts);
+  if (!result) return { pick: null, rivals: [] };
+
   // Name and description are the model's way in; firing by itself takes a
   // trigger, so "run npm test" cannot pull in the skill about writing them.
-  if (!best || !best.triggered || best.score < threshold) return null;
-  if (second && best.score - second.score < MARGIN) return null;
-  return { skill: best.skill, score: best.score, matched: best.matched };
+  const live = result.ranked.filter((c) => c.triggered && c.score >= result.threshold);
+  const [best, second] = live;
+  if (!best) return { pick: null, rivals: [] };
+  if (!second || best.score - second.score >= MARGIN) {
+    return { pick: { skill: best.skill, score: best.score, matched: best.matched }, rivals: [] };
+  }
+  return { pick: null, rivals: live.filter((c) => best.score - c.score < MARGIN).slice(0, 3) };
+}
+
+/** The skill a request calls for, or null when nothing matches clearly. */
+export function pickSkill(
+  skills: Skill[],
+  request: string,
+  opts: { exclude?: Set<string>; threshold?: number } = {},
+): Pick | null {
+  return chooseSkills(skills, request, opts).pick;
+}
+
+/** The short block sent when the matcher cannot separate two procedures. */
+export function skillChoice(rivals: Pick[]): string {
+  const rows = rivals.map((r) => `- ${r.skill.name}: ${catalogueLine(r.skill.description, 160)}`).join("\n");
+  return `<skill-choice>
+Several skills fit this request. Decide which one covers what is actually being asked and CALL the skill tool with its name BEFORE starting work — the skill holds a proven procedure that outranks your default approach. If none of them fits, ignore this note.
+${rows}
+</skill-choice>`;
 }
 
 /** The injected turn: the procedure itself, plus why it is there. */

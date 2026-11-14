@@ -13,6 +13,7 @@ import {
   type InjectedContext,
 } from "../session/projection.js";
 import { boundToolOutput } from "../tools/spill.js";
+import { runHookEvent } from "../hooks.js";
 import { contextWindowFor } from "../provider/models.js";
 import type { Message, ModelInfo, ToolCall, ToolContext, ToolDef, Usage } from "../types.js";
 import { UsageTracker } from "../usage.js";
@@ -57,7 +58,7 @@ export interface RunOptions {
   /** Reasoning budget for this run; resolved by the caller. */
   effort?: Effort;
   /** Interactive stall handler; see ChatRequest.onStall. */
-  onStall?: (idleMs: number) => Promise<boolean>;
+  onStall?: (idleMs: number, resolved: AbortSignal) => Promise<boolean>;
   /** A send is held back by a learned rate limit; see ChatRequest.onRateWait. */
   onRateWait?: (waitMs: number, model: string, said: string) => void;
   /** A transient upstream failure is being waited out; see ChatRequest.onRetryWait. */
@@ -209,6 +210,20 @@ async function runToolCalls(
       }
 
       events?.onToolStart?.(tool, parsed.args, call);
+      // A PreToolUse hook answers before the tool does: exit 2 is a refusal in
+      // the hook's own words, and the tool is never run. This is where a
+      // project forbids a command, or rewrites its arguments, without asking.
+      const pre = await runHookEvent("PreToolUse", { cwd: ctx.cwd, tool: tool.name, args: parsed.args }, ctx.signal);
+      if (pre.blocked) {
+        results[i] = {
+          role: "tool",
+          tool_call_id: call.id,
+          name: tool.name,
+          content: `Blocked by a hook: ${pre.reason}`,
+        };
+        events?.onToolEnd?.(tool, false, `hook: ${pre.reason}`, call);
+        continue;
+      }
       try {
         const res = await tool.run(parsed.args, ctx);
         const bound = boundToolOutput(ctx.spill, res.output, {
@@ -217,11 +232,19 @@ async function runToolCalls(
           limit: cfg.toolResultMaxBytes,
           dedupeMin: cfg.trimMinBytes,
         });
+        // A PostToolUse hook that fails speaks to the model here, where it
+        // reads what the call produced — the usual use is "the formatter or the
+        // linter rejected this", and the model fixes it on the next step.
+        const post = await runHookEvent(
+          "PostToolUse",
+          { cwd: ctx.cwd, tool: tool.name, args: parsed.args, output: bound.content },
+          ctx.signal,
+        );
         results[i] = {
           role: "tool",
           tool_call_id: call.id,
           name: tool.name,
-          content: bound.content,
+          content: post.blocked ? `${bound.content}\n\n[hook feedback] ${post.reason}` : bound.content,
           // Screenshots and the like: real image content for a vision model,
           // not a path it cannot follow. Trim drops them from old results.
           images: res.images,
@@ -609,10 +632,11 @@ function interruptedResults(calls: ToolCall[], done: Message[]): Message[] {
 
 /**
  * The ceiling a delegated run gets: its own, unless the user asked for a
- * tighter one. Subagents, plans and swarm steps keep a bound even when the
- * main loop has none — nobody is watching them, they cannot be told to
- * continue, and the agent that launched them can always launch another.
+ * tighter one. Zero means "no ceiling on this side": a session ceiling still
+ * applies to a helper that has none of its own, and a helper's own bound holds
+ * even when the main loop is unlimited.
  */
 export function stepCeiling(configured: number, own: number): number {
-  return configured > 0 ? Math.min(configured, own) : own;
+  if (configured <= 0) return Math.max(0, own);
+  return own > 0 ? Math.min(configured, own) : configured;
 }

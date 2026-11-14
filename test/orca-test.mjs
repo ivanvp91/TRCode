@@ -12,6 +12,8 @@ const HOME = fs.mkdtempSync(path.join(os.tmpdir(), "trc-orca-"));
 process.env.TRCODE_HOME = HOME;
 
 let received = [];
+/** Every post of the whole run, for the rule that no report names a conversation. */
+let allPosts = [];
 let failNext = 0;
 let hangNext = 0;
 
@@ -31,6 +33,7 @@ const server = http.createServer((req, res) => {
     let parsed = null;
     try { parsed = JSON.parse(body); } catch { /* recorded as null */ }
     received.push({ url: req.url, token: req.headers["x-orca-agent-hook-token"], body: parsed });
+    if (parsed) allPosts.push(parsed);
     res.writeHead(204).end();
   });
 });
@@ -84,8 +87,8 @@ check("detected inside an Orca pane", Boolean(reporter));
 }
 
 // ── the envelope ────────────────────────────────────────────────────────────
-reporter.busy("s1");
-reporter.userPrompt("почини сборку", "s1");
+reporter.busy();
+reporter.userPrompt("почини сборку");
 await settle(2);
 {
   const first = received[0];
@@ -99,13 +102,13 @@ await settle(2);
 
 // ── a repeated status is not re-sent ────────────────────────────────────────
 received = [];
-reporter.busy("s1");
+reporter.busy();
 await sleep(80);
 check("busy twice posts once", received.length === 0, JSON.stringify(events()));
 
 // ── streamed text is coalesced ──────────────────────────────────────────────
 received = [];
-for (let i = 1; i <= 40; i++) reporter.assistantText("часть ".repeat(i), "s1");
+for (let i = 1; i <= 40; i++) reporter.assistantText("часть ".repeat(i));
 await sleep(500);
 {
   const parts = received.filter((r) => r.body?.payload?.hook_event_name === "MessagePart");
@@ -120,14 +123,14 @@ await settle(1);
 check("permission asks are forwarded", events()[0] === "PermissionRequest", events().join(","));
 check("the tool is named", received[0]?.body?.payload?.toolName === "shell");
 received = [];
-reporter.busy("s1");
+reporter.busy();
 await settle(1);
 check("busy still fires after a permission ask", events()[0] === "SessionBusy", events().join(","));
 
 // ── idle flushes the preview and waits for delivery ─────────────────────────
 received = [];
-reporter.assistantText("итоговый ответ", "s1");
-await reporter.idle("s1");
+reporter.assistantText("итоговый ответ");
+await reporter.idle();
 {
   const names = events();
   // Both must arrive; which lands first is not ours to promise — post() fires
@@ -140,23 +143,34 @@ await reporter.idle("s1");
 {
   received = [];
   failNext = 2;
-  reporter.busy("s2");
+  reporter.busy();
   reporter.waiting("write", "src/index.ts");
-  await reporter.idle("s2");
+  await reporter.idle();
   check("a failing server is survivable", true);
 
   hangNext = 1;
   const started = Date.now();
-  reporter.busy("s3");
-  await reporter.idle("s3");
+  reporter.busy();
+  await reporter.idle();
   check(`a hanging server does not stall the turn (${Date.now() - started}ms)`, Date.now() - started < 3000, String(Date.now() - started));
 
   // A closed Orca is the normal case for most users.
   await new Promise((r) => server.close(r));
   const t0 = Date.now();
-  reporter.busy("s4");
-  await reporter.idle("s4");
+  reporter.busy();
+  await reporter.idle();
   check(`a closed server costs nothing (${Date.now() - t0}ms)`, Date.now() - t0 < 2000, String(Date.now() - t0));
+}
+
+// ── nothing tempts Orca into resuming the pane as another agent ──────────────
+// Orca saves a session id from the opencode route as resumable and later starts
+// the pane with `opencode --session <id>`; a trcode id makes opencode refuse the
+// whole session ("Expected a string starting with \"ses\"").
+{
+  const named = allPosts.filter((p) =>
+    ["sessionID", "session_id", "sessionId", "conversation_id", "conversationId"].some((k) => k in (p.payload ?? {})),
+  );
+  check(`no report names a conversation (${allPosts.length} posts)`, allPosts.length > 0 && named.length === 0, JSON.stringify(named.slice(0, 2)));
 }
 
 fs.rmSync(HOME, { recursive: true, force: true });

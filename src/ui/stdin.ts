@@ -14,6 +14,30 @@ const stack: InputConsumer[] = [];
 let attached = false;
 let lastCtrlC = 0;
 
+/**
+ * The terminal's own focus report, asked for with DECSET 1004.
+ *
+ * A pane that is switched away and back may be re-laid out while nobody is
+ * looking at it, and no resize is delivered for that: the app's idea of the
+ * screen and the screen itself drift apart, and the block at the bottom is drawn
+ * in the wrong place over what was left of the old one. The focus report is the
+ * only notice a terminal gives that its content is about to be looked at again.
+ */
+const FOCUS_IN = "\x1b[I";
+const FOCUS_OUT = "\x1b[O";
+const ENABLE_FOCUS = "\x1b[?1004h";
+const DISABLE_FOCUS = "\x1b[?1004l";
+const focusHandlers: ((focused: boolean) => void)[] = [];
+
+/** Listens for focus changes; call the returned function to stop listening. */
+export function onTerminalFocus(fn: (focused: boolean) => void): () => void {
+  focusHandlers.push(fn);
+  return () => {
+    const i = focusHandlers.indexOf(fn);
+    if (i !== -1) focusHandlers.splice(i, 1);
+  };
+}
+
 function dispatch(chunk: Buffer): void {
   // Safety net ahead of every widget: raw mode swallows SIGINT, so if the
   // consumer chain ever wedges, no key would work at all. A double Ctrl+C
@@ -26,6 +50,16 @@ function dispatch(chunk: Buffer): void {
       process.exit(130);
     }
     lastCtrlC = now;
+  }
+  // The focus report is the terminal talking, not the user: it never reaches a
+  // widget, which would type "[I" into the prompt.
+  const text = chunk.toString("utf8");
+  if (text.includes(FOCUS_IN) || text.includes(FOCUS_OUT)) {
+    const focused = text.includes(FOCUS_IN);
+    const rest = text.split(FOCUS_IN).join("").split(FOCUS_OUT).join("");
+    for (const fn of focusHandlers) fn(focused);
+    if (!rest) return;
+    chunk = Buffer.from(rest, "utf8");
   }
   const top = stack[stack.length - 1];
   if (top) top(chunk);
@@ -43,6 +77,7 @@ function ensureAttached(): void {
   process.stdin.resume();
   process.stdin.on("data", dispatch);
   attached = true;
+  if (process.stdout.isTTY) process.stdout.write(ENABLE_FOCUS);
 }
 
 /** Makes `fn` the active consumer; call the returned function to step back. */
@@ -67,6 +102,7 @@ export function hasConsumer(): boolean {
 export function releaseStdin(): void {
   stack.length = 0;
   if (!attached) return;
+  if (process.stdout.isTTY) process.stdout.write(DISABLE_FOCUS);
   process.stdin.removeListener("data", dispatch);
   try {
     process.stdin.setRawMode(false);

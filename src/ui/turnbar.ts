@@ -770,8 +770,14 @@ export class TurnBar {
     // the status is chrome, and without the gap the two read as one block.
     rows.push("");
 
-    const gap = Math.max(2, statusWidth() - width(st.left) - width(st.hint));
-    rows.push(indent + st.left + " ".repeat(gap) + st.hint);
+    // The left half is state and the hint is a reminder, so the hint keeps its
+    // room: a model id long enough to push the row past the terminal would make
+    // it wrap, which costs the frame a row it cannot count (see frameLines).
+    const rowW = statusWidth();
+    const hint = clipAnsi(st.hint, Math.max(6, rowW - 6));
+    const left = clipAnsi(st.left, Math.max(4, rowW - width(hint) - 2));
+    const gap = Math.max(2, rowW - width(left) - width(hint));
+    rows.push(indent + left + " ".repeat(gap) + hint);
     rows.push(indent + contextRow(st, statusWidth()));
     return rows;
   }

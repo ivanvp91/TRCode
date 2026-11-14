@@ -166,7 +166,9 @@ Three ways to distribute agent work, using the same worker execution policy, plu
   turn run at once; each has its own context and model, and the lead agent sees only their
   final text. A request with several independent parts is fanned out this way without being
   asked, and the running helpers are listed in the turn bar with their model, step budget
-  used and tokens spent. `read_only: true` gives a scout with no write access. By default a
+  used and tokens spent. A helper is not capped by default — it works until it stops, like
+  the main loop — and `"subagentSteps"` in the config puts a ceiling back; a role preset
+  with `maxSteps` still bounds a narrow helper. `read_only: true` gives a scout with no write access. By default a
   subagent runs on **the session's own model** — `/subagents` names other models it may be
   launched on (a session left open once sent its reconnaissance to the cheapest id in an
   OpenRouter catalog: 130 requests, 2.8M input tokens on a model nobody chose for this).
@@ -475,16 +477,21 @@ result are already in the transcript, and the turn bar gives those rows back to 
 that follows. The row uses the stats line's palette: the model in orange, the numbers,
 the percentage and the action in gray.
 
-A subagent is paid for by the key this session is using, and it runs on **the session's own
-model by default**. `/subagents` is where that is decided — two modes, and the panel says
-which one is in force:
+A subagent is paid for by the key behind the model it runs on, and it runs on **the
+session's own model by default**. Any connected provider can be a helper's host: the list
+is one list for the whole client, and a marked model of another provider is offered to the
+lead next to the session's own — that host's key pays for it. `/subagents` is where that
+is decided — two modes, and the panel says which one is in force:
 
 - **the session's model** — every subagent runs on whatever the session runs on;
-- **a list you chose** — subagents may be launched on any model marked in it.
+- **a list you chose** — subagents may be launched on any model marked in it, from any
+  connected provider.
 
-The list is kept either way. Switching to the session's model does not throw it away, so
-coming back to a shortlist of five costs one keystroke instead of five choices; `Forget the
-list` is the separate, deliberate button.
+The panel has a tab per connected provider — the session's host first — and a Favorites
+tab, so reaching a model on another plan costs one `←/→`. The list is kept either way.
+Switching to the session's model does not throw it away, so coming back to a shortlist of
+five costs one keystroke instead of five choices; `Forget the list` is the separate,
+deliberate button.
 
 ```
 /subagents              # the panel: Space marks, Enter saves and switches to the list

@@ -10,11 +10,12 @@
 import { appendFileSync } from "node:fs";
 import { stashPaste, takeCollapsed } from "./paste.js";
 import { panelRows } from "./panel.js";
-import { pushConsumer } from "./stdin.js";
+import { onTerminalFocus, pushConsumer } from "./stdin.js";
 import { c, clipAnsi, cursor, esc, hasColor, width } from "./ansi.js";
 import { t } from "../i18n.js";
 import { bandTextWidth, contentWidth, fullWidth, indent, PAD_LEFT, statusWidth } from "./layout.js";
 import { contextRow } from "./inputbox.js";
+import { trace } from "./trace.js";
 import {
   expandedBlock,
   bandRow,
@@ -30,6 +31,9 @@ import {
   line,
   padded,
   paintFrame,
+  reanchorSeq,
+  setIdleComposer,
+  wrappedRowOffset,
 } from "./render.js";
 
 const CTRL_A = String.fromCharCode(1);
@@ -326,6 +330,12 @@ export class InputEditor {
   private pos = 0;
   private renderedRows = 0;
   private cursorRow = 0;
+  /** The frame as it was painted, the width it was built for, its caret column. */
+  private painted: string[] = [];
+  private paintedCols = 0;
+  private paintedCaretCol = 0;
+  /** True when the terminal has rewrapped that frame since it was painted. */
+  private reflowed = false;
   /** Rows this frame opened under the transcript to reach the bottom edge. */
   private dropRows = 0;
   /** Rows of the conversation the menu overlay is covering, and what was there. */
@@ -461,6 +471,8 @@ export class InputEditor {
     this.historyIdx = -1;
     this.renderedRows = 0;
     this.cursorRow = 0;
+    this.painted = [];
+    this.reflowed = false;
     this.menu = [];
     this.menuIdx = 0;
     this.menuDismissed = false;
@@ -472,8 +484,34 @@ export class InputEditor {
       // Attached at the end of read(), once onData exists.
       let release: () => void = () => {};
 
-      const onResize = () => this.repaint();
+      // A window that changes width rewraps the frame on screen, so the walk
+      // back to its top cannot be counted in the lines we drew there any more
+      // (see wrappedRowOffset).
+      const onResize = () => {
+        const cols = process.stdout.columns || 80;
+        if (this.renderedRows && this.paintedCols && cols !== this.paintedCols) this.reflowed = true;
+        this.repaint();
+      };
       process.stdout.on("resize", onResize);
+      // The pane was away and came back: it may have been laid out again while
+      // hidden, without a resize to say so. The frame is written again instead
+      // of being walked back over by a count the terminal may not honour.
+      const offFocus = onTerminalFocus((focused) => {
+        if (!focused || !this.renderedRows) return;
+        this.reflowed = true;
+        this.repaint();
+      });
+      // A line the app prints on its own — a late tool tail, an update notice —
+      // used to land on the row this frame's caret stands on and take the input
+      // band with it. The composer is not a footer, so it gives the modal
+      // renderer the way out and back under the line instead.
+      setIdleComposer({
+        erase: () => this.frameErase(),
+        replace: () => {
+          sealBlankRows();
+          this.repaint();
+        },
+      });
 
       let settled = false;
       const finish = (value: string | null) => {
@@ -481,7 +519,9 @@ export class InputEditor {
         settled = true;
         this.abortRead = null;
         release();
+        setIdleComposer(null);
         process.stdout.removeListener("resize", onResize);
+        offFocus();
         setBracketedPaste(false);
         this.pasting = false;
         this.pasteBuf = "";
@@ -793,13 +833,28 @@ export class InputEditor {
     return locatePos(this.buf, this.pos, inner);
   }
 
-  private erase(): void {
-    if (!this.renderedRows) return;
-    // One write, like every other frame here: the walk up and the clear must
-    // not be two separate repaints for the terminal to show.
-    process.stdout.write(esc.toColumn(1) + esc.up(this.cursorRow) + esc.clearDown);
+  /**
+   * The escape sequence that lifts the frame, cursor left on its top row.
+   *
+   * Returned rather than written: a line the app prints on its own has to go
+   * into the same write as this, or the composer blinks out between the two.
+   */
+  private frameErase(): string {
+    if (!this.renderedRows) return "";
+    const seq = esc.toColumn(1) + esc.up(this.caretWalk()) + esc.clearDown;
     this.renderedRows = 0;
     this.cursorRow = 0;
+    this.painted = [];
+    this.reflowed = false;
+    return seq;
+  }
+
+  private erase(): void {
+    // One write, like every other frame here: the walk up and the clear must
+    // not be two separate repaints for the terminal to show.
+    const seq = this.frameErase();
+    if (!seq) return;
+    process.stdout.write(seq);
     // What is printed next starts at the frame's old top, under the blank rows
     // it dropped over — they are history now, not a gap above the input.
     sealBlankRows();
@@ -828,6 +883,18 @@ export class InputEditor {
       this.lastMenuBuf = this.buf;
     }
     this.refreshMenu();
+  }
+
+  /**
+   * Rows from the frame's top to the caret as the screen shows them today.
+   *
+   * The line count is right until the window changes width: the terminal then
+   * rewraps the rows it already shows, and a line we drew as one row may stand
+   * there as two. Walking up by the count would stop inside the frame.
+   */
+  private caretWalk(): number {
+    if (!this.reflowed || !this.painted.length) return this.cursorRow;
+    return wrappedRowOffset(this.painted, this.cursorRow, this.paintedCaretCol);
   }
 
   private draw(): void {
@@ -891,20 +958,44 @@ export class InputEditor {
     // every keystroke that moment is what flickered. Writing over the old rows
     // instead means no frame ever shows the box missing. The caret is hidden
     // for the walk: otherwise it reads as jumping a line up and snapping back.
-    const prev = this.renderedRows;
-    const reclaimed = prev ? 0 : takeFooterSlack(lines.length);
-    const shrink = Math.max(0, prev - lines.length);
+    // The frame the terminal shows may be taller than the lines it was built
+    // from: a window that changed width rewraps it. Counting the lines there
+    // would leave the rows above the erase point behind as a second frame.
+    const prev = this.reflowed && this.painted.length ? wrappedRowOffset(this.painted, this.painted.length, 0) : this.renderedRows;
+    // A width change is answered by writing the area again rather than walking
+    // back over rows whose count the terminal may not honour: see reanchorSeq.
+    const reanchor = this.reflowed && this.painted.length > 0;
+    const reclaimed = reanchor || prev ? 0 : takeFooterSlack(lines.length);
+    const shrink = reanchor ? 0 : Math.max(0, prev - lines.length);
     // Return rows freed by a shorter draft immediately. Shifting the visible
     // transcript down keeps it adjacent to the input while the status stays
     // at the bottom, without accumulating padding during history navigation.
-    const returned = bottomPinned() ? shrink : 0;
+    // Rewrapped rows are cleared where they stand instead: the transcript under
+    // them is not the text the log remembers.
+    const returned = reanchor ? 0 : this.reflowed ? 0 : bottomPinned() ? shrink : 0;
     // A taller window (or the first draw under a banner) opens rows below the
     // prompt, and the prompt follows them down: the composer belongs on the
     // last line of the screen, not wherever the frame happened to be left.
     // Rows reclaimed from a bar that came off the screen have already moved it
     // there — asking for a drop on top of that move would open a gap under the
     // stats, which is exactly the strip the reclaim exists to avoid.
-    const drop = reclaimed ? 0 : bottomGap(lines.length);
+    //
+    // After a rewrap the rows the frame gave up are blank air under it, and the
+    // composer has to come back down over them: the count is what the terminal
+    // showed against what it gets now.
+    const drop = reanchor ? 0 : this.reflowed ? shrink : reclaimed ? 0 : bottomGap(lines.length);
+    trace("composer", {
+      cols: process.stdout.columns || 0,
+      rows: screenHeight(),
+      prev,
+      h: lines.length,
+      reclaim: reclaimed,
+      shrink,
+      drop,
+      reanchor: reanchor ? 1 : 0,
+      reflow: this.reflowed ? 1 : 0,
+      pinned: bottomPinned() ? 1 : 0,
+    });
     // The overlay puts back what it covers from the row log, so the blank rows
     // that hold the composer away from the transcript have to be in it: a menu
     // over a gap must restore a gap, not the last lines of the conversation.
@@ -913,7 +1004,8 @@ export class InputEditor {
       noteBlankRows(drop);
     }
     let frame = esc.hide;
-    if (prev) frame += esc.toColumn(1) + esc.up(this.cursorRow);
+    if (reanchor) frame += reanchorSeq(lines);
+    else if (prev) frame += esc.toColumn(1) + esc.up(this.caretWalk());
     // Only cleared footer rows are discarded. Moving the transcript with the
     // composer avoids converting the live spinner/preview height into a gap.
     // Capped at the screen: scrolling further than that only pushes the
@@ -934,10 +1026,16 @@ export class InputEditor {
     frame += esc.up(lastRow - targetRow) + esc.toColumn(caretCol) + esc.show;
     paintFrame(frame);
 
-    bottomDrawn(lines.length, drop > 0 || reclaimed > 0);
+    bottomDrawn(lines.length, reanchor || drop > 0 || reclaimed > 0);
     this.paintOverlay(menu, targetRow, caretCol);
     this.renderedRows = lines.length;
     this.cursorRow = targetRow;
+    // What the terminal now shows, and at which width — the next repaint counts
+    // its rows and may have to count them again after a rewrap.
+    this.painted = lines;
+    this.paintedCols = process.stdout.columns || 80;
+    this.paintedCaretCol = Math.max(0, caretCol - 1);
+    this.reflowed = false;
   }
 
   /**

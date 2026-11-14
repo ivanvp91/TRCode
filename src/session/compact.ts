@@ -10,6 +10,7 @@
  */
 import { complete, repairToolPairs } from "../provider/client.js";
 import { loadConfig } from "../config.js";
+import { fireHookEvent } from "../hooks.js";
 import { contextWindowFor } from "../provider/models.js";
 import { estimateTokens, historyTokens } from "../usage.js";
 import type { Message, ModelInfo } from "../types.js";
@@ -95,10 +96,10 @@ function isDigest(m: Message): boolean {
 }
 
 function isRealUser(m: Message): boolean {
-  // Injected context rides as a user message too — skill bodies, UI briefs —
-  // and carrying one verbatim would spend the whole budget on something the
-  // summary can describe in a line.
-  return m.role === "user" && !isDigest(m) && !m.meta?.hidden && !m.meta?.skill;
+  // Injected context rides as a user message too — skill bodies, UI briefs,
+  // a shortlist of contender skills — and carrying one verbatim would spend the
+  // whole budget on something the summary can describe in a line.
+  return m.role === "user" && !isDigest(m) && !m.meta?.hidden && !m.meta?.skill && !m.meta?.skillChoice;
 }
 
 /** Serialises history into a transcript the summariser model can read. */
@@ -200,6 +201,9 @@ export async function compactSession(
 ): Promise<CompactResult> {
   const cfg = loadConfig();
   const level = opts.level ?? "full";
+  // A project may want to save the transcript somewhere before it is folded
+  // away. The hook cannot stop the compaction — it is a place to take a copy.
+  fireHookEvent("PreCompact", { cwd: session.cwd, sessionId: session.id, model: session.model });
   const all = session.messages;
   // Medium keeps the tail it is in the middle of working on; full keeps only
   // what is cheap to keep — the user's own words.

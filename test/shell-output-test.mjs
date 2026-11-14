@@ -69,6 +69,7 @@ check("short output is verbatim", /just this/.test(small.output) && !/omitted/.t
   check("a command that keeps printing is not killed", !res.isError, res.output.slice(-120));
   check("even well past the idle limit", secs > 2.5, secs.toFixed(1) + "s");
   check("and its output is tailed live", lines.length > 1, JSON.stringify(lines.slice(0, 3)));
+  check("the tail is the command's own line, with no elapsed prefix", lines.every((l) => !/^\d+s · /.test(l)), JSON.stringify(lines.slice(0, 3)));
 }
 
 // Silence is still a reason to stop.

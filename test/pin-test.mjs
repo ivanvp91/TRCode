@@ -41,6 +41,9 @@ class Screen {
     // The background each cell was painted with, so a band can be told from a
     // blank row — both are spaces.
     this.bgGrid = Array.from({ length: rows }, () => Array(cols).fill(""));
+    // How far into each row a character was actually written: a row of band
+    // padding ends where its spaces do, and a rewrap has to count them.
+    this.used = Array(rows).fill(0);
     this.bg = "";
     this.row = 0;
     this.col = 0;
@@ -52,12 +55,55 @@ class Screen {
     this.grid.push(this.blank());
     this.bgGrid.shift();
     this.bgGrid.push(this.blankBg());
+    this.used.shift();
+    this.used.push(0);
   }
   resized(rows) {
-    while (this.grid.length < rows) { this.grid.push(this.blank()); this.bgGrid.push(this.blankBg()); }
-    while (this.grid.length > rows) { this.grid.pop(); this.bgGrid.pop(); }
+    while (this.grid.length < rows) { this.grid.push(this.blank()); this.bgGrid.push(this.blankBg()); this.used.push(0); }
+    while (this.grid.length > rows) { this.grid.pop(); this.bgGrid.pop(); this.used.pop(); }
     this.rows = rows;
     this.row = Math.min(this.row, rows - 1);
+  }
+  /**
+   * A window that changes width rewraps what it already shows, the way a real
+   * one does: a row wider than the new width takes two, a shorter one stays a
+   * row, and the cursor follows the character it stood on. Rows that overflow
+   * the screen scroll off the top. This is what a switched pane does to the
+   * frame already on the screen.
+   */
+  rewrap(cols, rows) {
+    const out = [];
+    const outBg = [];
+    const outUsed = [];
+    let caretRow = 0;
+    let caretCol = Math.min(this.col, cols - 1);
+    for (let y = 0; y < this.grid.length; y++) {
+      const text = this.grid[y].join("").slice(0, this.used[y]);
+      const bgRow = this.bgGrid[y];
+      const pieces = Math.max(1, Math.ceil(text.length / cols));
+      for (let i = 0; i < pieces; i++) {
+        if (y === this.row && (this.col < (i + 1) * cols || i === pieces - 1)) {
+          caretRow = out.length;
+          caretCol = Math.min(cols - 1, Math.max(0, this.col - i * cols));
+        }
+        const piece = text.slice(i * cols, i * cols + cols);
+        out.push(piece.padEnd(cols).split(""));
+        outUsed.push(piece.length);
+        const cells = bgRow.slice(i * cols, i * cols + cols);
+        while (cells.length < cols) cells.push("");
+        outBg.push(cells);
+      }
+    }
+    while (out.length < rows) { out.push(Array(cols).fill(" ")); outBg.push(Array(cols).fill("")); outUsed.push(0); }
+    // More rows than the screen holds scroll the top off and lift the cursor.
+    const drop = Math.max(0, out.length - rows);
+    this.cols = cols;
+    this.rows = rows;
+    this.grid = out.slice(drop, drop + rows);
+    this.bgGrid = outBg.slice(drop, drop + rows);
+    this.used = outUsed.slice(drop, drop + rows);
+    this.row = Math.max(0, Math.min(rows - 1, caretRow - drop));
+    this.col = caretCol;
   }
   /** True when the row carries a background colour — a band. */
   banded(y) { return this.bgGrid[y].some((b) => b); }
@@ -79,6 +125,7 @@ class Screen {
             for (let j = 0; j < Math.min(n, this.rows); j++) {
               this.grid.pop(); this.grid.unshift(this.blank());
               this.bgGrid.pop(); this.bgGrid.unshift(this.blankBg());
+              this.used.pop(); this.used.unshift(0);
             }
           }
           else if (cmd === "H") {
@@ -86,9 +133,11 @@ class Screen {
             this.col = Math.max(0, (nums[1] ?? 1) - 1);
           } else if (cmd === "J") {
             for (let x = this.col; x < this.cols; x++) { this.grid[this.row][x] = " "; this.bgGrid[this.row][x] = ""; }
-            for (let y = this.row + 1; y < this.rows; y++) { this.grid[y] = this.blank(); this.bgGrid[y] = this.blankBg(); }
+            this.used[this.row] = Math.min(this.used[this.row], this.col);
+            for (let y = this.row + 1; y < this.rows; y++) { this.grid[y] = this.blank(); this.bgGrid[y] = this.blankBg(); this.used[y] = 0; }
           } else if (cmd === "K") {
             for (let x = this.col; x < this.cols; x++) { this.grid[this.row][x] = " "; this.bgGrid[this.row][x] = ""; }
+            this.used[this.row] = Math.min(this.used[this.row], this.col);
           } else if (cmd === "m") {
             if (m[1] === "49" || m[1] === "0") this.bg = "";
             else if (m[1].startsWith("48;")) this.bg = m[1];
@@ -108,14 +157,46 @@ class Screen {
       } else if (ch === "\r") {
         this.col = 0;
       } else {
-        if (this.col < this.cols) {
-          this.grid[this.row][this.col] = ch;
-          this.bgGrid[this.row][this.col] = this.bg;
+        if (this.col >= this.cols) {
+          // A real terminal wraps here. Dropping the cell instead hid a whole
+          // class of bug: a frame row wider than the pane costs a row the code
+          // that drew it does not know about.
+          this.col = 0;
+          this.row++;
+          if (this.row >= this.rows) { this.scroll(); this.row = this.rows - 1; }
         }
+        this.grid[this.row][this.col] = ch;
+        this.bgGrid[this.row][this.col] = this.bg;
+        this.used[this.row] = Math.max(this.used[this.row], this.col + 1);
         this.col++;
       }
       i++;
     }
+  }
+  /**
+   * A window that changes width and cuts what does not fit, as xterm.js does
+   * with rows it did not soft-wrap itself: the cells beyond the new edge are
+   * gone, the rows stay where they were.
+   */
+  truncate(cols, rows) {
+    const fitCells = (cells) => {
+      const out = cells.slice(0, cols);
+      while (out.length < cols) out.push(typeof out[0] === "string" ? "" : " ");
+      return out;
+    };
+    const fitRows = (arr, fill) => {
+      const out = arr.slice(0, rows).map(fitCells);
+      while (out.length < rows) out.push(Array(cols).fill(fill));
+      return out;
+    };
+    this.grid = fitRows(this.grid, " ");
+    this.bgGrid = fitRows(this.bgGrid, "");
+    this.used = this.used.slice(0, rows).map((u) => Math.min(u, cols));
+    while (this.used.length < rows) this.used.push(0);
+    this.cols = cols;
+    this.rows = rows;
+    this.row = Math.min(this.row, rows - 1);
+    this.col = Math.min(this.col, cols - 1);
   }
   lines() { return this.grid.map((r) => r.join("").replace(/\s+$/, "")); }
   nonEmpty() { return this.lines().filter((l) => l.trim()); }
@@ -331,6 +412,50 @@ render.setFooter(null);
   // empty rows that reads as a gap after an answer.
   const bandAt = lines.findIndex((l) => l.includes("›"));
   check("stats, then exactly the frame's two rows", bandAt === stats + 4, lines.join("\n"));
+
+  stdin.emit("data", Buffer.from("\r"));
+  await p;
+}
+
+// ── a line printed while the composer is up lands above it ──────────────────
+{
+  // The composer is not a footer: nothing takes it down when the app prints on
+  // its own (a late tool tail, an update notice). The line used to be written
+  // onto the row the caret stands on — the input band survived one short line
+  // and was eaten after a few, which is an input line that "disappears" under a
+  // long turn. The frame steps aside for the write and comes back under it.
+  const quiet = new Screen(COLS, ROWS);
+  process.stdout.write = (chunk) => { quiet.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: ROWS, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: COLS, configurable: true });
+  process.stdout.emit("resize");
+
+  render.line("banner");
+  for (let i = 0; i < 9; i++) render.line("a message " + i);
+  render.setStartRow(quiet.row + 1);
+
+  const { InputEditor } = await import("../dist/ui/editor.js");
+  const ed = new InputEditor({
+    status: () => ({ left: "model", hint: "esc to interrupt", context: "context: 3%" }),
+    history: [],
+  });
+  const p = ed.read();
+  await new Promise((r) => setTimeout(r, 40));
+  stdin.emit("data", Buffer.from("hello there", "utf8"));
+  await new Promise((r) => setTimeout(r, 40));
+
+  for (let i = 0; i < 3; i++) render.line("a notice " + i);
+  await new Promise((r) => setTimeout(r, 60));
+
+  const lines = quiet.lines();
+  check("the notices are on screen", /a notice 0/.test(lines.join("\n")), lines.join("\n"));
+  check("the composer is still on the last line", /context: 3%/.test(lines[ROWS - 1]), lines.join("\n"));
+  check("the draft is still in the band", lines.some((l) => l.includes("hello there")), lines.join("\n"));
+  check(
+    "the notices stand above the band",
+    lines.findIndex((l) => /a notice 2/.test(l)) < lines.findIndex((l) => l.includes("›")),
+    lines.join("\n"),
+  );
 
   stdin.emit("data", Buffer.from("\r"));
   await p;
@@ -792,6 +917,332 @@ for (const long of ["first\nsecond\nthird", "wrapped text ".repeat(24)]) {
   check("and the echo stays where it landed", back[2] === "echo line one", back.join("\n"));
   stdin.emit("data", Buffer.from("\r"));
   await again;
+}
+
+// ── the pane is switched: a narrower window rewraps the bar on screen ──────
+//
+// Switching to a pane of another width makes the terminal rewrap what it
+// already shows: a row painted to the old width now takes two. Counting the
+// lines the bar was built from then stops inside the frame, the erase leaves
+// its top rows, and the redraw puts a second bar under them — the stack of
+// "thinking" rows that shows up after a switch.
+{
+  const pane = new Screen(100, 24);
+  process.stdout.write = (chunk) => { pane.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: 24, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  process.stdout.emit("resize");
+  render.setStartRow(null);
+
+  render.line("banner");
+  for (let i = 0; i < 18; i++) render.line("a message " + i);
+  render.setStartRow(pane.row + 1);
+  // Rows that fill the pane: at a narrower width the long ones wrap in two.
+  const bar = () => {
+    const w = Math.max(20, (process.stdout.columns || 80) - 8);
+    return ["bar one " + "a".repeat(w - 8), "", "bar two " + "b".repeat(w - 8), "band"];
+  };
+  render.setFooter(bar);
+  const wide = pane.lines();
+  check("the bar fills the bottom of the pane", wide[23] === "band", wide.join("\n"));
+
+  // A switch to a narrower pane: the terminal rewraps the rows it shows.
+  Object.defineProperty(process.stdout, "columns", { value: 70, configurable: true });
+  pane.rewrap(70, 24);
+  process.stdout.emit("resize");
+  render.refreshFooter();
+  const narrowLines = pane.lines();
+  const firstRow = narrowLines.filter((l) => l.startsWith("bar one")).length;
+  const firstTail = narrowLines.filter((l) => /^a{10,}$/.test(l)).length;
+  check("the rewrapped bar leaves no second copy of itself", firstRow === 1 && firstTail === 0, narrowLines.join("\n"));
+  check("and it still ends on the last line", narrowLines[23] === "band", narrowLines.join("\n"));
+  check("the transcript above it is intact", narrowLines.some((l) => l.startsWith("a message 17")), narrowLines.join("\n"));
+
+  // Back to the wider pane: the frame shrinks under the cursor this time, and
+  // an erase counted in the old rows would walk up over the conversation.
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  pane.rewrap(100, 24);
+  process.stdout.emit("resize");
+  render.refreshFooter();
+  const backLines = pane.lines();
+  check("a wider pane does not eat the lines above the bar", backLines.some((l) => l.startsWith("a message 17")), backLines.join("\n"));
+  check("and the bar is one copy on the last line", backLines[23] === "band" && backLines.filter((l) => l.startsWith("bar two")).length === 1, backLines.join("\n"));
+  render.setFooter(null);
+}
+
+// ── the same switch under the idle composer ────────────────────────────────
+// The composer is a frame of its own with the same walk-up arithmetic, and its
+// band rows fill the terminal exactly: a narrower pane wraps each of them into
+// two, so an erase counted in lines stops inside the frame and leaves the rows
+// of a second input band above the real one.
+{
+  const pane = new Screen(100, 24);
+  process.stdout.write = (chunk) => { pane.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: 24, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  process.stdout.emit("resize");
+  render.setStartRow(null);
+
+  render.line("banner");
+  for (let i = 0; i < 16; i++) render.line("a message " + i);
+  render.setStartRow(pane.row + 1);
+
+  const { InputEditor } = await import("../dist/ui/editor.js");
+  const status = () => ({ left: "model", hint: "keys", context: "context: 3%" });
+  const ed = new InputEditor({ status, history: [] });
+  const p = ed.read();
+  await new Promise((r) => setTimeout(r, 30));
+  check("the composer ends on the last line", /context: 3%/.test(pane.lines()[23]), pane.lines().join("\n"));
+
+  Object.defineProperty(process.stdout, "columns", { value: 70, configurable: true });
+  pane.rewrap(70, 24);
+  process.stdout.emit("resize");
+  await new Promise((r) => setTimeout(r, 60));
+  const after = pane.lines();
+  const bands = after.filter((l) => l.includes("›")).length;
+  const bandRows = after.filter((_, y) => pane.banded(y)).length;
+  check("a narrower pane leaves one input band", bands === 1 && bandRows === 3, after.join("\n"));
+  check("with the status still on the last line", /context: 3%/.test(after[23]), after.join("\n"));
+  stdin.emit("data", Buffer.from("\r"));
+  await p;
+}
+
+// ── the composer under a switch on a terminal that cuts ───────────────────
+//
+// Same thing one layer down: the composer's own walk-up counts its lines, and a
+// terminal that cuts instead of wrapping leaves the frame shorter than the count
+// — the erase goes too high and takes the newest lines of the conversation.
+{
+  const pane = new Screen(100, 24);
+  process.stdout.write = (chunk) => { pane.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: 24, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  process.stdout.emit("resize");
+  render.setStartRow(null);
+
+  for (let i = 0; i < 22; i++) render.line("a message " + i);
+  render.setStartRow(pane.row + 1);
+
+  const { InputEditor } = await import("../dist/ui/editor.js");
+  const ed = new InputEditor({ status: () => ({ left: "model", hint: "keys", context: "context: 3%" }), history: [] });
+  const p = ed.read();
+  await new Promise((r) => setTimeout(r, 30));
+  stdin.emit("data", Buffer.from("draft", "utf8"));
+  await new Promise((r) => setTimeout(r, 30));
+
+  Object.defineProperty(process.stdout, "columns", { value: 64, configurable: true });
+  pane.truncate(64, 24);
+  process.stdout.emit("resize");
+  await new Promise((r) => setTimeout(r, 60));
+  const after = pane.lines();
+  check("a cut leaves the newest message above the composer", after.includes("a message 21"), after.join("\n"));
+  check("and one band with the draft in it", after.filter((l) => /›\s+draft/.test(l)).length === 1, after.join("\n"));
+  check("and the status on the last line", /context: 3%/.test(after[23]), after.join("\n"));
+  stdin.emit("data", Buffer.from("\r"));
+  await p;
+}
+
+// ── a pane narrower than the layout floor ─────────────────────────────────
+//
+// The layout has floors — a content column, a status row — that used to be
+// honoured even when the pane was narrower than them. Every band row then went
+// out a few cells too wide, the terminal wrapped each of them into two, and the
+// block stood taller than the lines it was drawn from. Counting lines to find
+// its top stopped inside it, so its first rows stayed on screen while the live
+// bar was drawn below them: the spinner row of a moment ago, duplicated.
+{
+  const pane = new Screen(100, 24);
+  process.stdout.write = (chunk) => { pane.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: 24, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  process.stdout.emit("resize");
+  render.setStartRow(null);
+
+  render.line("banner");
+  for (let i = 0; i < 10; i++) render.line("a message " + i);
+  render.setStartRow(pane.row + 1);
+
+  const bar = () => [
+    "",
+    "     a line of reasoning long enough to be clipped at the edge of a narrow pane",
+    "",
+    "   ⠋ thinking (12s)  esc to interrupt · type to queue a message",
+    "",
+    render.bandRow(),
+    render.bandRow("   › "),
+    render.bandRow(),
+    "",
+    "   opencode-go:deepseek-v4.1-flash (thinking: high)" + " ".repeat(2) + "esc to interrupt",
+    "   context: 12% (24k/200k)",
+  ];
+  render.setFooter(bar);
+  const spinnerRows = (lines) => lines.filter((l) => l.includes("⠋ thinking")).length;
+  check("the wide bar is one copy", spinnerRows(pane.lines()) === 1, pane.lines().join("\n"));
+
+  // The pane is switched to one narrower than the layout floors.
+  Object.defineProperty(process.stdout, "columns", { value: 40, configurable: true });
+  pane.rewrap(40, 24);
+  process.stdout.emit("resize");
+  render.refreshFooter();
+  const narrow = pane.lines();
+  const tooWide = narrow.filter((l) => l.length > 40);
+  check("no row of the bar is wider than a 40-column pane", tooWide.length === 0, narrow.join("\n"));
+  check("and the bar is still one copy there", spinnerRows(narrow) === 1, narrow.join("\n"));
+
+  // Back to the wide pane: the rows the narrow frame spread over are gone.
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  pane.rewrap(100, 24);
+  process.stdout.emit("resize");
+  render.refreshFooter();
+  const back = pane.lines();
+  check("the wide pane shows one spinner, not the old row above it", spinnerRows(back) === 1, back.join("\n"));
+  check("the transcript above it is intact", back.some((l) => l.startsWith("a message 9")), back.join("\n"));
+  check("and the bar ends on the last line", /context: 12%/.test(back[23]), back.join("\n"));
+  render.setFooter(null);
+}
+
+// ── a pane switch on a terminal that cuts instead of wrapping ─────────────
+//
+// xterm.js does not re-wrap a row it never soft-wrapped: narrowing the pane
+// truncates the row and keeps it one row tall. Counting our lines as if they had
+// wrapped walks the erase above the block, wiping conversation that stood there.
+// The pane's switch cannot be answered by arithmetic on either model, so the
+// screen area is cleared and written again instead.
+{
+  const pane = new Screen(100, 24);
+  process.stdout.write = (chunk) => { pane.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: 24, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  process.stdout.emit("resize");
+  render.setStartRow(null);
+
+  render.line("banner");
+  // Enough conversation to fill the screen: an erase that overshoots takes real
+  // lines with it, which is what the truncating terminal used to cause.
+  for (let i = 0; i < 22; i++) render.line("a message " + i);
+  render.setStartRow(pane.row + 1);
+
+  const spinnerRows = (lines) => lines.filter((l) => l.includes("⠋ thinking")).length;
+  const bar = () => [
+    "",
+    "   ⠋ thinking (12s)  esc to interrupt · type to queue a message",
+    "",
+    render.bandRow(),
+    render.bandRow("   › "),
+    render.bandRow(),
+    "",
+    "   opencode-go:deepseek-v4.1-flash" + " ".repeat(2) + "esc to interrupt · enter to steer",
+    "   context: 12% (24k/200k)",
+  ];
+  render.setFooter(bar);
+  check("the bar starts as one copy", spinnerRows(pane.lines()) === 1, pane.lines().join("\n"));
+
+  Object.defineProperty(process.stdout, "columns", { value: 64, configurable: true });
+  pane.truncate(64, 24);
+  process.stdout.emit("resize");
+  render.refreshFooter();
+  const cut = pane.lines();
+  check("a truncating terminal still shows one spinner", spinnerRows(cut) === 1, cut.join("\n"));
+  // The newest line printed is still there, not a row the erase took away with
+  // the old frame when it counted the rows as if they had wrapped.
+  check("and keeps the newest conversation above the bar", cut.includes("a message 21"), cut.join("\n"));
+  check("with the bar on the last line", /context: 12%/.test(cut[23]), cut.join("\n"));
+  render.setFooter(null);
+}
+
+// ── a pane that comes back to the front ────────────────────────────────────
+//
+// Switching to another pane and back re-lays out the screen with no resize to
+// say so; the terminal reports it as a focus change (DECSET 1004). The frame on
+// screen is no longer the one that was drawn, so the area is written again
+// rather than walked back over a count the terminal may not honour.
+{
+  const pane = new Screen(100, 24);
+  process.stdout.write = (chunk) => { pane.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: 24, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  process.stdout.emit("resize");
+  render.setStartRow(null);
+
+  for (let i = 0; i < 22; i++) render.line("a message " + i);
+  render.setStartRow(pane.row + 1);
+  const spinnerRows = (lines) => lines.filter((l) => l.includes("⠋ thinking")).length;
+  const bar = () => [
+    "",
+    "   ⠋ thinking (12s)  esc to interrupt · type to queue a message",
+    "",
+    render.bandRow(),
+    render.bandRow("   › "),
+    render.bandRow(),
+    "",
+    "   context: 12% (24k/200k)",
+  ];
+  render.setFooter(bar);
+  check("the bar is one copy before the switch", spinnerRows(pane.lines()) === 1, pane.lines().join("\n"));
+
+  // The pane was shown again after the terminal reworked its rows: the frame the
+  // app drew is not the frame on screen any more.
+  pane.grid[16] = "   ⠋ thinking (3s) leftover row".padEnd(100).split("");
+  stdin.emit("data", Buffer.from("\x1b[I", "utf8"));
+  await new Promise((r) => setTimeout(r, 40));
+  const back = pane.lines();
+  check("a focus report redraws the block whole", spinnerRows(back) === 1, back.join("\n"));
+  check("and the conversation above it survives", back.includes("a message 21"), back.join("\n"));
+  check("with the block ending on the last line", /context: 12%/.test(back[23]), back.join("\n"));
+
+  // The report itself is not input: it must not land in the prompt as "[I".
+  const typed = stdin.listenerCount("data") > 0;
+  check("the focus report never reaches the input", typed && !back.some((l) => l.includes("[I")), back.join("\n"));
+  render.setFooter(null);
+}
+
+// ── a pane fitted away and back ────────────────────────────────────────────
+//
+// A pane put away is fitted to a width it cannot use — smaller than any layout
+// would be drawn for — and fitted back before it is looked at again. That width
+// never becomes the layout's, but the terminal did reflow its buffer to it and
+// back, and the rows the bar was painted from are not the rows it occupies now.
+// The frame is then taller on screen than the lines the erase counts, which
+// stops inside it and leaves its top half above the fresh copy.
+{
+  const pane = new Screen(100, 24);
+  process.stdout.write = (chunk) => { pane.write(String(chunk)); return true; };
+  Object.defineProperty(process.stdout, "rows", { value: 24, configurable: true });
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  process.stdout.emit("resize");
+  render.setStartRow(null);
+
+  for (let i = 0; i < 18; i++) render.line("a message " + i);
+  render.setStartRow(pane.row + 1);
+  const spinnerRows = (lines) => lines.filter((l) => l.includes("⠔ thinking")).length;
+  const bar = () => [
+    "",
+    "   ⠔ thinking (12s)  esc to interrupt · type to queue a message",
+    "",
+    render.bandRow(),
+    render.bandRow("   › "),
+    render.bandRow(),
+    "",
+    "   context: 12% (24k/200k)",
+  ];
+  render.setFooter(bar);
+  check("the bar is one copy before the pane is put away", spinnerRows(pane.lines()) === 1, pane.lines().join("\n"));
+
+  // Fitted away and back: the pane is re-laid out twice and the width it ends
+  // on is the one the bar was drawn for.
+  Object.defineProperty(process.stdout, "columns", { value: 10, configurable: true });
+  pane.rewrap(10, 24);
+  process.stdout.emit("resize");
+  Object.defineProperty(process.stdout, "columns", { value: 100, configurable: true });
+  pane.rewrap(100, 24);
+  process.stdout.emit("resize");
+  render.refreshFooter();
+
+  const fitted = pane.lines();
+  check("a pane fitted away and back leaves one bar", spinnerRows(fitted) === 1, fitted.join("\n"));
+  check("with the conversation above it", fitted.includes("a message 17"), fitted.join("\n"));
+  check("and the bar on the last line", /context: 12%/.test(fitted[23]), fitted.join("\n"));
+  render.setFooter(null);
 }
 
 say(`\n${passed} passed, ${failed} failed`);

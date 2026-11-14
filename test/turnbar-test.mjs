@@ -425,6 +425,34 @@ line("   after the turn");
   Object.defineProperty(process.stdout, "rows", { value: origRows, configurable: true });
 }
 
+// A pane narrower than the layout floors: every row still has to fit inside
+// it. A row that does not is wrapped by the terminal into two, and the frame is
+// then a row taller than the code that drew it counts — which is how the old
+// copy of the bar ends up on screen above the live one.
+{
+  const origCols = process.stdout.columns;
+  Object.defineProperty(process.stdout, "columns", { value: 40, configurable: true });
+  const { width } = await import("../dist/ui/ansi.js");
+  const narrow = new TurnBar({
+    status: () => ({
+      left: "opencode-go:deepseek-v4.1-flash  thinking: high  …tokenrouter-cli",
+      hint: "esc to interrupt · enter to steer",
+      context: "context: 87% (1.2M/1.4M)",
+    }),
+    onInterrupt: () => {},
+  });
+  screen.reset();
+  narrow.start();
+  narrow.setThinking(["a line of reasoning long enough to run past the edge of a forty column pane"]);
+  narrow.setActivity(["1. deepseek-v4.1-flash 70% · 25k tok · reading src/provider/client.ts"]);
+  const rows = narrow.rows();
+  const tooWide = rows.filter((r) => width(r) > 40);
+  check("no row of the bar is wider than a 40-column pane", tooWide.length === 0, tooWide.map((r) => width(r) + ": " + strip(r)).join("\n"));
+  check("the model keeps the left side, the hint is not pushed off", rows.some((r) => /esc to interrupt/.test(strip(r))), strip(rows.join("\n")));
+  narrow.stop();
+  Object.defineProperty(process.stdout, "columns", { value: origCols, configurable: true });
+}
+
 // The helper list: one row per running subagent, above the spinner. It is its
 // own block, so the reasoning preview closing does not take it away.
 {
@@ -449,6 +477,10 @@ line("   after the turn");
     check("the second row carries its own numbers", /2\. glm-5\.3-flash 3% · 3\.2k tok · read src\/a\.ts/.test(t), t);
     check("the list sits above the input", t.indexOf("1. deepseek") < t.lastIndexOf("›"), t);
     check("and above the reasoning preview", t.indexOf("1. deepseek") < t.indexOf("первая мысль"), t);
+    // A helper with no ceiling of its own: the rounds it has spent are the
+    // only honest progress figure.
+    const uncapped = strip(subagentRow({ id: 3, label: "c", model: "kimi-k3", steps: 12, maxSteps: 0, tokens: 96000 }));
+    check("an uncapped helper shows its rounds, not a share of nothing", /kimi-k3 12 steps · 96k tok/.test(uncapped), uncapped);
     if (hasColor) {
       // Same palette as the turn's stats line: model orange, numbers gray.
       check(

@@ -22,6 +22,23 @@ export interface ImageAttachment {
   mime: string;
 }
 
+/**
+ * A lifecycle event a user hook can react to. The names follow what the other
+ * CLIs call them, so a script written for one is recognisable in the other.
+ */
+export type HookEvent = "SessionStart" | "UserPromptSubmit" | "PreToolUse" | "PostToolUse" | "Stop" | "PreCompact";
+
+/** One hook command, with an optional regex over the tool name. */
+export interface HookDef {
+  /** Runs a shell command; sees a JSON payload on stdin. */
+  command: string;
+  /** PreToolUse/PostToolUse only: which tool names it applies to. */
+  matcher?: string;
+  timeoutMs?: number;
+}
+
+export type HooksConfig = Partial<Record<HookEvent, HookDef[]>>;
+
 export interface Message {
   role: Role;
   content: string | null;
@@ -42,9 +59,10 @@ export interface Message {
   /**
    * Local bookkeeping. `hidden` is stripped before hitting the wire; `skill`
    * marks an auto-loaded procedure, which the model must see but which would
-   * bury the transcript if it were replayed.
+   * bury the transcript if it were replayed; `skillChoice` lists the skills the
+   * matcher could not separate, sent as a shortlist instead of a guess.
    */
-  meta?: { hidden?: boolean; ts?: number; model?: string; skill?: string };
+  meta?: { hidden?: boolean; ts?: number; model?: string; skill?: string; skillChoice?: string[] };
 }
 
 export interface Usage {
@@ -197,8 +215,13 @@ export interface ToolContext {
   depth: number;
   /** Interactive clarification; absent in headless runs. */
   askUser?(questions: UserQuestion[]): Promise<UserAnswer[] | null>;
-  /** Returns true when the user (or policy) approves the action. */
-  confirm(tool: ToolDef, args: Record<string, any>, preview?: string): Promise<boolean>;
+  /**
+   * Returns true when the user (or policy) approves the action. `force` asks
+   * even when the permission mode, --yolo or a grant made for ordinary work
+   * says yes: for commands that reach another machine. Only its own grant,
+   * given at that very prompt, silences it.
+   */
+  confirm(tool: ToolDef, args: Record<string, any>, preview?: string, force?: boolean): Promise<boolean>;
   /**
    * True when the confirm() just answered had put `preview` on screen, so the
    * result can leave it out instead of printing the same diff a second time.

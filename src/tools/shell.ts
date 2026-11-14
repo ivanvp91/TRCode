@@ -20,6 +20,11 @@ const HARD_LIMIT_MS = 20 * 60_000;
  */
 const HEARTBEAT_MS = 10_000;
 /**
+ * What a heartbeat line starts with. It repeats every ten seconds, so a live
+ * view has to replace the previous copy instead of adding another one.
+ */
+export const HEARTBEAT_MARK = "Running… (";
+/**
  * After we have killed a tree, how long we wait for the `close` event before
  * resolving with what was captured anyway. `taskkill` is fire-and-forget, and
  * a grandchild that survives it — a gradle daemon's java.exe — keeps the
@@ -61,6 +66,26 @@ class Capture {
     if (!this.dropped) return this.head + this.tail;
     return `${this.head}\n… [${this.dropped} characters omitted from the middle] …\n${this.tail}`;
   }
+}
+
+/**
+ * Commands that reach another machine. The base prompt tells the model to stay
+ * local; this is the half that does not depend on it having read that — a
+ * remote command is confirmed whatever the permission mode says.
+ */
+const REMOTE_SHELL = [
+  /(?:^|[\s;&|(`])(?:ssh|scp|sftp|mosh|sshpass|telnet)(?=\s|$)/i,
+  /\brsync\b[^|;&]*\s(?:-e\s+ssh|[\w.-]+@)/i,
+];
+
+/** A database client pointed at something other than this machine. */
+const REMOTE_DB = /\b(?:mysql|mysqldump|mariadb|psql)\b[^|;&]*\s(?:-h\s*|--host[=\s]*)([^\s'"]+)/i;
+const LOCAL_HOST = /^(?:localhost|127\.0\.0\.1|::1|0\.0\.0\.0)$/i;
+
+function reachesRemote(command: string): boolean {
+  if (REMOTE_SHELL.some((rx) => rx.test(command))) return true;
+  const host = REMOTE_DB.exec(command)?.[1];
+  return Boolean(host && !LOCAL_HOST.test(host.replace(/^["']|["']$/g, "").replace(/:\d+$/, "")));
 }
 
 /** Commands that are refused outright regardless of permission mode. */
@@ -187,7 +212,8 @@ export const shellTool: ToolDef = {
       }
     }
 
-    const ok = await ctx.confirm(shellTool, args, command);
+    const remote = reachesRemote(command);
+    const ok = await ctx.confirm(shellTool, args, command, remote);
     if (!ok) return { output: "The user rejected the command.", isError: true };
     ctx.signal.throwIfAborted();
 
@@ -298,7 +324,10 @@ export const shellTool: ToolDef = {
         const line = chunk.split(/\r?\n/).filter((l) => l.trim()).pop();
         if (!line) return;
         lastEmit = Date.now();
-        ctx.emit(`${Math.round((Date.now() - started) / 1000)}s · ${line.trim().slice(0, 120)}`);
+        // No elapsed prefix: the whole point of the tail is the command's own
+        // last words, and a column of "125s ·" in front of every one of them
+        // made the bar read as a timer instead of as progress.
+        ctx.emit(line.trim().slice(0, 120));
       };
 
       // Silence is the case the tail cannot cover: while a command prints
@@ -309,7 +338,7 @@ export const shellTool: ToolDef = {
         if (!ctx.emit || quietMs < HEARTBEAT_MS) return;
         lastEmit = Date.now();
         ctx.emit(
-          `Running… (${fmtDuration(Date.now() - started)} · quiet ${fmtDuration(quietMs)} of ${fmtDuration(timeout)})`,
+          `${HEARTBEAT_MARK}${fmtDuration(Date.now() - started)} · quiet ${fmtDuration(quietMs)} of ${fmtDuration(timeout)})`,
         );
       }, HEARTBEAT_MS);
 

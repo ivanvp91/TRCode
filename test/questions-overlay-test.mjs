@@ -200,6 +200,35 @@ check("the screen it covered comes back exactly", screen.text() === before, {
   after: screen.text().split("\n").slice(-12),
 });
 
+// ── a pane that goes away and comes back while it is open ───────────────────
+// The frame is written again from the top of the screen after a width change —
+// the transcript tail first, then the block. Walking up the dialog's own rows
+// once more put the whole thing on the first row of the screen, its last line
+// that many rows short of the bottom.
+const switched = new AbortController();
+const switchedAnswer = questionModal(
+  [{ question: "Where should settings live?", header: "Settings", options: [{ label: "Shared with the project" }, { label: "User only" }, { label: "Ask every time" }] }],
+  { signal: switched.signal },
+);
+await wait(60);
+const setWidth = (value) => {
+  Object.defineProperty(process.stdout, "columns", { value, configurable: true, writable: true });
+  process.stdout.emit("resize");
+};
+setWidth(70);
+await wait(60);
+setWidth(COLS);
+await wait(60);
+const rows = screen.lines();
+const last = rows.reduce((at, l, i) => (l.trim() ? i : at), -1);
+check("the block ends on the last row after the pane came back", last === ROWS - 1, { last, ROWS, screen: rows });
+check("the input line came back with it", indexOfRow("\u203a") === ROWS - 2, { band: indexOfRow("\u203a"), ROWS, screen: rows });
+check("the dialog is still above the input", indexOfRow("\u2570\u2500") < indexOfRow("\u203a"), { bottom: indexOfRow("\u2570\u2500"), band: indexOfRow("\u203a"), screen: rows });
+
+key(ESC);
+await switchedAnswer;
+await wait(60);
+
 process.stdout.write = realWrite;
 setFooter(null);
 console.log(`\n${passed} passed, ${failed} failed`);

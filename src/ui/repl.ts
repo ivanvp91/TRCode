@@ -2,7 +2,7 @@
 import path from "node:path";
 import os from "node:os";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { c } from "./ansi.js";
+import { c, sanitizeOutput } from "./ansi.js";
 import type { LogoAnimation } from "./logo.js";
 import {
   MarkdownStream,
@@ -36,8 +36,10 @@ import { contentWidth, fmtAgo, fmtDuration } from "./layout.js";
 // `t` and `count` are taken in this file by the turn totals.
 import { t as tr, t, count as nOf } from "../i18n.js";
 import { matchLibrary, designInjection, blendInjection, isDesignRequest } from "../ui-library/match.js";
+import { fireHookEvent, fireNotify, hookSettings, runHookEvent } from "../hooks.js";
 import { listEntries, getEntry, type UiEntry } from "../ui-library/store.js";
 import { pickUiEntry, extractEntryForm } from "./commands.js";
+import { checkProjectSettings } from "./commands/hooks.js";
 import { nextTip, allTipIds, type TipState } from "./tips.js";
 import { composeStatus, type StatusInfo } from "./inputbox.js";
 import { expandPastes, rememberCollapsed } from "./paste.js";
@@ -45,6 +47,7 @@ import { InputEditor, PipeReader, setExtraNewlineKeys } from "./editor.js";
 import { choose } from "./choice.js";
 import { askLine } from "./prompt.js";
 import { questionModal } from "./questions.js";
+import { stallPrompt } from "./stall.js";
 import type { UserQuestion, UserAnswer } from "../tools/questions.js";
 import { TurnBar, InterruptWatcher } from "./turnbar.js";
 import { OrcaReporter } from "./orca.js";
@@ -82,11 +85,11 @@ import { delegationPreference } from "../agent/delegation.js";
 import { subagentModelsConfigured } from "../agent/worker.js";
 import { SubagentRegistry, type SubagentActivity, type SubagentProgress } from "../agent/subagent.js";
 import { buildTools, TodoStore } from "../tools/index.js";
-import { shellTool } from "../tools/shell.js";
+import { HEARTBEAT_MARK, shellTool } from "../tools/shell.js";
 import { createSpillStore, type SpillStore } from "../tools/spill.js";
 import { connectMcpServers, mcpPendingCount, mcpSettled, onMcpCatalogChange, untrustedProjectServers } from "../mcp/client.js";
 import { discoverSkills, type Skill } from "../skills/loader.js";
-import { pickSkill, skillInjection, skillInterjector } from "../skills/match.js";
+import { chooseSkills, skillChoice, skillInjection, skillInterjector } from "../skills/match.js";
 import { Session } from "../session/session.js";
 import {
   DEFAULT_MAX_TURNS,
@@ -163,6 +166,12 @@ export class App {
    * here, so a resumed session keeps its preset rather than the config's.
    */
   presetOverride?: "standard" | "minimal";
+  /**
+   * Plan mode: the turn explores and proposes, and every tool that could change
+   * something is out of the list (see buildTools). Entered with /plan or
+   * --plan; left when the user approves the plan or turns the mode off.
+   */
+  planMode = false;
   /** Full reasoning of the last turn, for /reasoning. */
   lastReasoning = "";
   /**
@@ -176,6 +185,8 @@ export class App {
   private goalBudgetWarned = false;
   /** Skills whose body is already in the history — auto-loaded or asked for. */
   loadedSkills = new Set<string>();
+  /** Skills already offered as a shortlist, so the same list is not re-sent. */
+  offeredSkills = new Set<string>();
 
   private abort: AbortController | null = null;
   /** Mid-turn compactions run in this turn; capped so a failed one cannot repeat per step. */
@@ -285,10 +296,11 @@ export class App {
     this.broker = new PermissionBroker({
       autoApprove: opts.autoApprove,
       interactive: process.stdin.isTTY,
+      cwd: this.cwd,
       exclusive: (fn) => this.exclusiveInput(fn),
     });
     this.broker.onWaiting = (tool, detail) => this.orca?.waiting(tool, detail);
-    this.broker.onAnswered = () => this.orca?.busy(this.session.id);
+    this.broker.onAnswered = () => this.orca?.busy();
     // Esc at a permission prompt ends the turn. Denying just this one tool
     // leaves the model going, and the next tool asks again — which is what a
     // stuck session looks like from the outside.
@@ -311,6 +323,25 @@ export class App {
     Session.pruneEmpty(this.cwd);
     pruneOrphanStores(this.cwd);
     pruneOrphanBackups(this.cwd);
+    // A repository's .trcode/settings.json may add hooks; anything else in it
+    // is refused, and saying so once beats a setting that silently does not
+    // work.
+    const projectSettings = checkProjectSettings(this.cwd);
+    if (projectSettings.warning) warn(projectSettings.warning);
+    else if (projectSettings.hint) hint(projectSettings.hint);
+    // A repository does not get to run commands here because it was cloned:
+    // its hooks wait for the same explicit yes its MCP servers need.
+    const pendingHooks = hookSettings(this.cwd).pending;
+    if (pendingHooks) {
+      this.notice(
+        "warn",
+        tr(
+          "{file} defines {count} hooks. They run commands on this machine — review them with /hooks, enable them with /hooks trust.",
+          "{file} определяет хуков: {count}. Они запускают команды на этой машине — посмотрите /hooks, включите через /hooks trust.",
+          { file: path.relative(this.cwd, pendingHooks.file) || pendingHooks.file, count: pendingHooks.count },
+        ),
+      );
+    }
     // When every provider's catalog is already on disk this costs a file read;
     // when one of them would have to be asked over the network, the prompt
     // opens on the cached catalog instead and the refresh lands behind it. A
@@ -386,6 +417,10 @@ export class App {
         })
         .catch(() => {});
     }
+    // The session is open: a SessionStart hook can prepare the environment —
+    // fetch the branch, warm a cache, write a note. Fire-and-forget, because
+    // the prompt must not wait on someone's script.
+    fireHookEvent("SessionStart", { cwd: this.cwd, sessionId: this.session.id, model: this.session.model });
   }
 
   /**
@@ -435,8 +470,10 @@ export class App {
     // follows the current session — /new and /resume swap it underneath. It
     // gets there two ways: injected by auto-selection, or returned by the tool.
     this.loadedSkills = new Set();
+    this.offeredSkills = new Set();
     for (const m of this.session.messages) {
       if (m.meta?.skill) this.loadedSkills.add(m.meta.skill);
+      else if (m.meta?.skillChoice) for (const name of m.meta.skillChoice) this.offeredSkills.add(name);
       else if (m.role === "tool") {
         const hit = /^<skill name="([^"]+)"/.exec(String(m.content ?? ""));
         if (hit) this.loadedSkills.add(hit[1]);
@@ -449,6 +486,7 @@ export class App {
       onTodoChange: () => {},
       cwd: this.memoryOn ? this.cwd : undefined,
       preset: this.preset,
+      planMode: this.planMode,
       runCode: this.codeModeOn
         ? {
             confirmShell: (command) =>
@@ -522,7 +560,7 @@ export class App {
       onToggleMode: () => this.toggleAutoApprove(),
       history: this.history,
       onSteer: steer ? (text: string) => this.steerQueue.push(text) : undefined,
-      suggest: (buffer) => commandSuggestions(buffer),
+      suggest: (buffer) => commandSuggestions(buffer, this.cwd),
       suggestRows: 6,
     });
     this.bar = bar;
@@ -563,7 +601,21 @@ export class App {
     this.activityLines = [];
     this.subagentsRunning.clear();
     this.session.save();
-    if (!this.pending.length) await this.orca?.idle(this.session.id);
+    // The turn is over as far as anyone watching is concerned: this is where a
+    // Stop hook and the notification script hear about it, once, with the
+    // outcome rather than the prompt. Both are fire-and-forget — a script that
+    // hangs must not hold the composer.
+    const lastSaid = [...this.session.messages].reverse().find((m) => m.role === "assistant" && String(m.content ?? "").trim());
+    const end = {
+      cwd: this.cwd,
+      sessionId: this.session.id,
+      model: this.session.model,
+      ok: !this.lastTurnFailed && !interrupted,
+      stoppedBecause: interrupted ? "aborted" : this.lastTurnFailed ? "failed" : "stop",
+    };
+    fireHookEvent("Stop", end);
+    fireNotify({ ...end, lastMessage: String(lastSaid?.content ?? "") });
+    if (!this.pending.length) await this.orca?.idle();
   }
 
   /** Long slash commands own stdin, cancellation, accounting and the footer like chat. */
@@ -574,7 +626,7 @@ export class App {
     }
     const bar = this.startTurn();
     bar.setLabel(label);
-    this.orca?.busy(this.session.id);
+    this.orca?.busy();
     let input = 0, output = 0, cached = 0;
     const repaint = () => bar.setTokens(input, Math.max(0, output), cached);
     const progress: TaskProgress = {
@@ -649,10 +701,10 @@ export class App {
         this.cfg = loadConfig();
       }
     }
-    if (!subagentModelsConfigured(this.catalog, this.session.model)) {
+    if (!subagentModelsConfigured(this.catalog)) {
       if (!process.stdin.isTTY) return false;
       await subagentsModal(this, true);
-      if (!subagentModelsConfigured(this.catalog, this.session.model)) {
+      if (!subagentModelsConfigured(this.catalog)) {
         this.abort?.abort();
         return false;
       }
@@ -731,7 +783,7 @@ export class App {
       signal,
       depth: 0,
       askUser: process.stdin.isTTY && process.stdout.isTTY ? (questions) => this.askUserQuestions(questions, signal) : undefined,
-      confirm: (tool, args, preview) => this.broker.confirm(tool, args, preview, signal),
+      confirm: (tool, args, preview, force) => this.broker.confirm(tool, args, preview, signal, force),
       previewShown: (preview) => this.broker.previewShown(preview),
       snapshot: (opts) => recordWrite(this.session, opts),
       billMedia: (model, cost, id) => {
@@ -753,7 +805,7 @@ export class App {
       try {
         return await questionModal(questions, { signal, onCancel: () => this.abort?.abort() });
       } finally {
-        this.orca?.busy(this.session.id);
+        this.orca?.busy();
       }
     }, { keepBar: true });
   }
@@ -785,6 +837,16 @@ export class App {
    */
   progress(text: string): void {
     if (!this.bar) return;
+    // A tail line is the child's own writing, colour and links included: it
+    // goes through the bar, which clips it to the terminal's width.
+    text = sanitizeOutput(text);
+    // A heartbeat is one line ageing, not a new fact: the shell repeats it
+    // every ten seconds of silence, and appending each copy stacked a column
+    // of identical "Running…" rows until the bar held nothing else.
+    if (text.startsWith(HEARTBEAT_MARK)) {
+      const stale = this.activityLines.findIndex((l) => l.startsWith(HEARTBEAT_MARK));
+      if (stale >= 0) this.activityLines.splice(stale, 1);
+    }
     this.activityLines.push(text);
     if (this.activityLines.length > 8) this.activityLines.shift();
     this.bar.setThinking([...this.activityLines]);
@@ -993,7 +1055,7 @@ export class App {
     }
     const { used, window } = pressure.pressure;
     return {
-      mode: this.broker.autoApprove ? "yolo" : undefined,
+      mode: [this.broker.autoApprove ? "yolo" : "", this.planMode ? tr("plan", "план") : ""].filter(Boolean).join(" · ") || undefined,
       provider: providerLabel(splitModelId(this.session.model).providerId),
       model: this.session.model,
       effort: this.effort(),
@@ -1280,8 +1342,8 @@ export class App {
     this.editor ??= new InputEditor({
       status: () => composeStatus(this.status()),
       history: this.history,
-      complete: (partial) => commandNames().filter((n) => n.startsWith(partial)),
-      suggest: (buffer) => commandSuggestions(buffer),
+      complete: (partial) => commandNames(this.cwd).filter((n) => n.startsWith(partial)),
+      suggest: (buffer) => commandSuggestions(buffer, this.cwd),
       suggestRows: 6,
       onToggleMode: () => this.toggleAutoApprove(),
       // The welcome animation paints at fixed coordinates; the first keystroke
@@ -1389,6 +1451,10 @@ export class App {
       // An auto-loaded skill is a procedure for the model, not conversation.
       if (m.meta?.skill) {
         padded(c.gray(`  ⚡ skill ${m.meta.skill}`));
+        continue;
+      }
+      if (m.meta?.skillChoice?.length) {
+        padded(c.gray(`  ⚡ skills offered ${m.meta.skillChoice.join(", ")}`));
         continue;
       }
 
@@ -1516,16 +1582,32 @@ export class App {
    */
   private autoLoadSkill(text: string): void {
     if (!this.cfg.skillsEnabled || this.cfg.skillAuto === false) return;
-    const pick = pickSkill(this.skills, text, { exclude: this.loadedSkills });
-    if (!pick) return;
-
-    this.loadedSkills.add(pick.skill.name);
+    const choice = chooseSkills(this.skills, text, { exclude: this.loadedSkills });
+    const pick = choice.pick;
+    if (pick) {
+      this.loadedSkills.add(pick.skill.name);
+      this.session.add({
+        role: "user",
+        content: skillInjection(pick.skill),
+        meta: { skill: pick.skill.name },
+      });
+      hint(`⚡ skill ${pick.skill.name} — ${pick.matched.slice(0, 3).join(", ")}`);
+      return;
+    }
+    // No clear winner: the two procedures are close enough that sending either
+    // would be a guess with a few thousand tokens behind it. The names and one
+    // line each cost a fraction of that, and the model can read the request —
+    // which is the evidence the trigger words only approximate — to finish the
+    // job by calling the skill tool itself.
+    const rivals = choice.rivals.filter((r) => !this.offeredSkills.has(r.skill.name));
+    if (!rivals.length) return;
+    for (const r of rivals) this.offeredSkills.add(r.skill.name);
     this.session.add({
       role: "user",
-      content: skillInjection(pick.skill),
-      meta: { skill: pick.skill.name },
+      content: skillChoice(rivals),
+      meta: { skillChoice: rivals.map((r) => r.skill.name) },
     });
-    hint(`⚡ skill ${pick.skill.name} — ${pick.matched.slice(0, 3).join(", ")}`);
+    hint(`⚡ ${rivals.map((r) => r.skill.name).join(" / ")} — several skills fit, the model picks`);
   }
 
   /** The reply just streamed, for the gate that reads the proposed entry form. */
@@ -1723,6 +1805,39 @@ export class App {
     } finally {
       await this.finishTurn(bar.stop(), unsent);
     }
+    // A plan is a proposal until someone says yes. Asked only when the turn
+    // actually finished and produced something: an interrupted or failed turn
+    // has nothing to approve.
+    if (this.planMode && !this.lastAborted && !this.lastTurnFailed && !unsent) await this.offerPlanApproval();
+  }
+
+  /** Plans are read-only; the decision after one is the whole point of the mode. */
+  setPlanMode(on: boolean): void {
+    if (this.planMode === on) return;
+    this.planMode = on;
+    this.rebuildTools();
+  }
+
+  private async offerPlanApproval(): Promise<void> {
+    if (!process.stdin.isTTY) return;
+    const answer = await this.exclusiveInput(async () => {
+      line();
+      return choose<"execute" | "keep" | "leave">(
+        [
+          { value: "execute", label: tr("Execute the plan", "Выполнить план"), key: "y", tone: "ok" },
+          { value: "keep", label: tr("Keep planning", "Ещё планировать"), key: "k", tone: "warn" },
+          { value: "leave", label: tr("Leave plan mode", "Выйти из режима плана"), key: "n", tone: "danger" },
+        ],
+        { initial: "execute", fallback: "keep" },
+      );
+    });
+    if (answer === "keep") return;
+    this.setPlanMode(false);
+    // Queued rather than run here: the mode is already off, and the next turn
+    // starts from the ordinary input loop with the plan in the history.
+    if (answer === "execute") {
+      this.pending.push(tr("The plan above is approved — carry it out.", "План выше одобрен — выполняй его."));
+    }
   }
 
   private async performTurn(text: string, bar: TurnBar): Promise<string | undefined> {
@@ -1733,6 +1848,20 @@ export class App {
       start: () => {},
       stop: () => {},
     };
+
+    // A UserPromptSubmit hook sees what is about to be sent, before anything
+    // is spent on it: exit 2 is a refusal, and its stdout is context the model
+    // gets with the prompt — a rule, a reminder, a branch name.
+    const submitted = await runHookEvent("UserPromptSubmit", {
+      cwd: this.cwd,
+      sessionId: this.session.id,
+      model: this.session.model,
+    });
+    if (submitted.blocked) {
+      warn(tr("A hook refused this prompt: {reason}", "Хук отклонил этот запрос: {reason}", { reason: submitted.reason }));
+      return original;
+    }
+    const hookContext = submitted.stdout.trim();
 
     await this.maybeAutoCompact();
     if (this.abort!.signal.aborted) {
@@ -1752,13 +1881,19 @@ export class App {
     // Opened before the prompt joins the history, so /rewind can cut the
     // conversation exactly here as well as put the files back.
     markTurn(this.session, text);
-    this.session.add({ role: "user", content: text });
+    // The hook's own words ride with the user's message: the model reads them
+    // last, which is where an instruction is followed, and the echo above stays
+    // what the user actually typed.
+    this.session.add({
+      role: "user",
+      content: hookContext ? `${text}\n\n<hook-context>\n${hookContext}\n</hook-context>` : text,
+    });
     this.autoLoadSkill(text);
     await this.autoLoadDesign(text);
 
     this.lastReasoning = "";
-    this.orca?.busy(this.session.id);
-    this.orca?.userPrompt(text, this.session.id);
+    this.orca?.busy();
+    this.orca?.userPrompt(text);
 
     const started = Date.now();
     // The turn's own abort flag: a callback that fires after Esc must not draw.
@@ -1851,7 +1986,7 @@ export class App {
         // and cost 2.1k tokens on every request to do it. It also disagreed
         // with the failover path below, so continuing on another model quietly
         // rewrote the system prompt and voided the cache for the session.
-        systemPrompt: buildSystemPrompt({ cwd: this.cwd, model: this.session.model, skills: this.activeSkills }),
+        systemPrompt: buildSystemPrompt({ cwd: this.cwd, model: this.session.model, skills: this.activeSkills, planMode: this.planMode }),
         messages: this.session.messages,
         tools: this.tools,
         toolContext: this.toolContext(),
@@ -1868,7 +2003,7 @@ export class App {
         conversationId: this.session.id,
         // A silent stream is a question, not a verdict: the user can see the
         // clock and decide whether the model is worth waiting for.
-        onStall: async (idleMs) => {
+        onStall: async (idleMs, resolved) => {
           if (!process.stdin.isTTY) return false;
           warn(
             tr(
@@ -1877,16 +2012,12 @@ export class App {
               { duration: fmtDuration(idleMs) },
             ),
           );
-          const answer = await this.exclusiveInput(() =>
-            choose<"wait" | "abort">(
-              [
-                { value: "wait", label: tr("Keep waiting", "Ждать дальше"), key: "w", tone: "ok" },
-                { value: "abort", label: tr("Abort the request", "Прервать запрос"), key: "n", tone: "danger" },
-              ],
-              { initial: "wait", fallback: "abort" },
-            ),
-          );
-          return answer === "wait";
+          // The bar keeps running under the question: this is a question about
+          // a turn that is still going, not a gate in front of one. Pausing it
+          // left the bottom of the screen empty and put the buttons on the row
+          // where the answer then started arriving. `resolved` takes the
+          // question away when the stream moves again.
+          return this.exclusiveInput(() => stallPrompt({ signal: resolved }), { keepBar: true });
         },
         // A held-back send looks like a hang unless the label says what is
         // being waited out.
@@ -2016,7 +2147,7 @@ export class App {
               opening = "";
               answer = text;
               md.push(text);
-              if (this.orca) this.orca.assistantText(text, this.session.id);
+              if (this.orca) this.orca.assistantText(text);
               return;
             }
             md?.push(delta);
@@ -2024,7 +2155,7 @@ export class App {
             // answer += on every delta is O(answer) per chunk (quadratic over a
             // long turn); Orca caps its payload anyway, so it needs a window,
             // not the whole text.
-            if (this.orca) this.orca.assistantText(answer.length > 4000 ? answer.slice(-4000) : answer, this.session.id);
+            if (this.orca) this.orca.assistantText(answer.length > 4000 ? answer.slice(-4000) : answer);
           },
           onToolStart: (tool, args) => {
             if (signal.aborted) return;
@@ -2238,7 +2369,7 @@ export class App {
         this.session.model = alt;
         this.session.save();
         opts.model = alt;
-        opts.systemPrompt = buildSystemPrompt({ cwd: this.cwd, model: alt, skills: this.activeSkills, preset: this.preset });
+        opts.systemPrompt = buildSystemPrompt({ cwd: this.cwd, model: alt, skills: this.activeSkills, preset: this.preset, planMode: this.planMode });
         opts.effort = this.effort();
         this.rebuildTools();
         opts.tools = this.tools;

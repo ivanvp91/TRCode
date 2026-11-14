@@ -1,15 +1,18 @@
 /** Providers, models, favourites, settings and /update. */
 import { c } from "../ansi.js";
-import { error, hint, info, line, plural, Spinner, success, warn } from "../render.js";
+import { error, hint, info, line, padded, plural, Spinner, success, warn } from "../render.js";
 import { openModal, pick, pickMulti, type PickerItem } from "../picker.js";
+import { choose } from "../choice.js";
 import { editFavorites, openModelModal } from "../modelpicker.js";
 import { loadConfig, saveConfig, configPath, rememberProjectState, VERSION, STATUS_FIELDS, type StatusField } from "../../config.js";
 import { latestRelease, isNewer, applyUpdate } from "../../update.js";
 import { fetchModels } from "../../provider/models.js";
 import { DEFAULT_PROVIDER, modeConfig, modeFor, providerById, providerLabel, providers, providerState, rememberBaseUrl, rememberProviderState, type ProviderDef } from "../../provider/registry.js";
 import { readCredentials } from "../../provider/credentials.js";
+import { accountCreds, accountsOf, activateAccount, activeAccountId, maskSecret, registerAccount, removeAccount, renameAccount } from "../../provider/accounts.js";
 import { LIGHT_BUDGET, MEDIUM_BUDGET } from "../../session/compact.js";
-import { chooseHost, disconnectProvider, loginProvider } from "../login.js";
+import { chooseHost, disconnectProvider, loginProvider, suggestName } from "../login.js";
+import { askForm } from "../form.js";
 import { t, count, t as tr } from "../../i18n.js";
 import type { App } from "../repl.js";
 import { escWatch } from "../turnbar.js";
@@ -618,13 +621,181 @@ export async function providerModal(app: App): Promise<void> {
 }
 
 
+// ── /accounts ─────────────────────────────────────────────────────────────
+
+/**
+ * The credentials a provider holds, each with its name, and the panel that
+ * manages them.
+ *
+ * A key or a subscription is one account of many: the host meters each one
+ * separately, so a spent week is answered by the next rather than by waiting.
+ * The rows say which one carries the session and which is out of quota; Enter
+ * makes a row active, and the buttons add, rename and delete.
+ */
+export async function accountsModal(app: App, named?: string): Promise<void> {
+  const wanted = (named ?? "").trim().toLowerCase();
+  const def = wanted ? providerById(wanted) : providerById(currentProviderId(app));
+  if (!def) {
+    return error(t("Unknown provider: {name}. Available: {providers}", "Неизвестный поставщик: {name}. Доступны: {providers}", { name: wanted, providers: providers().map((p) => p.id).join(", ") }));
+  }
+  if (!modeFor(def.id)) {
+    return warn(t("{provider} is not connected — /login {id} connects it.", "{provider} не подключён — подключит /login {id}.", { provider: def.label, id: def.id }));
+  }
+
+  for (;;) {
+    const entries = accountsOf(def.id);
+    if (!entries.length) {
+      // Connected before the book existed, or a key imported by hand: file the
+      // credential under a name rather than showing an empty panel.
+      const cfgNow = loadConfig();
+      const current =
+        def.id === DEFAULT_PROVIDER
+          ? cfgNow.apiKey
+            ? { mode: "apikey" as const, accessToken: cfgNow.apiKey, source: "config.json" }
+            : null
+          : readCredentials(def.id);
+      if (!current) return warn(t("{provider} is not connected — /login {id} connects it.", "{provider} не подключён — подключит /login {id}.", { provider: def.label, id: def.id }));
+      registerAccount(def.id, current);
+      continue;
+    }
+    const active = activeAccountId(def.id);
+    const items: PickerItem[] = entries.map((entry, i) => {
+      const creds = accountCreds(def.id, entry);
+      const where = creds?.email ?? (creds ? maskSecret(creds.accessToken) : "");
+      return {
+        value: entry.id,
+        label: `${entry.name}`,
+        hint: c.gray(` ${where}`),
+        badge: entry.id === active ? c.brightGreen(t("active", "активный")) : c.gray(String(i + 1)),
+      };
+    });
+
+    // No panel to draw in: print the list and be done. A piped session still
+    // needs to see what the provider holds, and there is nothing to press.
+    if (!process.stdin.isTTY) {
+      line();
+      padded(c.bold(t("{label} — accounts", "{label} — аккаунты", { label: def.label })));
+      for (const item of items) {
+        padded(`  ${item.label}${item.hint}${item.badge ? c.gray(`  ${item.badge}`) : ""}`);
+      }
+      line();
+      return;
+    }
+
+    const res = await app.exclusiveInput(() =>
+      openModal({
+        title: t("{label} — accounts", "{label} — аккаунты", { label: def.label }),
+        subtitle: t(
+          "Enter makes the row under the cursor active — that is the credential requests carry from now on. The buttons add, rename and delete.",
+          "Enter делает строку под курсором активной — с этого момента запросы идут с неё. Кнопки добавляют, переименовывают и удаляют.",
+        ),
+        items,
+        initial: active ?? undefined,
+        search: false,
+        actions: [
+          { id: "add", label: t("Add account", "Добавить аккаунт"), hotkey: "a" },
+          { id: "rename", label: t("Rename", "Переименовать"), hotkey: "r" },
+          { id: "delete", label: t("Delete", "Удалить"), hotkey: "d", tone: "danger" },
+        ],
+      }),
+    );
+    if (!res) return;
+
+    if (res.kind === "item") {
+      if (!res.value || res.value === active) return;
+      const entry = entries.find((e) => e.id === res.value);
+      if (!entry || !accountCreds(def.id, entry)) {
+        // A ChatGPT account whose profile was signed out elsewhere: the row is
+        // still worth keeping, but it cannot carry a request until it is
+        // signed in again.
+        return warn(t("That account has no usable credential — sign in again with Add account.", "У этого аккаунта нет рабочих данных — войдите заново через «Добавить аккаунт»."));
+      }
+      activateAccount(def.id, res.value);
+      app.cfg = loadConfig();
+      await refreshCatalog(app, { quiet: true });
+      const creds = accountCreds(def.id, entry);
+      success(
+        t("{provider}: the active account is {name}{detail}.", "{provider}: активный аккаунт — {name}{detail}.", {
+          provider: def.label,
+          name: entry.name,
+          detail: creds && !creds.email ? c.gray(` (${maskSecret(creds.accessToken)})`) : "",
+        }),
+      );
+      return;
+    }
+
+    const target = entries.find((e) => e.id === res.value) ?? entries.find((e) => e.id === active);
+
+    if (res.id === "add") {
+      // The add flow asks its own questions — subscription or key, the key, the
+      // name — and may take minutes for a browser login, so the panel steps
+      // aside and comes back when it is done.
+      const added = await loginProvider(def, { exclusive: (fn) => app.exclusiveInput(fn) });
+      app.cfg = loadConfig();
+      if (added.connected) {
+        app.catalog = await fetchModels({ force: true });
+        app.rebuildTools();
+      }
+      continue;
+    }
+
+    if (res.id === "rename") {
+      if (!target) continue;
+      const answers = await app.exclusiveInput(() =>
+        askForm({
+          title: t("Rename account", "Переименовать аккаунт"),
+          subtitle: t("A name is how this credential is told apart in the list.", "Имя отличает эту учётную запись в списке."),
+          fields: [{ label: t("Name", "Имя"), value: target.name, placeholder: suggestName(def.id, target.profileId ? "oauth" : target.creds?.mode ?? "apikey") }],
+          submit: t("Save", "Сохранить"),
+        }),
+      );
+      const name = answers?.[0]?.trim();
+      if (name && renameAccount(def.id, target.id, name)) continue;
+      continue;
+    }
+
+    if (res.id === "delete") {
+      if (!target) continue;
+      if (entries.length === 1) {
+        // Deleting the last credential is disconnecting, and it must say so:
+        // the provider disappears from the session, not just from this list.
+        if (def.id === DEFAULT_PROVIDER) {
+          hint(t("The last TokenRouter key is removed with: trc auth logout", "Последний ключ TokenRouter удаляется так: trc auth logout"));
+          continue;
+        }
+        const sure = await choose<"yes" | "no">(
+          [
+            { value: "no", label: t("Keep it", "Оставить"), key: "n" },
+            { value: "yes", label: t("Disconnect {provider}", "Отключить {provider}", { provider: def.label }), key: "y", tone: "danger" },
+          ],
+          { initial: "no", fallback: "no" },
+        );
+        if (sure !== "yes") continue;
+        await logoutFromProvider(app, def);
+        return;
+      }
+      const sure = await choose<"yes" | "no">(
+        [
+          { value: "no", label: t("Keep it", "Оставить"), key: "n" },
+          { value: "yes", label: t("Delete {name}", "Удалить {name}", { name: target.name }), key: "y", tone: "danger" },
+        ],
+        { initial: "no", fallback: "no" },
+      );
+      if (sure !== "yes") continue;
+      removeAccount(def.id, target.id);
+      app.cfg = loadConfig();
+      success(t("Deleted the account {name}.", "Аккаунт {name} удалён.", { name: target.name }));
+      continue;
+    }
+  }
+}
+
 /**
  * The favorite editor: checkbox lists on the provider tabs, preselected with
  * the current stars. Space flips rows while scrolling, Enter saves the whole
  * set in one write; Esc cancels without touching anything. Clearing all is a
  * separate button inside the panel — not an accidental Enter.
- */
-export async function favModal(app: App): Promise<void> {
+ */export async function favModal(app: App): Promise<void> {
   const picked = await app.exclusiveInput(() =>
     editFavorites({ catalog: app.catalog, current: app.session.model, defaultModel: loadConfig().model }),
   );

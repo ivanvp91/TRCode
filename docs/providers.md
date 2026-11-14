@@ -54,6 +54,20 @@ outside a session. Naming `tokenrouter` reaches the router explicitly. `/login` 
 session follows the same rule, so it asks for a Kimi credential while you are on Kimi
 rather than for a router key.
 
+### Several keys or accounts per provider
+
+Each provider keeps a book of named credentials — keys and subscription logins alike —
+with one of them active. `/login` on a connected provider opens that list: Enter makes
+the row under the cursor active, and the buttons add, rename and delete. `/accounts`
+opens the same panel directly. Adding asks for the key and its name (or the account name
+after a browser sign-in), and the new credential becomes active.
+`trc auth login --provider X --name work` files a key from the command line.
+
+The active account is the one requests carry, and switching is always manual — a
+refusal is reported as before, with a pointer to `/accounts` when a second credential
+exists. Hosts meter each account separately, so a spent weekly quota is answered by
+activating another key. Deleting the last credential disconnects the provider.
+
 The subscription path is an OAuth 2.0 device flow (RFC 8628): the CLI prints a URL and
 a code, you approve them in a browser on any machine, and the access token is renewed
 automatically from then on. A host with no device grant (OpenAI's ChatGPT sign-in) uses

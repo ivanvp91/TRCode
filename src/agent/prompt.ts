@@ -19,6 +19,10 @@ const BASE = `You are TRCode, a coding agent in the terminal. You work on a real
 - Do not add comments that restate the obvious. Match the surrounding code: the same comment density, naming and idioms.
 - Do not create READMEs, docs or examples unless asked.
 
+# Servers
+- Stay off remote machines unless the user named one in this request: no ssh/scp/rsync, no deploy, no command on a production box — not even to verify something.
+- Then only that host and that action; anything more waits for a yes.
+
 # Verifying your work
 - After changing code, run the checks this project already has (tests, linter, build) — find them in package.json / Makefile / README, not by inventing one.
 - If a check fails, say so plainly and show the output. Never present unverified work as verified.
@@ -52,7 +56,8 @@ const SUBAGENT_BASE = `You are a TRCode subagent, launched by the lead agent for
 - If the task was investigative, return the findings rather than a summary of your process.
 - If you could not find or verify something, say so explicitly instead of filling the gap with a guess.
 - The working directory is shared with the lead and with other subagents running now: your writes are visible to them at once, and theirs to you. Change only the files your assignment covers, and re-read a file before editing it.
-- grep first, then read around the hit with offset/limit. Reading whole files you do not need costs the same on every step of your own loop.`;
+- grep first, then read around the hit with offset/limit. Reading whole files you do not need costs the same on every step of your own loop.
+- No remote machines (ssh, deploy, prod database): return that one is needed.`;
 
 /**
  * The minimal preset has two tools and no safety net of snapshots around them:
@@ -65,7 +70,8 @@ const MINIMAL_BASE = `You are TRCode in minimal mode: exactly two tools, shell a
 - There is no read tool: to see a file before editing it, print it through shell.
 - There is no write tool: edit replaces exact strings, so quote enough context to hit the right spot.
 - Shell redirects and one-liners that write files are outside the snapshot undo — say so when you use them.
-- Be brief and surgical: this mode exists for small, fast changes.`;
+- Be brief and surgical: this mode exists for small, fast changes.
+- Never reach a remote machine (ssh, deploy) unless asked in this request.`;
 
 export interface PromptOptions {
   cwd: string;
@@ -73,6 +79,12 @@ export interface PromptOptions {
   skills: Skill[];
   extraInstructions?: string;
   subagent?: boolean;
+  /**
+   * Read-only planning: the turn explores and proposes, and the tools that
+   * could change anything are not in the list at all. Said in the prompt too,
+   * because a model that cannot see a write tool still tries to describe one.
+   */
+  planMode?: boolean;
   /** "minimal" swaps the full base prompt for the two-tool one. */
   preset?: "standard" | "minimal";
 }
@@ -234,12 +246,23 @@ function sshHostsLine(): string {
   return sshHosts;
 }
 
+/**
+ * Said only in plan mode. Kept out of the ordinary prompt on purpose: it is a
+ * phase, not a policy, and every byte here would otherwise be paid for on every
+ * request of every session.
+ */
+const PLAN_SECTION =
+  "<plan-mode>\nThis turn is read-only: the user asked to see a plan before anything changes. " +
+  "Explore the code, then answer with the plan itself — what you would change, in what order, and what you are unsure about. " +
+  "File edits, shell commands and paid generation are not available; do not claim to have changed anything.\n</plan-mode>";
+
 export function buildSystemPrompt(opts: PromptOptions): string {
   if (opts.preset === "minimal") {
     // Minimal keeps only the base and the language directive: no listing, git,
     // skills, memory or model notes — the preset exists to shed exactly these.
     const parts = [MINIMAL_BASE, `<language>\n${languageDirective(loadConfig().lang)}\n</language>`];
     if (opts.extraInstructions) parts.push(`<session-instructions>\n${opts.extraInstructions}\n</session-instructions>`);
+    if (opts.planMode) parts.push(PLAN_SECTION);
     return parts.join("\n\n");
   }
   const parts = [opts.subagent ? SUBAGENT_BASE : BASE];
@@ -258,6 +281,13 @@ Model: ${opts.model}
 Git repository: ${isGitRepo(opts.cwd) ? "yes" : "no"}${sshHostsLine()}
 </environment>`);
 
+  // Near the top on purpose: the model scans the start of the prompt first, and
+  // a catalogue that only appears after the workspace, git status and project
+  // instructions reads as an appendix — which is how a matching skill went
+  // unloaded. The body is still on demand; only the names ride along from here.
+  const skillsSection = skillsPromptSection(opts.skills);
+  if (skillsSection) parts.push(skillsSection);
+
   let tree = listingSnapshots.get(opts.cwd);
   if (tree === undefined) {
     tree = topLevelListing(opts.cwd);
@@ -271,9 +301,6 @@ Git repository: ${isGitRepo(opts.cwd) ? "yes" : "no"}${sshHostsLine()}
     gitSnapshots.set(opts.cwd, git);
   }
   if (git) parts.push(`<git>\n${git}\n</git>`);
-
-  const skillsSection = skillsPromptSection(opts.skills);
-  if (skillsSection) parts.push(skillsSection);
 
   let project = projectSnapshots.get(opts.cwd);
   if (project === undefined) {
@@ -303,6 +330,10 @@ Git repository: ${isGitRepo(opts.cwd) ? "yes" : "no"}${sshHostsLine()}
   if (video) parts.push(video);
   const cfg = loadConfig();
   if (cfg.imageModel || cfg.audioModel || video) parts.push("<media-workflow>Before making scripts or scenes, call prepare_media_workspace (a .tmp/ folder deleted on exit) and keep all scratch and scenes there; pass workspace to generation tools. Only the finished deliverable goes in the current directory. Inspect results against the requested text, size, timing, references and transparency. Recover interrupted jobs with resume_media; never resubmit paid generation automatically.</media-workflow>");
+
+  // Last of all: plan mode is on for one phase of a session, so saying it here
+  // keeps every byte before it identical to the ordinary prompt.
+  if (opts.planMode) parts.push(PLAN_SECTION);
 
   return parts.join("\n\n");
 }

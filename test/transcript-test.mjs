@@ -180,5 +180,36 @@ function check(name, cond, detail = "") {
   check("prose after the table still renders", lines.some((l) => l.includes("Вывод: PowerDNS.")), JSON.stringify(lines));
 }
 
+// ── a build log cannot colour the rows under it ────────────────────────────
+{
+  // rustc links every crate it names to docs.rs with an OSC 8 hyperlink. A row
+  // cut to the terminal's width can lose the closer, and the terminal then
+  // draws a link underline under every row that follows: dashed lines under the
+  // whole screen, the composer included, that nothing printed afterwards
+  // clears. Cursor control from a child is worse — it would erase the session.
+  const link = (url, text) => `${ESC}]8;;${url}${ESC}\\${text}${ESC}]8;;${ESC}\\`;
+  const { width, hasColor } = await import("../dist/ui/ansi.js");
+  const linked = link("https://docs.rs/serde/1.0.0/serde/", "serde::Deserialize");
+  check("a link's URL is not counted as visible cells", width(linked) === width("serde::Deserialize"), String(width(linked)));
+
+  captured = "";
+  toolDone(
+    true,
+    [
+      `warning: unused import ${linked}`,
+      `${ESC}[4munderlined${ESC}[24m and ${ESC}[38;2;255;128;0morange${ESC}[0m`,
+      `${ESC}[?25l${ESC}[2Jcleared${ESC}[1;1H`,
+    ].join("\n"),
+  );
+  const raw = captured;
+  const rows = take();
+  check("no hyperlink reaches the terminal", !raw.includes("]8;"), JSON.stringify(raw));
+  check("the linked text itself is kept", raw.includes("serde::Deserialize"), JSON.stringify(raw));
+  check("an underline opened by the child is dropped", !raw.includes(`${ESC}[4m`), JSON.stringify(raw));
+  check("cursor control from the child is dropped", !raw.includes("[2J") && !raw.includes("[?25l"), JSON.stringify(raw));
+  if (hasColor) check("the child's colour survives", raw.includes("[38;2;255;128;0m"), JSON.stringify(raw));
+  check("all three rows are printed", rows.filter((l) => l.trim()).length === 3, JSON.stringify(rows));
+}
+
 say(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

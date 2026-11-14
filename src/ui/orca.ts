@@ -13,6 +13,12 @@
  * contract is public — Orca ships the plugin that speaks it — so that is the
  * dialect used here. `orcaAgent` in the config switches to another route.
  *
+ * Nothing sent here names a conversation. Orca remembers a session id from its
+ * `opencode` route as resumable and restarts that pane with
+ * `opencode --session <id>`; a trcode id is not an opencode one, so opencode
+ * refuses it ("Expected a string starting with \"ses\"") and the pane dies on
+ * restore. Without an id the pane comes back as a plain shell.
+ *
  * Everything here fails open. Orca being closed, slow or a version ahead must
  * never cost a turn.
  */
@@ -104,14 +110,14 @@ export class OrcaReporter {
     return new OrcaReporter(paneKey, cfg.orcaAgent || "opencode");
   }
 
-  busy(sessionId: string): void {
-    this.status("busy", sessionId);
+  busy(): void {
+    this.status("busy");
   }
 
   /** Flushes any queued preview first, so the finished pane shows the answer. */
-  async idle(sessionId: string): Promise<void> {
+  async idle(): Promise<void> {
     this.flushPart();
-    this.status("idle", sessionId);
+    this.status("idle");
     await this.drain();
   }
 
@@ -126,24 +132,24 @@ export class OrcaReporter {
     this.post("PermissionRequest", { toolName: tool, title: detail.slice(0, 200) });
   }
 
-  userPrompt(text: string, sessionId: string): void {
-    this.post("MessagePart", { role: "user", text: cap(text), sessionID: sessionId });
+  userPrompt(text: string): void {
+    this.post("MessagePart", { role: "user", text: cap(text) });
   }
 
   /**
    * Assistant text, coalesced: deltas arrive dozens of times a second and the
    * dashboard renders a preview. Only the latest snapshot matters.
    */
-  assistantText(text: string, sessionId: string): void {
+  assistantText(text: string): void {
     this.pendingPart = { role: "assistant", text };
     const since = Date.now() - this.lastPartAt;
-    if (since >= PART_THROTTLE_MS) return this.flushPart(sessionId);
+    if (since >= PART_THROTTLE_MS) return this.flushPart();
     if (this.partTimer) return;
-    this.partTimer = setTimeout(() => this.flushPart(sessionId), PART_THROTTLE_MS - since);
+    this.partTimer = setTimeout(() => this.flushPart(), PART_THROTTLE_MS - since);
     this.partTimer.unref?.();
   }
 
-  private flushPart(sessionId = ""): void {
+  private flushPart(): void {
     if (this.partTimer) {
       clearTimeout(this.partTimer);
       this.partTimer = null;
@@ -152,13 +158,13 @@ export class OrcaReporter {
     this.pendingPart = null;
     if (!part) return;
     this.lastPartAt = Date.now();
-    this.post("MessagePart", { role: part.role, text: cap(part.text), sessionID: sessionId });
+    this.post("MessagePart", { role: part.role, text: cap(part.text) });
   }
 
-  private status(next: "busy" | "idle", sessionId: string): void {
+  private status(next: "busy" | "idle"): void {
     if (this.lastStatus === next) return;
     this.lastStatus = next;
-    this.post(next === "busy" ? "SessionBusy" : "SessionIdle", { sessionID: sessionId });
+    this.post(next === "busy" ? "SessionBusy" : "SessionIdle", {});
   }
 
   private post(event: OrcaEvent, props: Record<string, unknown>): void {

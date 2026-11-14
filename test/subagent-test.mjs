@@ -61,8 +61,8 @@ const models = tool.parameters.properties.model.enum;
 // The default allowlist is the session's own model: a subagent runs on what the
 // session runs on unless /subagents says otherwise.
 check("the session's model is offered", models.includes("mock-fast"), String(models));
-// A subagent is paid for by the key this session is using, so nothing outside
-// the allowlist — another provider included — is ever suggested.
+// Nothing outside the allowlist is suggested — the marked list is the only way
+// to widen it, and it names models explicitly, host by host.
 check("another model of the provider is not offered by default", !models.includes("mock-smart"), String(models));
 check("another provider is not offered", !models.includes("kimi:k3"), String(models));
 check("image models are not", !models.includes("wan2.7-image"), String(models));
@@ -115,7 +115,7 @@ check("a multi-part request reads as a fan-out", /is a fan-out: launch one subag
 // A shortlist, when one was chosen: /subagents widens what may be launched.
 {
   const { saveConfig, loadConfig } = await import("../dist/config.js");
-  saveConfig({ subagentModels: { tokenrouter: ["mock-fast", "mock-smart"] } });
+  saveConfig({ subagentModels: ["mock-fast", "mock-smart"] });
   const widened = makeTaskTool({
     cwd: process.cwd(), catalog, skills: [], tools: () => [],
     defaultModel: "mock-fast", effortFor: () => "off", maxSteps: 3, usage: new UsageTracker(),
@@ -125,14 +125,14 @@ check("a multi-part request reads as a fan-out", /is a fan-out: launch one subag
 
   // A list naming a model this provider no longer serves must not empty the
   // allowlist — an empty enum reads as "any string will do".
-  saveConfig({ subagentModels: { tokenrouter: ["gone-from-catalog"] } }, { replace: ["subagentModels"] });
+  saveConfig({ subagentModels: ["gone-from-catalog"] });
   const stale = makeTaskTool({
     cwd: process.cwd(), catalog, skills: [], tools: () => [],
     defaultModel: "mock-fast", effortFor: () => "off", maxSteps: 3, usage: new UsageTracker(),
   });
   check("a stale shortlist falls back to the session's model", JSON.stringify(stale.parameters.properties.model.enum) === JSON.stringify(["mock-fast"]), String(stale.parameters.properties.model.enum));
 
-  saveConfig({ subagentModels: {} }, { replace: ["subagentModels"] });
+  saveConfig({ subagentModels: [] });
   check("cleared, the session's model only", JSON.stringify(makeTaskTool({
     cwd: process.cwd(), catalog, skills: [], tools: () => [],
     defaultModel: "mock-fast", effortFor: () => "off", maxSteps: 3, usage: new UsageTracker(),
@@ -150,26 +150,42 @@ check("a multi-part request reads as a fan-out", /is a fan-out: launch one subag
     defaultModel: "mock-fast", effortFor: () => "off", maxSteps: 3, usage: new UsageTracker(),
   }).parameters.properties.model.enum;
 
-  saveConfig({ subagentModels: { tokenrouter: ["mock-fast", "mock-smart"] } }, { replace: ["subagentModels"] });
-  check("a saved list reads as the list mode", subagentMode("tokenrouter") === "list");
+  saveConfig({ subagentModels: ["mock-fast", "mock-smart"] });
+  check("a saved list reads as the list mode", subagentMode() === "list");
   check("and it is what gets offered", JSON.stringify(enumOf()) === JSON.stringify(["mock-fast", "mock-smart"]), String(enumOf()));
 
-  saveConfig({ subagentMode: { tokenrouter: "session" } });
+  saveConfig({ subagentMode: "session" });
   check("switched to the session's model, only that is offered", JSON.stringify(enumOf()) === JSON.stringify(["mock-fast"]), String(enumOf()));
   check(
     "and the list is still in the config, untouched",
-    JSON.stringify(loadConfig().subagentModels.tokenrouter) === JSON.stringify(["mock-fast", "mock-smart"]),
-    JSON.stringify(loadConfig().subagentModels.tokenrouter),
+    JSON.stringify(loadConfig().subagentModels) === JSON.stringify(["mock-fast", "mock-smart"]),
+    JSON.stringify(loadConfig().subagentModels),
   );
 
-  saveConfig({ subagentMode: { tokenrouter: "list" } });
+  saveConfig({ subagentMode: "list" });
   check("switched back, the same list is offered again", JSON.stringify(enumOf()) === JSON.stringify(["mock-fast", "mock-smart"]), String(enumOf()));
 
-  // A provider with no mode saved behaves the way it did before the choice.
-  saveConfig({ subagentMode: {} }, { replace: ["subagentMode"] });
-  check("no mode saved, a list still means the list", subagentMode("tokenrouter") === "list");
-  saveConfig({ subagentModels: {} }, { replace: ["subagentModels"] });
-  check("no mode and no list means the session's model", subagentMode("tokenrouter") === "session");
+  // A config with no mode saved behaves the way it did before the choice.
+  saveConfig({ subagentMode: undefined });
+  check("no mode saved, a list still means the list", subagentMode() === "list");
+  saveConfig({ subagentModels: [] });
+  check("no mode and no list means the session's model", subagentMode() === "session");
+}
+
+// Helpers cross providers: a marked model from another host is offered to the
+// lead, because its own key pays for it.
+{
+  const { saveConfig } = await import("../dist/config.js");
+  const mixed = [...catalog, { id: "kimi:k3", modality: "text", chatCapable: true }];
+  const enumOf = () => makeTaskTool({
+    cwd: process.cwd(), catalog: mixed, skills: [], tools: () => [],
+    defaultModel: "mock-fast", effortFor: () => "off", maxSteps: 3, usage: new UsageTracker(),
+  }).parameters.properties.model.enum;
+
+  saveConfig({ subagentModels: ["mock-fast", "kimi:k3"] });
+  check("a marked model of another provider is offered", JSON.stringify(enumOf()) === JSON.stringify(["mock-fast", "kimi:k3"]), String(enumOf()));
+  saveConfig({ subagentModels: [] });
+  check("unmarked, it is not", !enumOf().includes("kimi:k3"), String(enumOf()));
 }
 
 // A refusal has to tell the model what to do differently, or it relaunches the

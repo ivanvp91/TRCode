@@ -49,11 +49,10 @@ Rules:
 - Do not invent files or commands you may not know: if a step needs reconnaissance, make that a separate step.`;
 
 /**
- * The models a step may run on. Same rule as the task tool: a step agent is
- * paid for by the key the session is using, so it is this provider's models,
- * and the shortlist alone when /subagents has one switched on. Without that
- * list there is nothing to choose between — the session's model runs every
- * step, exactly as it did before.
+ * The models a step may run on. Same rule as the task tool: any host the
+ * catalogue lists a marked model on, since a step is paid for by the key behind
+ * the model it runs on. With no shortlist switched on there is nothing to choose
+ * between — the session's model runs every step, exactly as it did before.
  */
 export function stepModels(app: App): ModelInfo[] {
   return workerModels(app.catalog, app.session.model).slice(0, 12);

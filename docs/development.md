@@ -55,6 +55,13 @@ TRCode is not on its list — the routes are `claude`, `cursor`, `gemini`, `grok
 public (Orca ships the plugin that speaks it). The pane will show an opencode icon; the
 status, the preview and the notifications are the real ones.
 
+What the reports deliberately do **not** carry is a session id. Orca treats the
+`sessionID` field of that route as an opencode conversation, remembers it as resumable
+and restarts the pane with `opencode --session <id>` after a reload. A TRCode id is not
+an opencode one, so opencode refuses it outright — `Expected a string starting with
+"ses" at ["sessionID"]` — and the pane dies before it starts. Without an id Orca brings
+the pane back as a plain shell, and `trc --resume` is yours to run.
+
 ```json
 { "orca": true, "orcaAgent": "opencode" }
 ```
@@ -104,6 +111,7 @@ the desktop renderer is patched.
 src/
   index.ts             entry point, arguments, headless mode
   config.ts            config, key, project instructions
+  hooks.ts             lifecycle hooks and the turn notification
   provider/
     client.ts          request dispatch, SSE, retries, effort probing
     registry.ts        providers: routing by model id, base URL, headers
@@ -140,6 +148,8 @@ src/
     stdin.ts           single owner of the input stream
     repl.ts            the loop, turns, transcript
     commands.ts        slash commands
+    commands/          command modules (custom.ts: user command files;
+                       hooks.ts: /hooks and /commands)
     render.ts          banner, markdown, tables, spinner, diffs
     layout.ts          chat geometry and time formatting
     picker.ts          list picker with tabs and sections

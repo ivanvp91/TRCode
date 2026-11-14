@@ -43,6 +43,7 @@ insert, Esc to dismiss. `/help` prints the full reference.
 | `/compact auto [on\|off]` | switch auto-compaction off or on, or report the thresholds |
 | `/rewind [last]` | put files back to how they were before a turn |
 | `/yolo [on\|off]` | skip confirmations — tools run immediately (also Shift+Tab) |
+| `/plan [on\|off]` | plan first: read-only exploration and a proposal, nothing changes until you approve (`trc --plan` starts this way) |
 | `/goal <objective> [--turns <n>]` | set a persistent goal the agent keeps working toward — see [Working toward a goal](tools-and-workflows.md#working-toward-a-goal) |
 | `/image [model\|off]` | choose the model that draws; the chat then calls it on request — see [Images, video and audio](tools-and-workflows.md#images-video-and-audio) |
 | `/video [on\|off\|model\|prompt_model]` | video mode: a text model prepares generation requests; questions and planning do not generate clips |
@@ -55,13 +56,18 @@ insert, Esc to dismiss. `/help` prints the full reference.
 system prompt, tool schemas, history after trim, injections — the projection behind
 [Token spend](models-and-costs.md#token-spend))
 
-**Settings** — `/lang [code]`, `/default [name]`, `/aliases`, `/permissions`, `/login [provider] [url]`, `/settings`, `/tips [on\|off\|reset]`, `/update [--check]`, `/config`, `/cwd`
+**Settings** — `/lang [code]`, `/default [name]`, `/aliases`, `/permissions`, `/hooks [reload|trust]`, `/commands [reload]`, `/login [provider] [url]`, `/settings`, `/tips [on\|off\|reset]`, `/update [--check]`, `/config`, `/cwd`
 (the catalog lives in `/model` — the panel lists the current provider by type and vendor,
 `/model all` every provider, and its Refresh button re-reads it past the cache; `/login`
 connects the one in use unless another is named, and takes a host for the providers whose
 endpoint is per-account; `/settings` groups the toggleable preferences — what the status
 line shows, whether skills and UI mockups match themselves automatically, whether updates
-are looked for; `/update` installs the newest GitHub release — details below)
+are looked for; `/update` installs the newest GitHub release — details below; `/hooks` lists the
+lifecycle hooks and the turn notification with the files they came from, `/commands` the
+markdown command files this project defines — both take `reload` to re-read from disk;
+`/permissions` takes a class and a mode, or a pattern — `allow shell(git status:*)`,
+`deny edit(secrets/**)`, `remove 2`, `clear`: rules are checked deny → ask → allow and the
+first match decides, so a refusal outvotes a permission)
 
 **Agents** — `/subagents [model [id]\|session\|list\|auto on\|auto off]`, `/prompt <task> \| model [id] \| off\|command\|auto`,
 `/prompt_model [id]`, `/mcp [reload]`

@@ -3,11 +3,18 @@ import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
 import crypto from "node:crypto";
-import type { McpServerConfig, ModelPricing } from "./types.js";
+import type { HooksConfig, McpServerConfig, ModelPricing } from "./types.js";
+import type { PermissionRule } from "./permissionRules.js";
 import type { SubagentRole } from "./agent/roles.js";
 
-export const VERSION = "0.2.2";
+export const VERSION = "0.3.0";
 export const DEFAULT_BASE_URL = "https://api.tokenrouter.com/v1";
+/**
+ * The built-in router's id. It keeps its key in config.json rather than the
+ * auth directory, and the account book has to know which provider that is —
+ * declared here so both sides can agree without importing each other.
+ */
+export const ROUTER_PROVIDER = "tokenrouter";
 
 export type PermissionMode = "ask" | "allow" | "deny";
 
@@ -78,19 +85,22 @@ export interface Config {
    */
   videoPromptModel?: string;
   /**
-   * Which models subagents may run on, per provider: "session" — the model the
-   * session runs on and nothing else; "list" — the models chosen in
-   * subagentModels. Absent is read from the list itself, so a config written
+   * Which models subagents may run on: "session" — the model the session runs
+   * on and nothing else; "list" — the models chosen in subagentModels, from any
+   * connected provider. Absent is read from the list itself, so a config written
    * before the choice existed keeps behaving the way it did.
    */
-  subagentMode: Record<string, "session" | "list">;
-  /** Per provider: let the lead launch helpers without a per-turn approval. */
+  subagentMode?: "session" | "list";
+  /** Keyed by the provider the session runs on: let the lead launch helpers
+   *  without a per-turn approval. */
   subagentAuto: Record<string, boolean>;
   /**
-   * Models a subagent may be launched on, per provider. A list restricts helper
-   * launches to those models; session mode uses the lead's current model.
+   * Models a subagent may be launched on, from any connected provider — a
+   * helper on another host spends that host's plan, which is the point. A list
+   * restricts helper launches to those models; session mode uses the lead's
+   * current model.
    */
-  subagentModels: Record<string, string[]>;
+  subagentModels: string[];
   /**
    * Named presets for the task tool's `role`, on top of the built-in explore
    * and review. null switches a built-in off.
@@ -126,8 +136,8 @@ export interface Config {
   /**
    * Scope of that tab: true — the default — every connected provider's stars,
    * so picking one switches the session's host; false — only what the provider
-   * in use serves. A panel whose answer has to be callable by the provider in
-   * use, the subagent pool, stays narrow either way.
+   * in use serves. Panels whose answer must be callable by the provider in use
+   * pass `favoritesCatalog` instead and stay narrow either way.
    */
   favoritesAllProviders: boolean;
   /**
@@ -167,6 +177,13 @@ export interface Config {
    * model takes no reasoning parameter at all.
    */
   effortForm: Record<string, string>;
+  /**
+   * Patterns that answer a confirmation, checked deny → ask → allow before the
+   * coarse per-class mode below: `shell(git status:*)`, `edit(src/**)`,
+   * `read(./.env)`, `fetch(domain:github.com)`. The first match in a pass wins,
+   * so a specific refusal always outvotes a broad permission.
+   */
+  permissionRules: PermissionRule[];
   permissions: {
     read: PermissionMode;
     write: PermissionMode;
@@ -234,6 +251,14 @@ export interface Config {
   thinkingRows: number;
   /** Ceiling on tool-call rounds per user turn; 0 removes it. */
   maxSteps: number;
+  /**
+   * Step ceiling for one subagent run — the `task` tool's helpers, not the
+   * session itself. 0 removes it, which is the default for the same reason
+   * maxSteps is 0: a helper stopped mid-task hands back a preamble, and the
+   * follow-up that continues it re-sends its whole history. A role preset's
+   * own maxSteps still narrows individual helpers.
+   */
+  subagentSteps: number;
   /**
    * Tool calls from one assistant turn that may run at once. Subagents are
    * tool calls too, so on a host that meters requests this is also how many
@@ -384,6 +409,27 @@ export interface Config {
    * by itself — /update does that on request.
    */
   updateCheck: boolean;
+  /**
+   * Shell commands run at lifecycle points: before a tool call, after it, when
+   * a prompt is submitted, when the session starts, when a turn ends, and
+   * before the history is compacted. Exit code 2 blocks the event and its
+   * stderr is the reason. A project may add its own in
+   * `.trcode/settings.json`; /hooks shows what is in force.
+   */
+  hooks: HooksConfig;
+  /**
+   * A command run when a turn ends: argv of the notification script, with the
+   * turn's JSON payload appended as the last argument. Empty means no
+   * notification.
+   */
+  notify: string[];
+  /**
+   * Fingerprints of the `.trcode/settings.json` hooks approved in each project.
+   * A repository is not trusted with running commands on this machine just
+   * because it was cloned; `/hooks trust` records the exact hooks agreed to,
+   * and any edit to the file asks again.
+   */
+  hooksTrusted: Record<string, string[]>;
 }
 
 /** The pieces a turn status can carry, each independently optional. */
@@ -397,9 +443,9 @@ const DEFAULTS: Config = {
   model: "moonshotai/kimi-k3",
   smallModel: "moonshotai/kimi-k3-free",
   promptModels: {},
-  subagentModels: {},
+  subagentModels: [],
   subagentRoles: {},
-  subagentMode: {},
+  subagentMode: undefined,
   subagentAuto: {},
   brainModels: [],
   brainMainModel: "",
@@ -444,6 +490,9 @@ const DEFAULTS: Config = {
   projectState: {},
   mcpTrusted: {},
   permissions: { read: "allow", write: "ask", shell: "ask", network: "ask", agent: "allow", paidMedia: "ask" },
+  // No rules out of the box: the class modes above are the whole policy until
+  // someone writes a pattern, and an empty list costs nothing per call.
+  permissionRules: [],
   newlineKeys: [],
   shell: "auto",
   // Not a response deadline — a dead-connection guard: it only fires after
@@ -489,6 +538,12 @@ const DEFAULTS: Config = {
   // the loop it guards against — which Esc, the live step counter and
   // auto-compaction already handle. Set a number to put a ceiling back.
   maxSteps: 0,
+  // No helper ceiling either, for the same reason: a subagent working through
+  // a review finding or a test failure needs far more than forty rounds, and
+  // being cut off there leaves the lead with a preamble — while the follow-up
+  // that continues the work re-sends the helper's entire history. A role
+  // preset with maxSteps still bounds a narrow helper (explore, review).
+  subagentSteps: 0,
   toolConcurrency: 4,
   // The ladder from cheapest loss to latest: nothing is thrown away before it
   // has to be, and the lossy full handoff still waits until the window is
@@ -519,6 +574,11 @@ const DEFAULTS: Config = {
   mcpToolSearch: false,
   statusFields: { model: true, tokens: true, steps: true, time: true, speed: true },
   updateCheck: true,
+  // Silent until asked for: a hook is a program spawned per tool call, and a
+  // default one would be a surprise nobody chose.
+  hooks: {},
+  notify: [],
+  hooksTrusted: {},
 };
 
 export function configDir(): string {
@@ -543,6 +603,36 @@ function readConfigFile(): Partial<Config> {
   }
 }
 
+/**
+ * The helper list, flat. A config written before helpers could cross providers
+ * holds one list per provider; merging them on read keeps every mark the user
+ * made without a migration step of its own.
+ */
+export function readSubagentModels(value: unknown): string[] {
+  if (Array.isArray(value)) return value.filter((id): id is string => typeof id === "string");
+  if (!value || typeof value !== "object") return [];
+  const out: string[] = [];
+  for (const list of Object.values(value as Record<string, unknown>)) {
+    if (!Array.isArray(list)) continue;
+    for (const id of list) if (typeof id === "string" && !out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+/**
+ * The mode, or undefined when nobody chose one — then the list decides, which
+ * is how a config from before the choice behaved. A per-provider map is read as
+ * the one mode it can mean: any "list" wins, since that is the wider setting.
+ */
+export function readSubagentMode(value: unknown): "session" | "list" | undefined {
+  if (value === "session" || value === "list") return value;
+  if (!value || typeof value !== "object") return undefined;
+  const modes = Object.values(value as Record<string, unknown>);
+  if (modes.includes("list")) return "list";
+  if (modes.includes("session")) return "session";
+  return undefined;
+}
+
 export function loadConfig(): Config {
   if (cached) return cached;
   let file: Partial<Config> = {};
@@ -557,9 +647,9 @@ export function loadConfig(): Config {
     contextWindows: { ...DEFAULTS.contextWindows, ...(file.contextWindows || {}) },
     effortForm: { ...DEFAULTS.effortForm, ...(file.effortForm || {}) },
     promptModels: { ...DEFAULTS.promptModels, ...(file.promptModels || {}) },
-    subagentModels: { ...DEFAULTS.subagentModels, ...(file.subagentModels || {}) },
+    subagentModels: readSubagentModels(file.subagentModels),
     subagentRoles: { ...DEFAULTS.subagentRoles, ...(file.subagentRoles || {}) },
-    subagentMode: { ...DEFAULTS.subagentMode, ...(file.subagentMode || {}) },
+    subagentMode: readSubagentMode(file.subagentMode),
     subagentAuto: { ...DEFAULTS.subagentAuto, ...(file.subagentAuto || {}) },
     modelPrompts: { ...DEFAULTS.modelPrompts, ...(file.modelPrompts || {}) },
     providerState: { ...DEFAULTS.providerState, ...(file.providerState || {}) },
@@ -567,11 +657,13 @@ export function loadConfig(): Config {
     mcpServers: { ...DEFAULTS.mcpServers, ...(file.mcpServers || {}) },
     mcpTrusted: { ...DEFAULTS.mcpTrusted, ...(file.mcpTrusted || {}) },
     statusFields: { ...DEFAULTS.statusFields, ...(file.statusFields || {}) },
+    hooksTrusted: { ...DEFAULTS.hooksTrusted, ...(file.hooksTrusted || {}) },
     // A favoriteModels corrupted by an older save (an object-shaped spread)
     // must not crash every model panel — salvage what looks like an array.
     brainModels: Array.isArray(file.brainModels) ? file.brainModels : DEFAULTS.brainModels,
     swarmModels: Array.isArray(file.swarmModels) ? file.swarmModels : DEFAULTS.swarmModels,
     favoriteModels: Array.isArray(file.favoriteModels) ? file.favoriteModels : DEFAULTS.favoriteModels,
+    permissionRules: Array.isArray(file.permissionRules) ? file.permissionRules : DEFAULTS.permissionRules,
   };
   const envKey = process.env.TOKENROUTER_API_KEY || process.env.TR_API_KEY;
   if (envKey) merged.apiKey = envKey;
@@ -599,6 +691,7 @@ export function saveConfig(patch: Partial<Config>, opts: { replace?: (keyof Conf
   // business persisting it.
   const current = readConfigFile();
   const replace = new Set(opts.replace ?? []);
+  const given = <K extends keyof Config>(key: K) => Object.prototype.hasOwnProperty.call(patch, key);
   const merge = <T extends object>(key: keyof Config, base: T | undefined, incoming: T | undefined): T =>
     replace.has(key) && incoming !== undefined ? incoming : ({ ...(base ?? {}), ...(incoming ?? {}) } as T);
   // Array-valued keys must replace wholesale — object-spreading an array
@@ -618,9 +711,13 @@ export function saveConfig(patch: Partial<Config>, opts: { replace?: (keyof Conf
     contextWindows: merge("contextWindows", current.contextWindows, patch.contextWindows),
     effortForm: merge("effortForm", current.effortForm, patch.effortForm),
     promptModels: merge("promptModels", current.promptModels, patch.promptModels),
-    subagentModels: merge("subagentModels", current.subagentModels, patch.subagentModels),
+    // The helper list is global and always whole: a patch replaces it, and a
+    // per-provider map left by an older version is read as the flat list it
+    // means. An explicit `undefined` clears the mode, which is how "nobody
+    // chose one, let the list decide" is written back.
+    subagentModels: given("subagentModels") ? readSubagentModels(patch.subagentModels) : readSubagentModels(current.subagentModels),
     subagentRoles: merge("subagentRoles", current.subagentRoles, patch.subagentRoles),
-    subagentMode: merge("subagentMode", current.subagentMode, patch.subagentMode),
+    subagentMode: given("subagentMode") ? readSubagentMode(patch.subagentMode) : readSubagentMode(current.subagentMode),
     subagentAuto: merge("subagentAuto", current.subagentAuto, patch.subagentAuto),
     modelPrompts: merge("modelPrompts", current.modelPrompts, patch.modelPrompts),
     providerState: merge("providerState", current.providerState, patch.providerState),
@@ -628,10 +725,12 @@ export function saveConfig(patch: Partial<Config>, opts: { replace?: (keyof Conf
     mcpServers: merge("mcpServers", current.mcpServers, patch.mcpServers),
     mcpTrusted: merge("mcpTrusted", current.mcpTrusted, patch.mcpTrusted),
     statusFields: merge("statusFields", current.statusFields, patch.statusFields),
+    hooksTrusted: merge("hooksTrusted", current.hooksTrusted, patch.hooksTrusted),
     brainModels: mergeList("brainModels", current.brainModels, patch.brainModels),
     swarmModels: mergeList("swarmModels", current.swarmModels, patch.swarmModels),
     favoriteModels: mergeList("favoriteModels", current.favoriteModels, patch.favoriteModels),
     tipsSeen: mergeList("tipsSeen", current.tipsSeen, patch.tipsSeen),
+    permissionRules: mergeList("permissionRules", current.permissionRules, patch.permissionRules),
   };
   ensureDir(configDir());
   fs.writeFileSync(configPath(), JSON.stringify(next, null, 2) + "\n", { mode: 0o600 });
