@@ -2,18 +2,19 @@
 
 ## Fixed
 
-- **OpenCode Zen и Go больше не отвечают 400 «Request is missing x-opencode-session».**
-  Шлюз просит клиента присылать стабильный id разговора в `x-opencode-session` — по нему
-  он держит один разговор на одном бэкенде и попадает в прогретый там кэш префикса — и
-  без заголовка отказывается маршрутизировать запрос. Заголовок объявляется в реестре
-  (`ProviderMode.sessionHeader`) и едет на каждом запросе к обоим режимам, включая
-  пробу ключа при логине. Значение — хеш, а не локальный id сессии: он несёт в себе
-  локальную дату, и вендору её знать незачем. Запросы без явного id (субагент, компакт,
-  генератор заголовка) различаются по собственному префиксу промпта — ровно по тому,
-  что шлюз и кэширует. Тесты в `test/provider-test.mjs` (8 проверок, всего 190).
-- `User-Agent` стал `trcode/<версия>` вместо безверсионного `trcode-cli`: Go просит
-  клиента называть себя своим именем, а версия в нём — единственный способ для хоста
-  отличить трафик одного релиза от другого.
+- **OpenCode Zen and Go no longer answer 400 "Request is missing x-opencode-session".**
+  The gateway asks the client to send a stable conversation id in `x-opencode-session` —
+  it keeps one conversation on one backend by that id and hits the prefix cache warmed
+  there — and without the header it refuses to route the request. The header is declared
+  in the registry (`ProviderMode.sessionHeader`) and travels on every request to both
+  modes, including the key probe at login. The value is a hash, not a local session id:
+  it carries the local date, and the vendor has no need to know it. Requests without an
+  explicit id (subagent, compaction, title generator) are told apart by their own prompt
+  prefix — exactly what the gateway caches. Tests in `test/provider-test.mjs` (8 checks,
+  190 total).
+- `User-Agent` is now `trcode/<version>` instead of the versionless `trcode-cli`: Go asks
+  the client to name itself, and the version in it is the only way for the host to tell
+  the traffic of one release from another.
 
 ## Install
 

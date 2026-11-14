@@ -1,52 +1,53 @@
-# TRCode v0.2.1 — тринадцать языков, веер субагентов, чистый терминал
+# TRCode v0.2.1 — thirteen languages, subagent fan-out, cleaner terminal
 
-## Языки интерфейса
+## Interface languages
 
-- Одиннадцать новых языков: китайский, японский, немецкий, французский, испанский,
-  итальянский, португальский, украинский, польский, малайский и индонезийский (всего
-  тринадцать). `/lang` принимает код, английское или родное имя, без аргумента открывает
-  пикер; подстановки стали именованными, склонения идут через `Intl.PluralRules`, а
-  непереведённая строка читается по-английски, а не исчезает.
+- Eleven new languages: Chinese, Japanese, German, French, Spanish, Italian, Portuguese,
+  Ukrainian, Polish, Malay and Indonesian (thirteen in total). `/lang` accepts a code, the
+  English or the native name, and with no argument opens the picker; placeholders became
+  named, plurals go through `Intl.PluralRules`, and an untranslated string reads in English
+  instead of disappearing.
 
-## Работа агента
+## Agent work
 
-- Запрос из нескольких независимых частей больше не идёт очередью: агент сам запускает
-  субагентов веером — по одному вызову `task` на часть в одном ходу.
-- Над спиннером идёт список работающих помощников: модель, израсходованный бюджет шагов,
-  токены и последнее действие.
-- Модели панели `/brain` получают инструменты агента, а сама панель стала чекбоксами:
-  пробел отмечает строку на любой вкладке, Enter применяет весь набор.
-- Вопрос модели рисуется над строкой ввода, не сдвигая ни диалог, ни композер.
-- `/brain` и `/swarm` спрашивают в обычном композере — с полосой, статусом и клавишами
-  редактирования.
-- Каждый файл, который перезаписывают `edit`/`write`, оставляет прежние байты в
-  `.tmp/agent-backups/<session-id>/` до конца сессии.
+- A request with several independent parts no longer runs as a queue: the agent fans out
+  subagents itself — one `task` call per part in the same turn.
+- Above the spinner runs a list of the working helpers: model, spent step budget, tokens
+  and the last action.
+- The `/brain` panel models get the agent's tools, and the panel itself became checkboxes:
+  space marks a row on any tab, Enter applies the whole set.
+- A question from the model is drawn above the input line without shifting either the
+  dialog or the composer.
+- `/brain` and `/swarm` ask in the normal composer — with the band, the status and the
+  editing keys.
+- Every file that `edit`/`write` overwrites leaves its previous bytes in
+  `.tmp/agent-backups/<session-id>/` until the session ends.
 
-## Исправлено
+## Fixed
 
-- `tok/s` в статус-баре считается по времени генерации, а не по часам хода; `↓` стал
-  накопительным за ход.
-- Ход, в котором модель только размышляла, больше не заканчивается молча: шаг
-  отправляется заново, пустой ответ в историю не пишется.
-- Панель `/brain` больше не заканчивается фразой «сейчас проверю ещё пару фактов»:
-  при исчерпании бюджета шагов модель отвечает по собранному.
-- Пустой блок «Ответ»/«Response» больше не печатается.
-- Пустота над панелями и выводом после отправки строки убрана.
+- `tok/s` in the status bar is computed from generation time, not from the turn clock; `↓`
+  became cumulative per turn.
+- A turn in which the model only thought no longer ends silently: the step is sent again,
+  and an empty answer is not written to history.
+- The `/brain` panel no longer ends with "let me check a couple more facts": when the step
+  budget is spent, the model answers from what it has gathered.
+- The empty "Response" block is no longer printed.
+- The void above panels and output after a submitted line is gone.
 
-## Терминал
+## Terminal
 
-- Логотип-заставка окрашен как шлифованный металл: серебристая рампа и зеркальный блик
-  раз в десять секунд, канал меняется не больше чем на одну ступень за кадр.
+- The splash logo is coloured like brushed metal: a silver ramp and a specular highlight
+  every ten seconds, with a channel changing by no more than one step per frame.
 
-## Проверка
+## Verification
 
-Полный набор: 82 тестовых набора.
+Full set: 82 test suites.
 
-## Установка и обновление
+## Installation and update
 
-В существующей установке: `trc update` или `/update`, затем перезапустите CLI.
+In an existing installation: `trc update` or `/update`, then restart the CLI.
 
-Для установки из архива релиза:
+To install from the release archive:
 
 ```sh
 npm install -g https://github.com/ivanvp91/TRCode/releases/download/v0.2.1/trcode-0.2.1.tgz

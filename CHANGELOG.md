@@ -10,841 +10,843 @@ All notable changes to TRCode are documented here. The format follows
 
 ### Added
 
-- **Несколько ключей и аккаунтов на одного поставщика.** Раньше у поставщика была
-  одна учётная запись, и смена ключа означала заново вводить его через `/login`.
-  Теперь каждый поставщик ведёт книгу именованных учётных данных
-  (`src/provider/accounts.ts`, `~/.trcode/auth/<id>.accounts.json` при правах 0600):
-  ключи API и входы по подписке лежат рядом, один из них активный, а его данные
-  по-прежнему записываются в `<id>.json` — старые читатели (`resolveAuth`,
-  `verifyProvider`, `trc auth status`) не изменились. `/login` у подключённого
-  поставщика открывает список: Enter делает строку под курсором активной, кнопки
-  добавляют (`Add account`), переименовывают и удаляют; удаление последней
-  учётной записи отключает поставщика. У неподключённого поставщика `/login`
-  спрашивает ключ: окно в рамке модалок с полями «Ключ API» и «Имя» (после
-  браузерного входа — имя аккаунта, по умолчанию email), и новый ключ становится
-  активным. Новые записи из CLI — `trc auth login --name work`. Ключ, который
-  хост отверг при проверке, из книги убирается вместе с файлом, а провайдер
-  возвращается к прежнему активному аккаунту. Переключение — всегда вручную:
-  автоматической ротации нет, выбор плательщика остаётся за пользователем.
-  Проверки — `test/accounts-test.mjs` (26) и `test/login-form-test.mjs` (24).
-- **Окно ввода ключа больше не сырой prompt.** `src/ui/form.ts` — форма в рамке
-  модалок (`╭─ Заголовок ─╮`, подпись, поля с курсором, ряд кнопок, легенда клавиш):
-  ключ рисуется звёздочками, Tab/↑↓ переходят между полями, Tab с последнего поля
-  уводит на кнопки (`←/→` выбирают, Enter выполняет), Enter подтверждает форму,
-  Esc отменяет, вставка ключа с переводом строки отправляет её. Для не-TTY
-  остался построчный `askSecret`, чтобы `echo key | trc auth login` работал.
-- **Правила разрешений по шаблонам.** Кроме классов (`permissions.shell`) теперь есть
-  список `permissionRules` (`src/permissionRules.ts`): `shell(git status:*)` —
-  префикс команды, `shell(rm -rf *)` — glob, `edit(src/**)`/`read(./.env)` — пути
-  относительно корня проекта (`*` в пределах сегмента, `**` через сегменты, ведущий
-  `/` — абсолютный путь), `fetch(domain:github.com)` — хост и его поддомены,
-  `*` вместо имени инструмента — всё. Проверка идёт тремя проходами deny → ask →
-  allow, в каждом побеждает первое совпадение: точечный запрет не перебивается
-  широким разрешением. `deny` действует даже под `/yolo` и на команды, уходящие на
-  другую машину; `allow` — только на обычные вызовы. `/permissions` без аргументов
-  показывает классы и нумерованный список правил, `allow|ask|deny <rule>` добавляет,
-  `remove <rule|#>` и `clear` убирают. Проверка — `test/permission-rules-test.mjs` (41).
-- **Режим плана.** `/plan [on|off]` и флаг `trc --plan`: сессия становится read-only —
-  `buildTools({planMode})` оставляет только чтение, поиск, веб, `todo`, `memory`,
-  skills и вопрос пользователю, а запись/правка/shell/run_code/субагенты/платная
-  генерация и MCP-тулзы не предлагаются вовсе (список по именам: новый инструмент
-  не попадёт туда сам). В системный промпт в этом режиме добавляется короткая секция
-  `<plan-mode>` — обычный промпт не вырос. После удачного хода бар спрашивает:
-  выполнить план, ещё планировать или выйти из режима; «выполнить» выключает режим и
-  ставит задачу в очередь. В строке статуса режим виден как «plan». Проверка —
-  `test/plan-mode-test.mjs` (15).
-- **Хуки жизненного цикла.** Внешняя команда на события `SessionStart`,
-  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` и `PreCompact`
-  (`src/hooks.ts`): JSON-payload на stdin, `event`/`cwd`/`tool`/`args`/`output`
-  в нём и в переменных `TRCODE_*`, код выхода `2` — блокировка события с
-  stderr в роли причины. `UserPromptSubmit` с кодом 0 добавляет свой stdout к
-  промпту (`<hook-context>`), `PostToolUse` — строку `[hook feedback]` к
-  результату инструмента, `PreToolUse` не даёт инструменту запуститься вовсе.
-  Матчер — regex по имени инструмента. Хуки читаются из `~/.trcode/config.json`
-  и из `.trcode/settings.json` проекта (проектный файл может добавить только
-  `hooks` и заменить `notify` — не разрешения и не модель); `/hooks` показывает
-  что в силе и откуда, `/hooks reload` перечитывает файлы, `TRCODE_NO_HOOKS`
-  выключает всё. Заодно на PowerShell код выхода пробрасывается явно
-  (`exit $LASTEXITCODE`) — иначе любой отказ читался бы как «1». Хуки из
-  репозитория не запускаются сами: `/hooks` показывает их, `/hooks trust`
-  одобряет файл целиком (отпечаток содержимого в `hooksTrusted`), правка файла
-  спрашивает заново — как и с MCP-серверами проекта.
-- **Уведомление о конце хода.** `notify` в тех же файлах: команда получает
-  JSON последним аргументом (`type`, `ok`, `stoppedBecause`,
-  `lastAssistantMessage`). Запускается один раз из `finishTurn`, не держит
-  композер и не роняет ход при ошибке.
-- **Свои слэш-команды из файлов.** `.trcode/commands/*.md` (в репозитории) и
-  `~/.trcode/commands/*.md` (у пользователя) становятся командами
-  `/name`; подкаталог — неймспейс (`db/migrate.md` → `/db:migrate`), проект
-  выигрывает при совпадении имён. Frontmatter `description` и `argument-hint`,
-  `$ARGUMENTS` подставляется (или дописывается в конец), `` !`cmd` `` и блок
-  ```` ```! ```` заменяются выводом команды до отправки модели,
-  `${TRCODE_CWD}`/`${TRCODE_SESSION_ID}` — путей и ид сессии
-  (`src/ui/commands/custom.ts`). Команды попадают в подсказки композера, в
-  индекс по `/`, в `/help` и в подсказку «возможно, вы имели в виду»; `/commands`
-  их перечисляет. Проверки — `test/hooks-test.mjs`, `test/hooks-live-test.mjs`
-  (хук внутри настоящего хода), `test/custom-commands-test.mjs`.
-- **Потолок шагов субагента стал настройкой и по умолчанию снят.** Помощник
-  `task` упирался в жёсткие 40 шагов независимо от `maxSteps` (тот ограничивает
-  только главный цикл, и у многих он 0): правка по итогам ревью обрывалась на
-  полуслове, а в результат уходила преамбула вроде «Now the agent operates on …».
-  Теперь потолок задаёт `subagentSteps` в конфиге (0 — без потолка, как у
-  главного цикла; роль с `maxSteps` по-прежнему сужает помощника), а
-  остановившийся помощник пишет в результате, что продолжить можно follow-up'ом
-  с его `agent_id`. В баре помощника без потолка вместо «0%» видны потраченные
-  раунды. Проверки — `test/harness-features-test.mjs`.
-- **Субагенты ходят между провайдерами.** Список моделей помощников был привязан к
-  поставщику сессии: `subagentModels` и `subagentMode` лежали картами по `providerId`,
-  а `workerModels` отбирал только модели того же хоста, поэтому дешёвый хост на другом
-  плане помощником стать не мог. Теперь список один на клиент (`subagentModels:
-  string[]`), режим тоже (`subagentMode: "session" | "list"`), а пул — все подключённые
-  поставщики: отмеченная модель чужого хоста попадает в `enum` инструмента `task`,
-  `/orchestrate` предлагает её шагу, и платит за неё ключ этого хоста. Старый конфиг с
-  картами по провайдерам читается как есть — списки сливаются при загрузке, режим
-  выводится из записей (`list` побеждает), а панель `/subagents` больше не ограничена
-  текущим поставщиком: вкладка на каждого подключённого провайдера, «Избранное» и подпись
-  «N отмеченных ниже, у любого поставщика». `/subagents auto on|off` остался по
-  провайдеру сессии — это разрешение на самостоятельный запуск, а не выбор модели.
-  Проверки — `test/subagent-test.mjs` (35), `test/subagent-stale-test.mjs` (13),
+- **Several keys and accounts per provider.** A provider used to have one
+  credential, and changing the key meant typing it again through `/login`.
+  Now every provider keeps a ledger of named credentials
+  (`src/provider/accounts.ts`, `~/.trcode/auth/<id>.accounts.json` with 0600
+  permissions): API keys and subscription logins sit side by side, one of them
+  is active, and its data is still written to `<id>.json` — the old readers
+  (`resolveAuth`, `verifyProvider`, `trc auth status`) are unchanged. `/login`
+  at a connected provider opens the list: Enter makes the row under the cursor
+  active, buttons add (`Add account`), rename and delete; deleting the last
+  credential disconnects the provider. At a provider that is not connected,
+  `/login` asks for the key: a modal-framed window with `API key` and `Name`
+  fields (after a browser login — the account name, email by default), and the
+  new key becomes active. New records from the CLI — `trc auth login --name work`.
+  A key the host rejected during the check is removed from the ledger together
+  with the file, and the provider goes back to the previously active account.
+  Switching is always manual: there is no automatic rotation, and the choice of
+  who pays stays with the user.
+  Checks — `test/accounts-test.mjs` (26) and `test/login-form-test.mjs` (24).
+- **The key input window is no longer a raw prompt.** `src/ui/form.ts` — a form in
+  the modal frame (`╭─ Title ─╮`, subtitle, fields with a cursor, a row of buttons,
+  a key legend): the key is drawn as asterisks, Tab/↑↓ move between fields, Tab from
+  the last field moves to the buttons (`←/→` select, Enter executes), Enter confirms
+  the form, Esc cancels, and pasting a key with a newline submits it. For non-TTY
+  the line-by-line `askSecret` remains, so `echo key | trc auth login` works.
+- **Permission rules by pattern.** Besides the classes (`permissions.shell`) there is
+  now a list of `permissionRules` (`src/permissionRules.ts`): `shell(git status:*)` —
+  a command prefix, `shell(rm -rf *)` — a glob, `edit(src/**)`/`read(./.env)` — paths
+  relative to the project root (`*` within a segment, `**` across segments, a leading
+  `/` — an absolute path), `fetch(domain:github.com)` — a host and its subdomains,
+  `*` instead of the tool name — everything. The check runs in three passes deny → ask
+  → allow, and in each the first match wins: a narrow denial is not overridden by a
+  broad allowance. `deny` applies even under `/yolo` and to commands that go to
+  another machine; `allow` — only to ordinary calls. `/permissions` without arguments
+  shows the classes and a numbered list of rules, `allow|ask|deny <rule>` adds one,
+  `remove <rule|#>` and `clear` remove them. Check — `test/permission-rules-test.mjs` (41).
+- **Plan mode.** `/plan [on|off]` and the `trc --plan` flag: the session becomes
+  read-only — `buildTools({planMode})` leaves only reading, search, web, `todo`,
+  `memory`, skills and asking the user, while writing/edit/shell/run_code/subagents/paid
+  generation and MCP tools are not offered at all (the list is by name: a new tool
+  does not end up there by itself). A short `<plan-mode>` section is added to the
+  system prompt in this mode — the regular prompt did not grow. After a successful
+  turn the bar asks: execute the plan, keep planning or leave the mode; "execute"
+  turns the mode off and queues the task. The status line shows the mode as "plan".
+  Check — `test/plan-mode-test.mjs` (15).
+- **Lifecycle hooks.** An external command for the events `SessionStart`,
+  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `Stop` and `PreCompact`
+  (`src/hooks.ts`): a JSON payload on stdin, `event`/`cwd`/`tool`/`args`/`output`
+  in it and in the `TRCODE_*` variables, exit code `2` — blocking the event with
+  stderr as the reason. `UserPromptSubmit` with code 0 adds its stdout to the
+  prompt (`<hook-context>`), `PostToolUse` — a `[hook feedback]` line to the
+  tool result, `PreToolUse` does not let the tool start at all.
+  The matcher is a regex over the tool name. Hooks are read from `~/.trcode/config.json`
+  and from the project's `.trcode/settings.json` (the project file may add only
+  `hooks` and replace `notify` — not permissions and not the model); `/hooks` shows
+  what is in force and where from, `/hooks reload` re-reads the files, `TRCODE_NO_HOOKS`
+  turns everything off. On PowerShell the exit code is also passed through explicitly
+  (`exit $LASTEXITCODE`) — otherwise any refusal would read as "1". Hooks from the
+  repository do not run by themselves: `/hooks` shows them, `/hooks trust`
+  approves the file as a whole (a fingerprint of its contents in `hooksTrusted`), and
+  editing the file asks again — just like with project MCP servers.
+- **Notification about the end of a turn.** `notify` in the same files: the command
+  receives JSON as its last argument (`type`, `ok`, `stoppedBecause`,
+  `lastAssistantMessage`). It runs once from `finishTurn`, does not hold the
+  composer and does not bring the turn down on error.
+- **Your own slash commands from files.** `.trcode/commands/*.md` (in the repository)
+  and `~/.trcode/commands/*.md` (at the user's) become `/name` commands; a
+  subdirectory is a namespace (`db/migrate.md` → `/db:migrate`), and the project
+  wins on a name clash. Frontmatter `description` and `argument-hint`,
+  `$ARGUMENTS` is substituted (or appended at the end), `` !`cmd` `` and a
+  ```` ```! ```` block are replaced by the command's output before the request goes
+  to the model, `${TRCODE_CWD}`/`${TRCODE_SESSION_ID}` — by paths and the session id
+  (`src/ui/commands/custom.ts`). The commands reach the composer's suggestions, the
+  index on `/`, `/help` and the "did you mean" hint; `/commands` lists them.
+  Checks — `test/hooks-test.mjs`, `test/hooks-live-test.mjs` (a hook inside a real
+  turn), `test/custom-commands-test.mjs`.
+- **The subagent step ceiling is now a setting and is off by default.** The `task`
+  helper hit a hard 40 steps regardless of `maxSteps` (which only limits the main
+  loop, and for many is 0): a fix ordered after a review was cut off mid-sentence,
+  and the result carried a preamble like "Now the agent operates on …".
+  The ceiling is now set by `subagentSteps` in the config (0 — no ceiling, like the
+  main loop; a role with `maxSteps` still narrows the helper), and a helper that
+  stopped says in its result that it can be continued with a follow-up
+  carrying its `agent_id`. In the bar of an uncapped helper the spent rounds are
+  shown instead of "0%". Checks — `test/harness-features-test.mjs`.
+- **Subagents move between providers.** The helper model list was tied to the
+  session's provider: `subagentModels` and `subagentMode` were maps by `providerId`,
+  and `workerModels` selected only models of the same host, so a cheap host on another
+  plan could not become a helper. Now there is one list for the whole client
+  (`subagentModels: string[]`), the mode too (`subagentMode: "session" | "list"`), and
+  the pool is every connected provider: a marked model of a foreign host gets into the
+  `enum` of the `task` tool, `/orchestrate` offers it to a step, and that host's key
+  pays for it. An old config with per-provider maps is read as is — lists are merged
+  on load, the mode is derived from the records (`list` wins), and the `/subagents`
+  panel is no longer limited to the current provider: a tab per connected provider,
+  "Favorites" and the caption "N marked below, at any provider". `/subagents auto on|off`
+  still applies per session provider — that is a permission to run on its own, not a
+  model choice.
+  Checks — `test/subagent-test.mjs` (35), `test/subagent-stale-test.mjs` (13),
   `test/orchestrate-test.mjs` (13).
-- **Ничья между навыками больше не гасит навык.** Если два навыка набирали близкий
-  счёт, автовыбор молча отказывался от обоих (`MARGIN`), и просьба вроде «почини
-  flaky-тест» оставалась без процедуры. Теперь вместо пустого выбора в историю
-  уходит `<skill-choice>` с коротким списком двух-трёх имён (`chooseSkills`,
-  `src/skills/match.ts`), и решает модель, которая читает запрос целиком; уже
-  предложенное повторно не предлагается (`offeredSkills`). Заодно фразовые триггеры
-  сравниваются по словам, а не подстрокой (русские склонения: «утечку памяти» против
-  «утечка памяти»), слово, которое заявили четыре и более навыка, только ранжирует,
-  а короткий запрос с глаголом («почини ci», 8 символов) уже считается задачей.
-  Каталог навыков в промпте сжат до первого предложения описания и перенесён сразу
-  после `<environment>`: на 57 навыках это 6.8k символов, около 1.9k токенов вместо
-  4.6k. Проверки — `test/skill-test.mjs`.
-- **Навык управления рабочим столом и браузером.** `.trcode/skills/desktop-control`:
-  Windows-действия (окна, UIA-дерево, клики по контролам, ввод, снимки окна через
-  `PrintWindow`) и браузер через DevTools Protocol без единой зависимости
-  (`scripts/browser.mjs`, в том числе пакетный режим `batch scenario.json`).
-  Оба исполнителя по умолчанию не трогают рабочий стол пользователя: foreground-
-  действия требуют явного `-AllowForeground`, необратимые клики — `-Confirm`,
-  каждое действие пишется в `~/.trcode/desktop-actions.jsonl`, а запрещённые
-  приложения задаются в `apps.json`. Регрессии — `tests/smoke.ps1`,
+- **A tie between skills no longer silences the skill.** If two skills scored close,
+  the auto-selection silently dropped both (`MARGIN`), and a request like "fix the
+  flaky test" was left without a procedure. Now, instead of an empty pick, a
+  `<skill-choice>` with a short list of two or three names goes into the history
+  (`chooseSkills`, `src/skills/match.ts`), and the model that reads the whole request
+  decides; something already offered is not offered again (`offeredSkills`). Phrase
+  triggers are also compared by words rather than by substring (Russian inflections:
+  a declined form versus the dictionary form of the same phrase), a word claimed by four or more skills only
+  ranks, and a short request with a verb ("fix ci", 8 characters) already counts as a
+  task. The skill catalogue in the prompt is squeezed to the first sentence of the
+  description and moved right after `<environment>`: at 57 skills that is 6.8k characters,
+  about 1.9k tokens instead of
+ 4.6k. Checks — `test/skill-test.mjs`.
+- **A skill for driving the desktop and the browser.** `.trcode/skills/desktop-control`:
+  Windows actions (windows, the UIA tree, clicks on controls, input, window captures via
+  `PrintWindow`) and a browser through DevTools Protocol with not a single dependency
+  (`scripts/browser.mjs`, including the batch mode `batch scenario.json`).
+  Both executors leave the user's desktop alone by default: foreground
+  actions require an explicit `-AllowForeground`, irreversible clicks — `-Confirm`,
+  every action is written to `~/.trcode/desktop-actions.jsonl`, and forbidden
+  applications are set in `apps.json`. Regressions — `tests/smoke.ps1`,
   `tests/foreground-policy.ps1`, `tests/browser-batch-smoke.mjs`.
 
 ### Fixed
 
-- **Секунды из живого хвоста команд убраны.** Каждая строка вывода долгой команды
-  уходила в блок прогресса с префиксом вида «125s · », и список читался как
-  таймер, а не как работа: в нём висело пять одинаковых «125s · PASS …». Теперь
-  в хвосте только слова самой команды (`src/tools/shell.ts`); отсчёт остался в
-  heartbeat «Running… (2m 30s · quiet … of 10m 0s)», который появляется, когда
-  команда молчит. Проверки — `test/activity-test.mjs`, `test/shell-output-test.mjs`.
+- **Seconds are gone from the live tail of commands.** Every output line of a long command
+  went into the progress block with a prefix like "125s · ", and the list read like a
+  timer rather than like work: five identical "125s · PASS …" hung in it. Now
+  the tail carries only the command's own words (`src/tools/shell.ts`); the count
+  remains in the heartbeat "Running… (2m 30s · quiet … of 10m 0s)", which appears when
+  the command is silent. Checks — `test/activity-test.mjs`, `test/shell-output-test.mjs`.
 
-- **Лимит, который снимается через дни, больше не высиживается.** Недельный лимит
-  плана отвечает `429` с `Retry-After` на двое суток с лишним (и словами
-  «resets in 2d 6h»), а клиент честно засыпал на всё это время: в транскрипте
-  висело «Waiting ~54h 55m before retrying» и отсчёт в статусе, терминал стоял
-  без ответа, и только через четыре минуты тишины появлялся вопрос «Keep
-  waiting». Такой ход не переждать, поэтому ожидание, которое не влезает в
-  общий запас терпения (`RATE_LIMIT_PATIENCE_MS`, пять минут), больше не
-  берётся вовсе: `postWithRetry` в `src/provider/client.ts` сразу заканчивает
-  ход сообщением «the usage limit is spent; the host asks to wait 2d 6h …
-  Switch models with /model, or send again after the limit resets» и словами
-  хоста о времени сброса. Подсказка «The same model elsewhere» при 429
-  по-прежнему предлагает соседний хост. Проверка — блок в
+- **A limit that clears in days is no longer sat out.** A plan's weekly limit answers
+  `429` with a `Retry-After` of two days and more (and the words
+  "resets in 2d 6h"), and the client honestly slept for all of it: the transcript
+  carried "Waiting ~54h 55m before retrying" and a countdown in the status, the terminal stood
+  without an answer, and only after four minutes of silence did the "Keep
+  waiting" question appear. Such a turn cannot be waited out, so a wait that does not fit
+  into the overall patience budget (`RATE_LIMIT_PATIENCE_MS`, five minutes) is no longer
+  taken at all: `postWithRetry` in `src/provider/client.ts` ends the turn right away with
+  the message "the usage limit is spent; the host asks to wait 2d 6h …
+  Switch models with /model, or send again after the limit resets" and the host's words
+  about the reset time. The "The same model elsewhere" hint on a 429
+  still suggests a neighbouring host. Check — the block in
   `test/provider-test.mjs`.
-- **Вопрос «ждать дальше?» больше не ломает нижнюю часть экрана.** Когда хост
-  замолкал, ход ставил на паузу нижний бар и рисовал кнопки `Keep waiting`
-  обычной строкой в транскрипте: бар исчезал, ответ, пришедший пока вопрос
-  висел, печатался прямо поверх этих кнопок, а следующая перерисовка вопроса
-  (`←/→`, Enter) стирала уже напечатанный ответ и оставляла вторую копию кнопок
-  ниже — в длинном ходе со множеством вызовов инструментов нижняя панель после
-  этого не восстанавливалась. Теперь вопрос — часть кадра бара (`src/ui/stall.ts`,
-  `setFooterAbove`), бар продолжает работать и остаётся на последней строке
-  экрана, вывод модели идёт над вопросом обычным путём, а `onStall` получает
-  второй аргумент — `AbortSignal`, который срабатывает, как только в поток
-  снова пришли данные (`withIdleWatchdog` в `src/provider/client.ts`): вопрос
-  снимается сам, без нажатия клавиши. Проверка — `test/stall-prompt-test.mjs` (32).
-- **Список моделей для субагентов сверяется с каталогом.** Сохранённый id
-  переживал модель: `opencode-go:minimax-m3.1-flash-free` оставался отмеченным,
-  когда хост его уже не отдавал, — в панели `/subagents` он считался в подписи
-  «N отмеченных ниже» и в строке «Субагенты у …», хотя строки для него на экране
-  нет, а сохранить панель означало записать его заново. Теперь список читается
-  через каталог (`liveSubagentModels` в `src/ui/commands/agents.ts`): панель
-  открывается без исчезнувших моделей, сохранение пишет только то, что видно на
-  экране, и один раз печатается строка «убрано из списка (N) — больше не
-  предлагаются: …». Очистившийся список перестаёт значить «работать по списку»
-  (режим сбрасывается на модель сессии), пустой каталог ничего не вычищает —
-  пока провайдер не загрузился, судить не по чему. Проверка —
+- **The "keep waiting?" question no longer breaks the bottom of the screen.** When the host
+  went silent, the turn paused the bottom bar and drew the `Keep waiting` buttons as an
+  ordinary line in the transcript: the bar disappeared, the answer that arrived while the
+  question hung was printed right over those buttons, and the next repaint of the question
+  (`←/→`, Enter) erased the answer already printed and left a second copy of the buttons
+  below — in a long turn with many tool calls the bottom panel was not
+  restored afterwards. Now the question is part of the bar's frame (`src/ui/stall.ts`,
+  `setFooterAbove`), the bar keeps working and stays on the last line of the
+  screen, the model's output goes above the question the usual way, and `onStall` receives
+  a second argument — an `AbortSignal` that fires as soon as data
+  arrives in the stream again (`withIdleWatchdog` in `src/provider/client.ts`): the question
+  is dismissed by itself, without a keypress. Check — `test/stall-prompt-test.mjs` (32).
+- **The subagent model list is checked against the catalog.** A saved id
+  outlived its model: `opencode-go:minimax-m3.1-flash-free` stayed marked
+  when the host no longer served it — in the `/subagents` panel it counted in the
+  "N marked below" caption and in the "Subagents at …" line, although there was no row
+  for it on screen, and saving the panel meant writing it again. Now the list is read
+  through the catalog (`liveSubagentModels` in `src/ui/commands/agents.ts`): the panel
+  opens without the vanished models, saving writes only what is visible on
+  screen, and a line "removed from the list (N) — no longer
+  offered: …" is printed once. A list that emptied out stops meaning "work by list"
+  (the mode falls back to the session model), and an empty catalog prunes nothing —
+  until the provider has loaded there is nothing to judge by. Check —
   `test/subagent-stale-test.mjs`.
-- **«Всегда разрешать shell в этой сессии» теперь правда разрешает — и на другой
-  машине тоже.** Кнопка добавляла `shell` в набор, разрешённый на сессию, но
-  команда, уходящая на другую машину, подтверждается принудительно (`force`), а
-  принуждение этот набор намеренно не смотрит — выходило, что для `ssh`/`scp`
-  кнопка не делала ничего, и следующая команда спрашивала снова. Теперь у
-  принудительных вызовов своё разрешение (`sessionAllowRemote` в
-  `src/ui/permissions.ts`): набор, выданный для обычной работы, их по-прежнему не
-  пропускает, а кнопка в таком запросе называется «Всегда разрешать команды на
-  другие машины в этой сессии» и запоминается отдельно; сам запрос печатает
-  строку о том, почему спрашивает даже при включённом YOLO. `/new` сбрасывает оба
-  набора. Проверка — `test/remote-gate-test.mjs`.
-- **Orca больше не запускает панель как opencode.** Отчёты trcode несут только
-  координаты панели, состояние и текст. Раньше в них уходил ещё `sessionID` —
-  id сессии trcode, — а маршрут `opencode`, через который идут отчёты, Orca
-  читает как «это opencode-сессия» и запоминает её как возобновляемую
-  (`sleepingAgentSessionsByPaneKey`). После перезагрузки Orca поднимала панель
-  командой `opencode --session <id>`, opencode проверяет префикс своего id и
-  падал с `Error: Expected a string starting with "ses" at ["sessionID"]`.
-  Теперь `busy`/`idle`/`userPrompt`/`assistantText` в `src/ui/orca.ts` не
-  называют сессию: панель восстанавливается обычной оболочкой, а не чужим
-  агентом. Старая запись о панели чистится сама, как только trcode начнёт в ней
-  ход (статус без сессии снимает её — `canReuseStatusProviderSession`).
-- **Обрывок JSON в аргументах вызова больше не отравляет ход.** Строгий хост
-  отвечает 400 «`arguments` must be valid JSON» на `function_call`, чьи
-  аргументы не разбираются, и повторяет это каждому следующему шагу — а
-  обрывок живёт в истории, потому что его туда положил сам провайдер (Muse
-  обрывает вызов на середине объекта, шаг, упёршийся в лимит вывода, оставляет
-  половину). История по-прежнему хранит то, что пришло (модель видит этот текст
-  в результате инструмента), на провод — в обоих диалектах — уходит `{}`:
-  `wireToolArgs()` в `src/provider/schema.ts`, вызовы из `wireMessages`
-  (`src/provider/client.ts`) и `toResponsesInput` (`src/provider/responses.ts`).
-  Заодно аргументы, пришедшие уже разобранным объектом, перестали превращаться
-  в `"[object Object]"` — они снова становятся JSON-строкой
+- **"Always allow shell in this session" now really allows — on another machine too.**
+  The button added `shell` to the set allowed for the session, but a command that goes
+  to another machine is confirmed forcibly (`force`), and force
+  deliberately ignores that set — so for `ssh`/`scp` the button did
+  nothing, and the next command asked again. Now forced calls have their own permission
+  (`sessionAllowRemote` in `src/ui/permissions.ts`): the set granted for ordinary
+  work still does not let them through, while the button in such a request is called
+  "Always allow remote commands this session" and is remembered separately; the request
+  itself prints a line about why it asks even with YOLO on. `/new` resets both
+  sets. Check — `test/remote-gate-test.mjs`.
+- **Orca no longer starts the panel as opencode.** trcode's reports carry only the panel
+  coordinates, the state and the text. They used to carry `sessionID` too —
+  trcode's session id — and the `opencode` route, through which the reports go, Orca
+  reads as "this is an opencode session" and remembers it as resumable
+  (`sleepingAgentSessionsByPaneKey`). After a restart Orca raised the panel with the
+  command `opencode --session <id>`, opencode checks the prefix of its own id and
+  failed with `Error: Expected a string starting with "ses" at ["sessionID"]`.
+  Now `busy`/`idle`/`userPrompt`/`assistantText` in `src/ui/orca.ts` do not
+  name the session: the panel is restored by an ordinary shell rather than by a foreign
+  agent. The old record about the panel is cleared by itself as soon as trcode starts a
+  turn in it (a status without a session removes it — `canReuseStatusProviderSession`).
+- **A JSON fragment in call arguments no longer poisons the turn.** A strict host
+  answers 400 "`arguments` must be valid JSON" to a `function_call` whose
+  arguments do not parse, and repeats it on every following step — and the
+  fragment lives in the history because the provider itself put it there (Muse
+  cuts a call off in the middle of an object, a step that hit the output limit leaves
+  half). The history still keeps what arrived (the model sees that text
+  in the tool result), while `{}` goes onto the wire — in both dialects:
+  `wireToolArgs()` in `src/provider/schema.ts`, called from `wireMessages`
+  (`src/provider/client.ts`) and `toResponsesInput` (`src/provider/responses.ts`).
+  Arguments that arrived already parsed as an object also stopped turning into
+  `"[object Object]"` — they become a JSON string again
   (`ResponsesStreamParser`, `parseResponsesResult`).
-- **Агент больше не ходит на серверы по своей инициативе.** В базовый промпт
-  добавлен раздел «Servers» — удалённая машина в работе только тогда, когда
-  пользователь назвал её в текущем запросе, и только для того хоста и действия,
-  которые он назвал; в промпт субагента и в минимальный пресет — строка о том же.
-  Промпт — половина дела; вторая в том, что `shell` теперь распознаёт команды,
-  уходящие на другую машину (`ssh`, `scp`, `sftp`, `mosh`, `sshpass`,
-  `telnet`, `rsync` с удалённым адресом и клиенты `mysql`/`mysqldump`/
-  `mariadb`/`psql` с нелокальным хостом), и спрашивает подтверждение всегда:
-  ни `permissions.shell = "allow"`, ни `--yolo`, ни «разрешить на сессию»,
-  выданное для обычной работы, его не пропускают, а без интерактива команда
-  отклоняется. Локальные `-h 127.0.0.1` и `--host=localhost` остаются обычными
-  командами. Проверка — `test/remote-gate-test.mjs`.
-- **Переключение панели больше не оставляет копию блока.** Возврат в панель, из
-  которой переключались, перекладывает экран без всякого resize: терминал молчит,
-  а кадр, нарисованный до ухода, на экране уже не тот — путь курсора вверх
-  считается по строкам, и стирание начинается внутри кадра: строка
-  «⠋ thinking» с прежним временем остаётся над живой. Теперь trcode просит у
-  терминала отчёт о фокусе (DECSET 1004) и на возврате фокуса пишет область
-  экрана заново (см. ниже), а сам отчёт не доходит до ввода как текст
-  (`onTerminalFocus` в `src/ui/stdin.ts`, обработчик в `src/ui/render.ts` и
-  `src/ui/editor.ts`). Ширина и высота из неправдоподобного отчёта (0, или
-  размер спрятанной панели) больше не используются для раскладки: остаётся
-  последняя настоящая (`termWidth`, `screenRows`). Проверка — блок «a pane that
-  comes back to the front» в `test/pin-test.mjs`.
-- **Смена ширины панели больше не оставляет копию блока.** Переключение экрана
-  меняет ширину терминала, и что он сделает с уже нарисованным — его дело:
-  xterm.js режет строку, которую сам не переносил, другие терминалы переносят
-  её в две. Отступ до верха кадра считался по одной из моделей, и после смены
-  ширины он врал в ту или другую сторону: слишком большой стирал переписку над
-  блоком, слишком малый оставлял верхнюю часть прежнего кадра — строка
-  «⠋ thinking» с прежним временем висела над живой. Теперь отступ не считается
-  вовсе: область экрана очищается от первой строки и пишется заново — хвост
-  переписки из лога строк (`tailRows`), затем блок, ровно до последней строки.
-  Строки очищаются и заполняются на месте, скролбэк не растёт и ни одна строка
-  не печатается дважды (`reanchorSeq` в `src/ui/render.ts`). Тем же путём идёт
-  композер в простое (`src/ui/editor.ts`). Проверка — блоки про смену ширины в
-  `test/pin-test.mjs`, в том числе на терминале, который режет строки:
-  без этого исправления теряются последние строки переписки.
-- **Трасса кадров для разбора подобных жалоб.** `TRCODE_FRAME_TRACE=<путь>` или
-  файл `~/.trcode/frame-trace` включают журнал `~/.trcode/frame-trace.log`:
-  события resize/focus, отчёт терминала о размере, откуда и сколько стирается,
-  где рисуется кадр, сколько строк занято. Пишется фоном, на отрисовку не влияет
+- **The agent no longer goes to servers on its own initiative.** A "Servers" section
+  has been added to the base prompt — a remote machine is in play only when the
+  user named it in the current request, and only for that host and action
+  they named; the subagent prompt and the minimal preset get a line about the same.
+  The prompt is half the job; the other half is that `shell` now recognises commands that
+  go to another machine (`ssh`, `scp`, `sftp`, `mosh`, `sshpass`,
+  `telnet`, `rsync` with a remote address, and the `mysql`/`mysqldump`/
+  `mariadb`/`psql` clients with a non-local host), and asks for confirmation always:
+  neither `permissions.shell = "allow"`, nor `--yolo`, nor "allow for the session"
+  granted for ordinary work lets it through, and without an interactive terminal the
+  command is declined. Local `-h 127.0.0.1` and `--host=localhost` remain ordinary
+  commands. Check — `test/remote-gate-test.mjs`.
+- **Switching panes no longer leaves a copy of the block.** Coming back to the pane you
+  switched away from re-lays the screen without any resize at all: the terminal stays
+  silent, while the frame drawn before the departure is no longer the one on screen — the
+  cursor path upwards is counted by lines, and erasing starts inside the frame: the
+  "⠋ thinking" line with the old time remains above the live one. Now trcode asks the
+  terminal for focus reports (DECSET 1004) and on focus return repaints the area
+  of the screen (see below), and the report itself does not reach the input as text
+  (`onTerminalFocus` in `src/ui/stdin.ts`, handlers in `src/ui/render.ts` and
+  `src/ui/editor.ts`). Width and height from an implausible report (0, or
+  the size of a hidden pane) are no longer used for layout: the last real
+  one is kept (`termWidth`, `screenRows`). Check — the block "a pane that
+  comes back to the front" in `test/pin-test.mjs`.
+- **Changing the pane width no longer leaves a copy of the block.** Switching screens
+  changes the terminal width, and what it does with what is already drawn is its business:
+  xterm.js cuts a line it did not wrap itself, other terminals wrap
+  it into two. The offset to the top of the frame was counted by one of the models, and after a width
+  change it lied one way or the other: too large erased the transcript above the
+  block, too small left the upper part of the previous frame — the
+  "⠋ thinking" line with the old time hung above the live one. Now the offset is not counted
+  at all: the screen area is cleared from the first line and written again — the tail of
+  the transcript from the line log (`tailRows`), then the block, exactly down to the last line.
+  Lines are cleared and filled in place, the scrollback does not grow and not a single line
+  is printed twice (`reanchorSeq` in `src/ui/render.ts`). The idle
+  composer goes the same way (`src/ui/editor.ts`). Check — the blocks about a width
+  change in `test/pin-test.mjs`, including on a terminal that cuts lines:
+  without this fix the last lines of the transcript are lost.
+- **A frame trace for diagnosing complaints like these.** `TRCODE_FRAME_TRACE=<path>` or
+  a `~/.trcode/frame-trace` file turns on the `~/.trcode/frame-trace.log` journal:
+  resize/focus events, the terminal's size report, where and how much is erased,
+  where the frame is drawn, how many lines are occupied. It is written in the background, does not affect drawing
   (`src/ui/trace.ts`).
-- **Панель уже 48 колонок больше не оставляет копию строки размышлений.**
-  Раскладка держала полы — 48 колонок терминала, 30 колонок контента — и
-  соблюдала их даже внутри панели уже пола: каждая полоса выходила на несколько
-  клеток шире экрана, терминал переносил её в две строки, и кадр становился выше
-  числа строк, из которого нарисован. Счёт по строкам не находил его верх —
-  прежние строки оставались на экране, а живой бар рисовался ниже: строка
-  «⠋ thinking» висела дважды. Теперь ширина терминала берётся как есть, полы
-  контента подрезаны под неё (`termWidth` в `src/ui/ansi.ts`, `contentWidth`
-  и соседи в `src/ui/layout.ts`), а кадр футера перед отрисовкой обрезается по
-  ширине экрана (`frameLines` в `src/ui/render.ts`) — строка кадра всегда ровно
-  одна физическая строка. Строка статуса бара делит ширину между моделью и
-  подсказкой, а не выдавливает подсказку за край. Проверка — блок про узкую
-  панель в `test/pin-test.mjs` и проверки ширины строк в
+- **A pane narrower than 48 columns no longer leaves a copy of the reasoning line.**
+  The layout kept floors — 48 terminal columns, 30 columns of content — and
+  observed them even inside a pane already below the floor: every band came out several
+  cells wider than the screen, the terminal wrapped it into two lines, and the frame became taller than
+  the number of lines it was drawn from. The line-based count did not find its top —
+  the previous lines stayed on screen while the live bar was drawn lower: the
+  "⠋ thinking" line hung twice. Now the terminal width is taken as it is, the content
+  floors are trimmed to it (`termWidth` in `src/ui/ansi.ts`, `contentWidth`
+  and its neighbours in `src/ui/layout.ts`), and the footer frame is clipped to the
+  screen width before drawing (`frameLines` in `src/ui/render.ts`) — a frame line is always exactly
+  one physical line. The bar's status line shares the width between the model and the
+  hint instead of squeezing the hint past the edge. Check — the block about a narrow
+  pane in `test/pin-test.mjs` and the line-width checks in
   `test/turnbar-test.mjs`.
 
 ## [0.2.2] — 2026-10-25
 
 ### Fixed
 
-- **Ответ больше не пропадает вместе с экраном.** В конце хода композер забирает у
-  ушедшей строки хода освободившиеся строки и сдвигает переписку вниз — сдвиг считался
-  по счётчику напечатанных строк, а его обнуляет замер позиции курсора в начале ввода.
-  Если терминал не отвечает на запрос курсора (`ESC[6n`) — а так бывает в панели
-  терминала внутри оркестратора, — напечатанное за ход засчитывалось со знаком минус, и
-  вместо пары строк композер просил сдвинуть экран на всю длину хода: 600 с лишним строк.
-  Терминал выбрасывал переписку в скролбэк, и оставался пустой экран без ответа и без
-  строки ввода. Теперь замер пересчитывает и точку отсчёта счётчика, «напечатано после»
-  не бывает отрицательным, а сам сдвиг не может превышать высоту экрана. Проверка —
-  блок «a failed probe does not scroll the screen away» в `test/pin-test.mjs`.
+- **The answer no longer disappears together with the screen.** At the end of a turn the composer takes the
+  freed lines from the departing turn row and shifts the transcript down — the shift was counted
+  by the printed-lines counter, and it is reset by the cursor position probe at the start of input.
+  If the terminal does not answer the cursor query (`ESC[6n`) — and that happens in a terminal
+  pane inside an orchestrator — what was printed during the turn counted with a minus sign, and
+  instead of a couple of lines the composer asked to move the screen by the whole length of the turn: 600-plus lines.
+  The terminal threw the transcript into the scrollback, and an empty screen remained without the answer and without
+  the input line. Now the probe also recalculates the counter's reference point, "printed since"
+  is never negative, and the shift itself cannot exceed the screen height. Check —
+  the block "a failed probe does not scroll the screen away" in `test/pin-test.mjs`.
 
 ## [0.2.1] — 2026-10-24
 
 ### Added
 
-- **Одиннадцать новых языков интерфейса: китайский, японский, немецкий, французский,
-  испанский, итальянский, португальский, украинский, польский, малайский и индонезийский.**
-  `/lang` теперь принимает код, английское или родное имя (всего тринадцать языков), а
-  без аргумента открывает пикер. Английский и русский по-прежнему живут прямо в местах
-  вывода (`t("Model", "Модель")`), остальные — каталоги `src/i18n/<code>.ts`, ключом в
-  которых служит тот же английский текст: новая строка не требует правок в вызовах, а
-  непереведённая читается по-английски, а не исчезает. Чтобы каталог вообще мог
-  сопоставить строку, подстановки стали именованными — `t("Deleted {id}", "Удалена {id}",
-  { id })`: конвертированы все шаблонные строки (скрипт прошёл по 819 вызовам `t()` и его
-  алиасов, шаблонных не осталось). Склонения идут через `Intl.PluralRules`, а формы (одна
-  у китайского и японского, четыре у польского и украинского) лежат в каталоге рядом со
-  строками: `count(2, ["model","models"], …)` сам выбирает нужную. Каталоги: 710 строк и
-  7 склоняемых существительных на язык, покрытие 710/710 — переводили субагенты по общему
-  списку ключей, собранному из исходников. Директива языка в системном промпте получила
-  строку на каждый язык, а потолок `prompt-test` не вырос. Тест `test/i18n-test.mjs`
-  расширен до 45 проверок (каталог, подстановка, склонение, fallback, шапка и справка на
-  de/zh/pl) и легче не стал.
+- **Eleven new UI languages: Chinese, Japanese, German, French,
+  Spanish, Italian, Portuguese, Ukrainian, Polish, Malay and Indonesian.**
+  `/lang` now accepts a code, an English or a native name (thirteen languages in all), and
+  without an argument opens a picker. English and Russian still live right in the output
+  sites (`t("Model", "<native>")`), the rest — in `src/i18n/<code>.ts` catalogs, whose key is
+  that same English text: a new line needs no changes at the call sites, and an
+  untranslated one reads in English rather than disappearing. So that a catalog could
+  match a line at all, substitutions became named — `t("Deleted {id}", "<native>",
+  { id })`: every template string was converted (a script walked through 819 calls of `t()` and its
+  aliases, none were left). Plurals go through `Intl.PluralRules`, and the forms (one
+  for Chinese and Japanese, four for Polish and Ukrainian) live in the catalog next to the
+  strings: `count(2, ["model","models"], …)` picks the right one itself. Catalogs: 710 strings and
+  7 inflected nouns per language, coverage 710/710 — subagents translated them from a common
+  list of keys collected from the sources. The language directive in the system prompt got a
+  line per language, and the `prompt-test` ceiling did not grow. The `test/i18n-test.mjs` suite is
+  extended to 45 checks (catalog, substitution, plural, fallback, header and help in
+  de/zh/pl) and did not get any lighter.
 
-- **Субагенты запускаются сами, когда задача делится на части.** Просьба «переведи на
-  10 языков», «проверь каждый модуль», «внеси одну правку во все эти файлы» больше не
-  идёт в очередь: в системном промпте появилось правило «запрос с несколькими
-  независимыми частями — это веер, а не очередь», и то же самое сказано в описании
-  инструмента `task` — по одному вызову на часть в одном ходу, без просьбы пользователя,
-  со сведением результатов на ведущем агенте. Место в промпте освободили сокращением
-  трёх формулировок рядом, потолок `test/prompt-test.mjs` (980 токенов) не поднимали:
-  сейчас 972. `/subagents auto on|off` остаётся переключателем разрешения: с `off`
-  первый самостоятельный запуск один раз спрашивает «Да / Нет / Включить авто».
-  Подсказка о команде теперь называет `auto on`, а не только выбор моделей.
+- **Subagents start by themselves when a task splits into parts.** A request like "translate into
+  10 languages", "check every module", "make one edit in all these files" no longer
+  goes into the queue: the system prompt gained the rule "a request with several
+  independent parts is a fan-out, not a queue", and the same is said in the description of the
+  `task` tool — one call per part in one turn, without the user asking,
+  with the results merged on the lead agent. The room in the prompt was freed by shortening
+  three formulations nearby, and the ceiling of `test/prompt-test.mjs` (980 tokens) was not raised:
+  it is 972 now. `/subagents auto on|off` remains the permission switch: with `off`
+  the first self-started run asks once "Yes / No / Enable auto".
+  The hint about the command now names `auto on`, not just the model choice.
 
-- **Статус-бар работы субагентов в строке хода.** Пока помощники работают, над
-  спиннером идёт список — по строке на каждого:
+- **A status bar for subagent work in the turn row.** While the helpers work, a list runs above
+  the spinner — one line per helper:
 
   ```
   1. deepseek-v4.1-flash 70% · 25k tok · read src/agent/loop.ts
   2. glm-5.3-flash 12% · 3.2k tok · grep(task)
   ```
 
-  В строке модель (без префикса провайдера), доля израсходованного бюджета шагов
-  (считается против того же потолка, под которым идёт помощник, поэтому 100% — это
-  остановка, а на ходу показывается не больше 99%), потраченные токены (вход + выход
-  этого помощника) и последнее действие. Палитра та же, что у строки статистики хода:
-  имя модели оранжевым, номер, проценты, токены и действие — серым. Ушедший помощник
-  исчезает из списка сразу:
-  заголовок и результат к этому моменту уже в транскрипте. Список живёт отдельным
-  блоком бара (`TurnBar.setActivity`), поэтому начало ответа ведущего (`endReasoning`)
-  его не стирает, а строки, которые он занимал, возвращаются транскрипту.
-  `SubagentActivity` вместо `begin/push/end` получает `begin/update/end` с
-  `SubagentProgress` (id, label, модель, шаги, бюджет, токены, последнее действие);
-  в не-TTY, как и раньше, шаги печатаются строками `├ [n] …`.
+  The line carries the model (without the provider prefix), the share of the step budget spent
+  (counted against the same ceiling the helper runs under, so 100% means it
+  stopped, and no more than 99% is shown while it runs), the tokens spent (this helper's input + output)
+  and the last action. The palette is the one of the turn statistics line:
+  the model name in orange, the number, percentages, tokens and action — in gray. A helper that has
+  finished disappears from the list at once:
+  its header and result are in the transcript by then. The list lives in a separate
+  block of the bar (`TurnBar.setActivity`), so the start of the lead's answer (`endReasoning`)
+  does not erase it, and the lines it occupied are returned to the transcript.
+  `SubagentActivity` gets `begin/update/end` instead of `begin/push/end`, with
+  `SubagentProgress` (id, label, model, steps, budget, tokens, last action);
+  in non-TTY, as before, steps are printed as `├ [n] …` lines.
 
-- **Резервные копии правимых файлов в `.tmp/agent-backups/`.** Каждый файл, который
-  собирается перезаписать `edit` или `write`, оставляет в проекте простую копию своих
-  прежних байт: `.tmp/agent-backups/<session-id>/<путь>.<YYYYMMDD-HHMMSS>`, с сохранением
-  структуры каталогов. Это не хранилище `/rewind` — то по-прежнему лежит в `~/.trcode`
-  адресуемым по хешу и умеет откатывать ход; копии нужны человеку, который хочет вернуть
-  файл руками, поэтому они обычные файлы внутри проекта, а не блобы. Живут они ровно
-  столько, сколько живёт сессия: удаление сессии через `/sessions` удаляет и их, а копии
-  сессий, чьих файлов уже нет, вычищаются на старте. Создаваемый файл копии не получает,
-  пустой и слишком большой (> 4 МБ) — тоже, одинаковые байты второй раз не дублируются,
-  а сбой копирования никогда не отменяет саму правку. Каталог `.tmp/` уже в `.gitignore`.
-  Системный промпт теперь говорит, где лежат копии и сколько они живут, — правило
-  уложилось в прежний потолок `test/prompt-test.mjs` (980 токенов) за счёт сокращения
-  трёх формулировок рядом. Тест `test/backup-test.mjs` (23 проверки) в `run-all.mjs`.
+- **Backups of edited files in `.tmp/agent-backups/`.** Every file that
+  `edit` or `write` is about to overwrite leaves a plain copy of its
+  previous bytes in the project: `.tmp/agent-backups/<session-id>/<path>.<YYYYMMDD-HHMMSS>`, keeping the
+  directory structure. This is not the `/rewind` store — that still lives in `~/.trcode`
+  addressable by hash and can roll a turn back; the copies are for a human who wants to bring
+  a file back by hand, so they are ordinary files inside the project, not blobs. They live exactly
+  as long as the session lives: deleting a session through `/sessions` deletes them too, and copies of
+  sessions whose files are gone are cleaned out on start. A created file gets no copy,
+  an empty or too large one (> 4 MB) — neither, identical bytes are not duplicated a second time,
+  and a copy failure never cancels the edit itself. The `.tmp/` directory is already in `.gitignore`.
+  The system prompt now says where the copies live and how long they live, — the rule
+  fitted into the previous `test/prompt-test.mjs` ceiling (980 tokens) by shortening
+  three formulations nearby. The `test/backup-test.mjs` suite (23 checks) is in `run-all.mjs`.
 
-- **Вопрос модели рисуется над строкой ввода, а не под ней.** Диалог `ask_user_question`
-  больше не заменяет нижнюю панель: его строки идут в том же кадре, что и бар, только
-  сверху — вопрос парит над перепиской, а строка ввода и статус остаются на своих местах
-  под ним. Ответ приходит в бар обычным путём; фоновая печать транскрипта не сдвигает
-  ни диалог, ни ввод. На время вопроса бар не останавливается (`exclusiveInput` с
-  `keepBar`), поэтому спиннер и статус хода продолжают жить. Тест —
-  `test/questions-overlay-test.mjs` (13 проверок, виртуальный экран).
+- **A model's question is drawn above the input line, not below it.** The `ask_user_question`
+  dialog no longer replaces the bottom panel: its lines go into the same frame as the bar, only
+  on top — the question floats above the transcript, while the input line and the status stay in their places
+  under it. The answer comes into the bar the usual way; background transcript printing moves
+  neither the dialog nor the input. For the duration of the question the bar does not stop (`exclusiveInput` with
+  `keepBar`), so the spinner and the turn status keep living. Test —
+  `test/questions-overlay-test.mjs` (13 checks, a virtual screen).
 
-- **Инструменты у панели `/brain`.** Модель панели больше не отвечает вслепую: каждая
-  получает тот же набор инструментов, что и агент сессии (`web_search`, `web_fetch`,
-  чтение файлов, оболочка), и работает по тем же правилам подтверждения. Вопрос про
-  текущее состояние библиотеки проверяется в сети, вопрос про проект — по самим файлам.
-  Бюджет — 8 инструментальных шагов на модель за раунд (три раунда на девять моделей
-  умножают каждый шаг), системный промпт просит искать факты, а не менять проект, а
-  вызовы инструментов видны в строке статуса. Без переданного контекста (headless
-  `runBrain`) панель, как и раньше, работает одним `complete()` без инструментов.
-  Файлы, названные в вопросе, по-прежнему прикладываются заранее: это дешевле, чем
-  шаг инструмента в каждом раунде у каждой модели.
+- **Tools for the `/brain` panel.** A panel model no longer answers blind: each one
+  gets the same set of tools as the session agent (`web_search`, `web_fetch`,
+  reading files, the shell) and works by the same confirmation rules. A question about
+  the current state of the library is checked on the web, a question about the project — against the files themselves.
+  The budget is 8 tool steps per model per round (three rounds for nine models
+  multiply every step), the system prompt asks to look facts up rather than change the project, and
+  tool calls are visible in the status line. Without context passed in (headless
+  `runBrain`) the panel, as before, works with a single `complete()` without tools.
+  Files named in the question are still attached in advance: that is cheaper than
+  a tool step in every round for every model.
 
 ### Fixed
 
-- **Скорость в токенах в секунду считается по генерации, а не по часам хода.** Строка
-  `tok/s` в статус-баре делила выданные токены на всё время хода, а в нём большую часть
-  занимают вызовы инструментов, ожидание лимита и повторные отправки: честные 40 tok/s
-  после девяноста секунд сборки показывались как 3. Вдобавок каждое новое usage-сообщение
-  подменяло счётчик `↓` числом последнего шага, и скорость падала ещё раз вместе с ним.
-  Теперь `src/ui/rate.ts` меряет только время, в которое модель действительно стримила
-  (поток открывается первой дельтой, закрывается usage-строкой и сам гаснет после паузы
-  внутри шага), `↓` в баре стал накопительным за ход, а итоговая строка `tok/s avg` берёт
-  то же время генерации. Тест — `test/rate-test.mjs`.
+- **The tok/s rate is counted by generation, not by the turn's clock.** The `tok/s` line
+  in the status bar divided the produced tokens by the whole turn time, and most of it
+  is taken by tool calls, waiting for a limit and resends: an honest 40 tok/s after ninety
+  seconds of building showed as 3. On top of that, every new usage message
+  replaced the `↓` counter with the number of the last step, and the rate dropped again together with it.
+  Now `src/ui/rate.ts` measures only the time during which the model actually streamed
+  (the stream opens with the first delta, closes with the usage line and goes out by itself after a pause
+  within a step), `↓` in the bar became cumulative for the turn, and the final `tok/s avg` line takes
+  the same generation time. Test — `test/rate-test.mjs`.
 
-- **Пустой блок «Ответ»/«Response» больше не печатается.** Раунд, в котором модель
-  сначала отдаёт перевод строки или пробелы, а потом только вызывает инструмент, раньше
-  рисовал разделитель `Response` с пустотой под ним — это читалось как пустой ответ
-  модели (а в длинной агентской задаче таких блоков набегает десяток). Теперь разделитель
-  ждёт первого видимого символа: ведущие пробелы копятся в буфере и уходят в блок уже
-  обрезанными слева, а раунд без слов печатает только строку вызова инструмента.
-  Тест — блок про «wordless tool round» в `test/firstturn-test.mjs`.
+- **The empty "Answer"/"Response" block is no longer printed.** A round in which the model
+  first emits a newline or spaces and then only calls a tool used to
+  draw the `Response` divider with emptiness under it — that read like an empty answer
+  from the model (and in a long agent task a dozen such blocks pile up). Now the divider
+  waits for the first visible character: leading spaces accumulate in a buffer and enter the block already
+  trimmed on the left, and a round without words prints only the tool call line.
+  Test — the block about a "wordless tool round" in `test/firstturn-test.mjs`.
 
-- **Ход, в котором модель только размышляла, больше не заканчивается молча.** Модель
-  тратит весь output-бюджет на reasoning: хост отдаёт `finish_reason: "length"` без
-  текста, либо роутер обрывает стрим без `finish_reason`. Раньше `runAgent` считал такой
-  шаг завершённым ходом и возвращал пустой ответ — на экране оставалась строка
-  статистики над пустотой. Теперь шаг отправляется заново (до пяти раз) с предупреждением
-  в транскрипте, пустой assistant-тёрн в историю не пишется, а если бюджет уже сожжён
-  размышлением — повтор несёт короткую надбавку «ответь прямо сейчас» (только в запросе,
-  не в истории). После двух повторов ход завершается явной ошибкой.
-- **Панель `/brain` больше не заканчивается обещанием ответить.** Если модель тратила
-  весь бюджет инструментальных шагов на исследование, `max_steps` обрывал её ровно
-  между «проверю ещё пару фактов» и собственно ответом — и эта фраза уходила в итог
-  панели (живой случай: 4m35s, 41 запрос, 529k входа, а в истории сессии лежит
-  «Прежде чем свести финальный ответ, проверю несколько спорных фактов инструментами»).
-  Теперь при исчерпании бюджета (или зацикливании) модель получает ещё один запрос на
-  той же истории и без инструментов: «бюджет кончился, отвечай тем, что уже собрал».
-  Бюджет стал разумнее: 8 шагов на раунд ответов, 4 на разбор чужих ответов и синтез.
-- **Пустота над панелями и выводом после отправки строки.** Композер на старте
-  сессии «падает» на последнюю строку экрана, оставляя над собой пустые строки. После
-  отправки курсор оставался внизу, поэтому эхо сообщения, ответ, вывод команды и
-  панели (`/brain`, `/model`, `/fav`) начинались под этой пустотой — просторный пустой
-  экран с текстом у самого низа. Теперь при отправке композер отдаёт эти строки
-  транскрипту: следующая напечатанная строка встаёт вплотную под последним сообщением,
-  а на следующем вводе композер снова опускается на последнюю строку (остаток
-  считается по фактической строке курсора через DSR, с фолбэком на счётчик строк).
-- **Вопрос `/brain` и задача `/swarm` вводятся в обычном композере.** Раньше это была
-  голая строка `❯ Вопрос:` — без полосы, статуса и клавиш редактирования, — и она
-  печаталась там, где стоял курсор.
+- **A turn in which the model only reasoned no longer ends in silence.** The model
+  spends the whole output budget on reasoning: the host returns `finish_reason: "length"` without
+  text, or the router cuts the stream without `finish_reason`. `runAgent` used to consider such a
+  step a completed turn and return an empty answer — a statistics line above emptiness was left on
+  screen. Now the step is sent again (up to five times) with a warning
+  in the transcript, an empty assistant turn is not written to the history, and if the budget is already burned by
+  reasoning — the retry carries a short extra "answer right now" (only in the request,
+  not in the history). After two retries the turn ends with an explicit error.
+- **The `/brain` panel no longer ends with a promise to answer.** If a model spent
+  the whole budget of tool steps on research, `max_steps` cut it off exactly
+  between "let me check a couple more facts" and the answer itself — and that phrase went into the panel's
+  result (a live case: 4m35s, 41 requests, 529k input, and in the session history there is
+  "Before bringing the final answer together, let me check a few disputed facts with tools").
+  Now, on budget exhaustion (or looping), the model gets one more request on
+  the same history and without tools: "the budget is spent, answer with what you have already gathered".
+  The budget became more sensible: 8 steps per round of answers, 4 for analysing other models' answers and synthesis.
+- **Emptiness above panels and output after sending a line.** At the start of a
+  session the composer "falls" to the last screen line, leaving empty lines above itself. After
+  sending, the cursor stayed at the bottom, so the message echo, the answer, the command output and
+  panels (`/brain`, `/model`, `/fav`) began under that emptiness — a spacious empty
+  screen with the text at the very bottom. Now, on send, the composer gives those lines back to the
+  transcript: the next printed line sits right under the last message,
+  and on the next input the composer goes down to the last line again (the remainder is
+  counted by the actual cursor row through DSR, with a fallback to the line counter).
+- **The `/brain` question and the `/swarm` task are typed in the ordinary composer.** This used to be a
+  bare `❯ Question:` line — without the band, the status and editing keys — and it was printed where
+  the cursor stood.
 
 ### Changed
 
-- **Серебристый градиент на логотипе.** Точечный монограмм больше не залит одним серым
-  тоном: он окрашен как шлифованный металл — нейтральная рампа от стали в левом нижнем
-  углу к полированному серебру в правом верхнем, а поверх раз в десять секунд туда и
-  обратно проходит узкая зеркальная полоса, которая выбеливает точки на своём пути, так
-  что поверхность читается как металл под светом. Цвет остался прежним серым (каналы
-  равны), меняется только его светлость. Оттенки скользят, а не прыгают: канал меняется
-  не больше чем на одну ступень (4 из 255) за кадр, поэтому подобраны и шаг рампы, и
-  ширина полосы, и период. Кадров стало 30 в секунду вместо 60, а ступени цвета склеивают
-  сглаженные клетки в один прогон — патч в среднем около килобайта, и всё равно
-  перерисовываются только изменившиеся клетки. Геометрия, позиция курсора и фон
-  терминала не изменились (точки по-прежнему прозрачны), `TRCODE_NO_SPLASH=1` даёт
-  статичный логотип. Тест `test/logo-test.mjs` проверяет нейтральность палитры, размах
-  рампы, наличие блика, плавность скольжения и бесшовный цикл.
+- **A silvery gradient on the logo.** The dotted monogram is no longer flooded with a single gray
+  tone: it is coloured like brushed metal — a neutral ramp from steel in the lower left
+  corner to polished silver in the upper right, and over it, once every ten seconds, a narrow
+  mirror band sweeps there and back, bleaching the dots in its path, so
+  that the surface reads like metal under light. The colour stayed the same gray (the channels
+  are equal), only its lightness changes. The shades slide rather than jump: a channel changes
+  by no more than one step (4 out of 255) per frame, so the ramp step, the
+  band width and the period were all chosen together. Frames went to 30 per second instead of 60, and the colour steps glue
+  smoothed cells into one run — a patch is about a kilobyte on average, and all the
+  same only the changed cells are redrawn. The geometry, the cursor position and the terminal
+  background did not change (the dots are still transparent), `TRCODE_NO_SPLASH=1` gives a
+  static logo. The `test/logo-test.mjs` suite checks the neutrality of the palette, the span
+  of the ramp, the presence of the highlight, the smoothness of the slide and the seamless cycle.
 
-- **Панель `/brain` — чекбоксы.** Каждая строка теперь отметка: пробел ставит и снимает
-  её на любой вкладке («Активные модели», «Избранное», «Все модели»), а Enter применяет
-  весь набор разом — отмеченные строки входят в совет, снятые из него уходят (главная
-  модель, выпавшая из списка, сбрасывается). Раньше Enter по строке добавлял или убирал
-  одну модель и снова открывал панель, так что совет из десяти собирался десятью
-  заходами. Вопрос, как и раньше, задаётся кнопкой «Спросить…» или `/brain <вопрос>`.
+- **The `/brain` panel is checkboxes.** Every row is now a mark: Space sets and clears
+  it on any tab ("Active models", "Favorites", "All models"), and Enter applies
+  the whole set at once — marked rows join the council, unmarked ones leave it (the main
+  model that fell out of the list is reset). Enter on a row used to add or remove
+  one model and reopen the panel, so a council of ten was assembled in ten
+  visits. The question, as before, is asked with the "Ask…" button or `/brain <question>`.
 
 ## [0.2.0] — 2026-10-22
 
 ### Added
 
-- **Подсказки о неиспробованных возможностях.** После обычного завершённого хода под
-  ответом иногда появляется одна строка `tip — …`: `/brain`, `/uilib add`, `/swarm`,
+- **Hints about untried features.** After an ordinary completed turn a single
+  `tip — …` line sometimes appears under the answer: `/brain`, `/uilib add`, `/swarm`,
   `/goal`, `/rewind`, `/fork`, `/trace`, `/preset minimal`, `/stat`, `/subagents`,
-  `/compact` или `!` для команд оболочки. Не чаще одного раза за ход, никогда на
-  первых двух ходах и во время цели, ни одна не повторяется между запусками
-  (`config.tipsSeen`), а подсказка о том, что в сессии уже используется, пропускается.
-  Какая именно — выбирается случайно из ещё не показанных и подходящих (раньше шли
-  по порядку списка, и до `!`, `/stat` и `/subagents` дело почти не доходило). Ритм
-  «каждый третий ход» считается по завершённым ходам (`App.turnsDone`), а не по
-  user-сообщениям: автоскиллы, дизайны `/uilib`, steer-строки и `/brain` сбивали
-  счёт, а `/compact` его обнулял. «Субагенты уже использовались» — это вызов
-  инструмента `task`, а не слово `subagent` в выводе любого инструмента.
-  Выключатель — `/tips off`, вернуть — `/tips on`, забыть показанное — `/tips reset`.
-- **`!команда` выполняет команду в оболочке, не отправляя её модели.** Строка идёт
-  через тот же инструмент `shell`, что и у агента: подтверждения, таймауты, живой
-  хвост и Esc работают как в ходе, вывод печатается обычным блоком `Ran <cmd>`.
-  Команда и её вывод добавляются в историю скрытым user-сообщением, поэтому
-  следующий ход уже знает, что вы выяснили, а повторный показ сессии их не дублирует.
-  Подсказка в строке статуса называет `!`, а при наборе строки с `!` она меняется на
-  «выполнит в оболочке · модели это не уйдёт». Прежний смысл `!` («отправить мои
-  слова без переписывания промпта») убран — для этого есть `/prompt off`.
-- **Список команд работает и во время хода.** В баре под спиннером `/` открывает тот
-  же список, что и в простое: фильтр по вводу, `↑↓` по строкам, Enter подставляет
-  команду в строку; список держит высоту, пока сужается (`suggestionLines` общая для
-  композера и бара). Строка, начинающаяся с `/`, при этом **не** уходит в текущий ход,
-  а ставится в очередь — иначе модель прочитала бы `/model k3` как текст. Подсказка
-  спиннера в этот момент говорит `enter to pick`, а на команде — `enter to queue the
+  `/compact` or `!` for shell commands. Never more than once per turn, never on
+  the first two turns and never during a goal, none repeats between runs
+  (`config.tipsSeen`), and a hint about something already used in the session is skipped.
+  Which one — is picked at random from those not yet shown and applicable (they used to go
+  in list order, and `!`, `/stat` and `/subagents` were almost never reached). The rhythm
+  "every third turn" is counted by completed turns (`App.turnsDone`), not by
+  user messages: auto-skills, `/uilib` designs, steer lines and `/brain` threw the
+  count off, and `/compact` zeroed it. "Subagents were already used" means a call of the
+  `task` tool, not the word `subagent` in the output of any tool.
+  The switch — `/tips off`, bring it back — `/tips on`, forget what was shown — `/tips reset`.
+- **`!command` runs a shell command without sending it to the model.** The line goes
+  through the same `shell` tool as the agent's: confirmations, timeouts, the live
+  tail and Esc work as in a turn, the output is printed as the usual `Ran <cmd>` block.
+  The command and its output are added to the history as a hidden user message, so
+  the next turn already knows what you found out, and replaying the session does not duplicate them.
+  The hint in the status line names `!`, and while typing a line with `!` it changes to
+  "will run in the shell · the model will not see it". The former meaning of `!` ("send my
+  words without rewriting the prompt") is gone — `/prompt off` is there for that.
+- **The command list works during a turn too.** In the bar under the spinner `/` opens the same
+  list as when idle: filtering by input, `↑↓` over the rows, Enter inserts
+  the command into the line; the list keeps its height while narrowing (`suggestionLines` is shared by
+  the composer and the bar). A line starting with `/` is therefore **not** sent into the current turn
+  but queued — otherwise the model would read `/model k3` as text. The spinner's hint
+  at that moment says `enter to pick`, and on a command — `enter to queue the
   command`.
 
 ### Security
 
-- **MCP-серверы из `.trcode/mcp.json` проекта больше не запускаются без спроса.**
-  Раньше любой клонированный репозиторий с этим файлом исполнял указанную там команду в
-  момент запуска `trc` в папке (а его инструменты могли ещё и объявить себе
-  `approval: "auto"`). Теперь такие серверы ждут `/mcp trust`. Одобрение действует на
-  эту папку и на ровно эту конфигурацию: любое изменение команды, аргументов или
-  окружения требует одобрить заново (`config.mcpTrusted`, отпечаток `id + config`).
-  При старте выводится предупреждение со списком, а `/mcp` показывает, что именно
-  будет запущено. Серверы из глобального конфига пользователя запускаются как раньше.
+- **MCP servers from the project's `.trcode/mcp.json` no longer start unasked.**
+  Any cloned repository with this file used to execute the command listed there at the
+  moment `trc` was launched in the folder (and its tools could even declare themselves
+  `approval: "auto"`). Now such servers wait for `/mcp trust`. An approval applies to
+  this folder and to exactly this configuration: any change of the command, arguments or
+  environment requires approving again (`config.mcpTrusted`, fingerprint `id + config`).
+  On start a warning with the list is printed, and `/mcp` shows what exactly
+  will be started. Servers from the user's global config start as before.
 
 ### Fixed
 
-- **Автообновление: `/update --check` только проверяет релиз.** Аргумент больше не
-  теряется в обработчике команды и не запускает установку.
-- **Автообновление проверяет диапазоны версий зависимостей.** Недостающие или
-  несовместимые зависимости готовятся в отдельной копии `node_modules`; любая
-  ошибка npm останавливает установку, даже если npm оставил `package.json`.
-  Новая сборка и зависимости заменяются переименованиями на одном диске.
-  При ошибке восстанавливаются оба каталога; если блокировка мешает и откату,
-  резервные копии сохраняются, а ошибка указывает их расположение.
-- **Многострочный ввод и история больше не накапливают пустые строки.** При
-  уменьшении поля ввода освобождённые строки возвращаются сразу, а статус
-  остаётся внизу экрана.
-- **Рассуждение закрывается перед ответом.** Начальные пустые строки ответа
-  пропускаются; перед текстом выводится разделитель `Ответ` (`Response` в
-  английском интерфейсе) с одной пустой строкой под ним.
-- **MCP: сессия Streamable HTTP, которую сервер забыл, теперь действительно
-  восстанавливается.** На 404 клиент переинициализировался, но слал `initialize` со
-  старым `Mcp-Session-Id`, и серверы на официальном SDK отвечали отказом. Теперь
-  идентификатор сбрасывается, как требует спецификация.
-- **MCP stdio: кириллица и эмодзи на границе чанков больше не превращаются в `�`.**
-  stdout сервера декодировался по кускам; теперь потоком (`setEncoding`). Строки
-  stderr тоже собираются целиком.
-- **MCP на Windows: аргументы с `&`, `|`, `<`, `>`, `^`, `()` берутся в кавычки.**
-  `npx mcp-remote https://host/sse?a=1&b=2` выполнял `b=2` как вторую команду cmd.
-- **MCP: на серверный `ping` приходит пустой результат, а на `roots/list` — папка
-  проекта.** Раньше на оба отвечалось «method not found», хотя клиент объявляет
+- **Self-update: `/update --check` only checks the release.** The argument is no longer
+  lost in the command handler and does not start an installation.
+- **Self-update verifies dependency version ranges.** Missing or
+  incompatible dependencies are prepared in a separate copy of `node_modules`; any
+  npm error stops the installation, even if npm left `package.json` in place.
+  The new build and the dependencies are swapped by renames on one disk.
+  On error both directories are restored; if a lock prevents the rollback too,
+  the backups are kept, and the error points at their location.
+- **Multiline input and history no longer accumulate empty lines.** When
+  the input field shrinks, the freed lines are returned at once, and the status
+  stays at the bottom of the screen.
+- **Reasoning closes before the answer.** Leading empty lines of the answer
+  are skipped; before the text a divider `Answer` (`Response` in
+  the English UI) is printed with one empty line under it.
+- **MCP: a Streamable HTTP session the server forgot is now really restored.** On a 404 the client
+  re-initialised but sent `initialize` with
+  the old `Mcp-Session-Id`, and servers on the official SDK answered with a refusal. Now the
+  identifier is reset, as the spec requires.
+- **MCP stdio: Cyrillic and emoji on a chunk boundary no longer turn into `�`.**
+  The server's stdout was decoded in pieces; now as a stream (`setEncoding`). stderr
+  lines are collected whole too.
+- **MCP on Windows: arguments with `&`, `|`, `<`, `>`, `^`, `()` are quoted.**
+  `npx mcp-remote https://host/sse?a=1&b=2` was executing `b=2` as a second cmd command.
+- **MCP: a server `ping` gets an empty result, and `roots/list` — the project
+  folder.** Both used to be answered "method not found", although the client declares
   `roots`.
-- **MCP: `structuredContent` больше не дублируется**, если сервер уже положил тот же
-  JSON в текстовый блок (как советует спецификация).
-- **MCP HTTP: ответ больше 8 МиБ сразу даёт понятную ошибку**, а не висит до
-  таймаута.
-- **`/sessions` и другие окна выбора больше не мигают при движении стрелками.** Окно
-  стиралось и печаталось построчно; теперь кадр перерисовывается одной
-  синхронизированной записью поверх старого. Перерисовки окна к тому же больше не
-  попадают в журнал строк транскрипта и в счётчик прокрутки.
-- **OAuth-вход через браузер не обрывается от лишнего запроса** на адрес callback
-  без кода (повтор, prefetch).
-- **Обновление OAuth-токена при нескольких сессиях `trc`.** Если другой процесс
-  успел обновить токен первым, а хост отверг наш refresh-токен как использованный,
-  берутся свежие данные с диска вместо требования войти заново (у ChatGPT это уже
-  делала его блокировка профиля).
-- **Список команд: курсор, ширина, Esc.** (1) После отрисовки панели над композером
-  курсор оставался в колонке 1, левее `›`: каждая строка оверлея кончается переводом
-  строки, а колонку каретки никто не возвращал. Теперь `paintOverlay` ставит её на место.
-  (2) Ширина панели считалась по самой длинной строке, поэтому при фильтрации
-  панель прыгала. Теперь она занимает ровно колонки полосы ввода: от левого края
-  (без отступа поля) до правого. Во время хода под панелью была своя пустая строка
-  плюс пустая строка над полосой — теперь одна, как в простое.
-  (3) Во время хода Esc при открытом списке прерывал весь ход, а панель оставалась на
-  месте бара. Теперь Esc закрывает только список, как в простое; следующий Esc и
-  Ctrl+C прерывают ход, как раньше. Подсказка бара при открытом списке:
-  «esc to close the list».
-- **Список команд во время хода больше не оставляет дыру.** Бар рос на высоту
-  списка (транскрипт уезжал вверх), а после закрытия сжимался, оставляя ~10 пустых
-  строк над собой: рассуждение и спиннер проваливались вниз, бар выглядел как пустой
-  композер, и казалось, что ход прервался. Теперь строки списка «заимствуются»
-  (`setFooter(..., cover)` в `render.ts`): список рисуется поверх транскрипта над
-  баром и при закрытии возвращает перекрытые строки из журнала строк, включая
-  напечатанное за это время.
-- **Первый ответ сессии больше не отделён от поля ввода тремя пустыми строками.**
-  После первого сообщения заставка снимается (`dismissWelcome`) и поле ввода
-  открепляется. Когда ход кончался, `readInput()` перемерял экран как при старте и
-  забывал строки, которые держал бар, поэтому композер опускался вниз на разницу
-  высот бара и композера (обычно 2 строки). Теперь долг бара сохраняется, и
-  композер забирает его строки, как после любого следующего хода. Тест:
-  `firstturn-test.mjs` (настоящий `App` против mock-сервера).
-- **Журнал строк больше не держит зазор композера в хвосте.** Пустые строки, на
-  которые композер опускался вниз (`noteBlankRows`), оставались «в конце» журнала
-  навсегда, и весь последующий текст записывался перед ними, хотя на экране он
-  ложится под ними. Всё, что восстанавливалось из журнала (список команд в простое и
-  в ходе), рисовало пустоту поверх последних строк ответа. Теперь зазор
-  «запечатывается», когда композер стирает свой кадр (`sealBlankRows`).
-- **Метка спиннера (`thinking`, `continuing`, …) выделена цветом модели** из строки
-  статуса (`brightCyan`), а не серым.
-- **Пассивная проверка обновлений запускается ровно один раз и слушает
-  выключатели.** `TRCODE_NO_UPDATE_CHECK` и `TRCODE_UPDATE_API` проверял только CLI,
-  а старт сессии (App.init) держал свою копию условия — при выключенной проверке
-  запрос всё равно уходил, а на чистой установке один и тот же GET уходил дважды
-  (CLI + init). Теперь в `src/update.ts` один `passiveCheckEnabled(cfg)`, и вызывает
-  его только `App.init()`.
-- **Автообновление больше не может поставить сборку, которой не хватает
-  зависимости.** Архив релиза несёт `dist` и `package.json`, но не `node_modules` —
-  их ставит пакетный менеджер. Релиз, добавивший зависимость (так появился `sharp`),
-  раньше подменял `dist` и оставлял `trc`, падающий на импорте при старте. Теперь
-  `applyUpdate` сверяет `dependencies` из архива с установленными версиями
-  (обход родителей, как у Node), и недостающие или несовместимые готовит сам —
-  `npm install --no-save <dep>@<range>` в отдельном каталоге, через `npm-cli.js`
-  рядом с node, без shell; `trc update` и `/update` показывают этот шаг. Если npm не смог,
-  подмена не делается, а ошибка называет причину и точную команду
-  (`npm install "sharp@^0.35.5"` в папке установки). Проверено на живом релизе:
-  0.1.7 → 0.1.9 раньше давало `ERR_MODULE_NOT_FOUND: sharp` при каждом запуске,
-  теперь `sharp` доставляется за ~8 с и `trc` стартует.
-- **`sharp` грузится при первом использовании, а не при старте** (`src/tools/sharp.ts`).
-  Клиенты до 0.1.9 обновляются старым кодом без проверки выше; следующий релиз,
-  поставленный ими, всё равно запустится, а без `sharp` откажут только инструменты
-  картинок — с подсказкой выполнить `/update`. `update-test.mjs` проверяет, что ни
-  один модуль в `dist` не импортирует `sharp` статически.
+- **MCP: `structuredContent` is no longer duplicated** if the server already put the same
+  JSON into a text block (as the spec advises).
+- **MCP HTTP: a response over 8 MiB gives a clear error at once**, instead of hanging until
+  the timeout.
+- **`/sessions` and other chooser windows no longer flicker when the arrows move.** The window
+  was erased and printed line by line; now the frame is repainted in one
+  synchronised write over the old one. Window repaints also no longer
+  get into the transcript's line journal and into the scroll counter.
+- **A browser OAuth login is not broken by a stray request** to the callback address
+  without a code (a repeat, a prefetch).
+- **OAuth token refresh when several `trc` sessions run.** If another process
+  refreshed the token first and the host rejected our refresh token as used,
+  fresh data is taken from disk instead of demanding a login again (with ChatGPT its profile lock
+  already did this).
+- **The command list: cursor, width, Esc.** (1) After drawing the panel above the composer
+  the cursor stayed in column 1, to the left of `›`: every overlay line ends with a newline,
+  and nobody returned the caret column. Now `paintOverlay` puts it back.
+  (2) The panel width was computed from the longest line, so while filtering
+  the panel jumped. Now it occupies exactly the columns of the input band: from the left edge
+  (without the field's indent) to the right one. During a turn there was its own empty line under the panel
+  plus an empty line above the band — now one, as when idle.
+  (3) During a turn, Esc with the list open interrupted the whole turn while the panel stayed
+  where the bar was. Now Esc closes only the list, as when idle; the next Esc and
+  Ctrl+C interrupt the turn, as before. The bar's hint with the list open:
+  "esc to close the list".
+- **The command list during a turn no longer leaves a hole.** The bar grew by the height of the
+  list (the transcript moved up), and after closing it shrank, leaving ~10 empty
+  lines above itself: reasoning and the spinner fell down, the bar looked like an empty
+  composer, and the turn seemed to have been interrupted. Now the list's lines are "borrowed"
+  (`setFooter(..., cover)` in `render.ts`): the list is drawn over the transcript above the
+  bar and, on closing, returns the covered lines from the line journal, including
+  what was printed in the meantime.
+- **The session's first answer is no longer separated from the input field by three empty lines.**
+  After the first message the splash is dismissed (`dismissWelcome`) and the input field
+  unpins. When the turn ended, `readInput()` re-measured the screen as at start and
+  forgot the lines the bar had held, so the composer went down by the difference in
+  height between the bar and the composer (usually 2 lines). Now the bar's debt is kept, and the
+  composer takes its lines, as after any following turn. Test:
+  `firstturn-test.mjs` (a real `App` against a mock server).
+- **The line journal no longer keeps the composer's gap in its tail.** The empty lines
+  the composer went down onto (`noteBlankRows`) stayed "at the end" of the journal
+  forever, and all subsequent text was written before them, although on screen it
+  lies under them. Everything restored from the journal (the command list when idle and
+  during a turn) drew emptiness over the last lines of the answer. Now the gap
+  is "sealed" when the composer erases its frame (`sealBlankRows`).
+- **The spinner label (`thinking`, `continuing`, …) is highlighted in the model's colour** from the status
+  line (`brightCyan`) rather than in gray.
+- **The passive update check runs exactly once and honours the
+  switches.** `TRCODE_NO_UPDATE_CHECK` and `TRCODE_UPDATE_API` were checked only by the CLI,
+  while session start (App.init) kept its own copy of the condition — with the check off the
+  request still went out, and on a clean install the same GET went twice
+  (CLI + init). Now `src/update.ts` has a single `passiveCheckEnabled(cfg)`, and only
+  `App.init()` calls it.
+- **Self-update can no longer install a build that lacks a dependency.**
+  A release archive carries `dist` and `package.json`, but not `node_modules` —
+  the package manager installs those. A release that added a dependency (that is how `sharp` appeared)
+  used to replace `dist` and leave `trc` failing on an import at start. Now
+  `applyUpdate` compares the archive's `dependencies` with the installed versions
+  (walking the parents, as Node does), and prepares the missing or incompatible ones itself —
+  `npm install --no-save <dep>@<range>` in a separate directory, through `npm-cli.js`
+  next to node, without a shell; `trc update` and `/update` show this step. If npm could not do it,
+  the swap is not made, and the error names the reason and the exact command
+  (`npm install "sharp@^0.35.5"` in the install folder). Verified on a live release:
+  0.1.7 → 0.1.9 used to give `ERR_MODULE_NOT_FOUND: sharp` on every start,
+  now `sharp` is delivered in ~8 s and `trc` starts.
+- **`sharp` is loaded on first use, not at start** (`src/tools/sharp.ts`).
+  Clients before 0.1.9 update with the old code without the check above; the next release
+  installed by them will start anyway, and without `sharp` only the image tools will refuse —
+  with a hint to run `/update`. `update-test.mjs` checks that no
+  module in `dist` imports `sharp` statically.
 
 ### Changed
 
-- **Перенос строк в поле ввода — по словам, а не по клеткам.** Длинное сообщение
-  раньше резалось ровно на ширине полосы, и слово уезжало на следующую строку
-  половиной («в cод» / «ex»). Теперь разрыв ставится после последнего пробела,
-  который помещается; принудительно режется только то, у чего пробела нет вовсе —
-  путь, base64, минифицированный JSON. Полоса ввода во время хода переносится так же.
-- **Строки статуса под полем ввода идут до края полосы.** Раньше они укладывались
-  в ширину текста чата, и правый край бара висел в восьми клетках от края терминала;
-  теперь подсказка и `context:` прижаты к тому же краю, что и набранный текст, и бар
-  читается как часть полосы, а не как отдельный абзац.
-- **Enter во время хода направляет текущий ход, а не ждёт его конца.** Сообщение,
-  набранное в нижней строке, пока модель работает, попадает в историю на ближайшей
-  границе шага — после результатов инструментов и перед следующим запросом, — так что
-  модель читает его и меняет курс, не теряя уже сделанного. Пока ход его не забрал,
-  строка видна в баре как `⎿ steering:`. **Tab** отправляет сообщение отдельным ходом
-  после текущего, как раньше; в панелях (`/brain`, `/orchestrate`, `/swarm`) и долгих
-  командах шаговой границы нет, поэтому там Enter по-прежнему ставит в очередь.
-  Прерванный ход (Esc) возвращает в редактор и steered-, и queued-строки.
+- **Line wrapping in the input field goes by words, not by cells.** A long message
+  used to be cut exactly at the band width, and a word went to the next line
+  in half ("in comp" / "letion"). Now the break is placed after the last space
+  that fits; only what has no space at all is cut forcibly —
+  a path, base64, minified JSON. The input band during a turn wraps the same way.
+- **The status lines under the input field go to the edge of the band.** They used to be laid out
+  in the width of the chat text, and the bar's right edge hung eight cells from the terminal edge;
+  now the hint and `context:` are flush to the same edge as the typed text, and the bar
+  reads as part of the band rather than as a separate paragraph.
+- **Enter during a turn steers the current turn instead of waiting for its end.** A message
+  typed in the bottom line while the model works gets into the history at the nearest
+  step boundary — after the tool results and before the next request — so the
+  model reads it and changes course without losing what it has already done. Until the turn takes it,
+  the line is visible in the bar as `⎿ steering:`. **Tab** sends the message as a separate turn
+  after the current one, as before; in panels (`/brain`, `/orchestrate`, `/swarm`) and long
+  commands there is no step boundary, so there Enter still queues.
+  An interrupted turn (Esc) returns both steered and queued lines to the editor.
 
 ## [0.1.9] — 2026-10-21
 
 ### Added
 
-- **MCP: клиент стал полноценным.** Рядом со stdio появился Streamable HTTP
-  (`url`, `headers`, `bearerToken`/`bearerTokenEnvVar`; legacy SSE намеренно не
-  поддерживается). Ресурсы сервера видны модели тремя инструментами —
-  `list_mcp_resources`, `read_mcp_resource`, `list_mcp_resource_templates`. Добавлен
-  протокол 2026-07-28: режимы `legacy` (по умолчанию), `auto` (пробует
-  `server/discover` и откатывается на `initialize`) и `2026-07-28` (каждый запрос
-  несёт версию и клиентские capabilities в `_meta`). Для жирных серверов —
-  `mcpToolSearch: true`: в запросе живёт один `find_mcp_tools`, а схемы найденных
-  инструментов подключаются на следующем шаге того же хода. `/mcp` научился
-  `restart <id>`, `stop` и `logs <id>`.
-- **MCP: ресурсы и вложения вместо заглушек.** Блоки `image` из результатов теперь
-  уходят модели как вложения, `structuredContent` — JSON-блоком, `resource_link` и
-  встроенные ресурсы — текстом.
-- **Google Gemini: ключ и (с предупреждением) вход по аккаунту.** `/login gemini`
-  (или `/login google`) предлагает два пути. Ключ из AI Studio идёт через официальный
-  OpenAI-совместимый шим `generativelanguage.googleapis.com/v1beta/openai`, каталог
-  берётся у хоста. Аккаунт — это OAuth-клиент Gemini CLI против Code Assist
-  (`cloudcode-pa.googleapis.com/v1internal`, формат `{model, project, request}`),
-  проект определяется сам через `loadCodeAssist`/`onboardUser`; сессия
-  `~/.gemini/oauth_creds.json` переиспользуется. Перед браузером печатается
-  предупреждение: Google считает такой вход нарушением ToS и банит аккаунты с февраля
-  2026 — ключ остаётся поддерживаемым путём.
-- **Muse Wonder и Muse Spark 1.3 в Meta.** В опубликованный ростер добавлены
-  `muse-wonder-1.0`, `muse-spark-1.3` и `muse-spark-1.3-contributor` (1M окна,
-  Responses). `muse login` оставляет сессию в `~/.config/muse/auth.json` — `/login meta`
-  переиспользует её (или лежащий там ключ) с предупреждением: подписка Muse Code
-  рассчитана только на CLI Meta, и такое использование может её лишить.
-- **OpenAI: ключ на платформе и подписка ChatGPT** — `/login openai`
-  предлагает «Подписка / Ключ API». Подписка — браузерный OAuth (PKCE) под
-  официальным клиентом ChatGPT; запросы идут на бэкенд ChatGPT с его служебными
-  заголовками (`originator`, `OpenAI-Beta`, `ChatGPT-Account-Id`), аккаунт читается из
-  `id_token`. Ключ — обычный `api.openai.com/v1`. Сессия стороннего CLI намеренно не
-  переиспользуется: тот сервер ротирует refresh-токен, и обновление отсюда разлогинило бы
-  его владельца. Только Responses и только стрим — так
-  требует бэкенд; нестримовые вызовы (компакт, заголовки) собираются из стрима.
-- **Вход в OpenCode Zen и OpenCode Go через аккаунт** — `/login opencode-go` и
-  `/login opencode` предлагают «Подписка / Ключ API»; подписка — device flow OpenCode
-  Console (тот же, что у самого opencode), без копирования ключа. Токен обновляется
-  сам; `trc auth login --provider opencode-go --oauth` пропускает выбор.
+- **MCP: the client is now complete.** Next to stdio there is Streamable HTTP
+  (`url`, `headers`, `bearerToken`/`bearerTokenEnvVar`; legacy SSE is deliberately
+  not supported). The server's resources are visible to the model through three tools —
+  `list_mcp_resources`, `read_mcp_resource`, `list_mcp_resource_templates`. The
+  2026-07-28 protocol is added: the modes `legacy` (default), `auto` (tries
+  `server/discover` and falls back to `initialize`) and `2026-07-28` (every request
+  carries the version and the client capabilities in `_meta`). For fat servers —
+  `mcpToolSearch: true`: a single `find_mcp_tools` lives in the request, and the schemas of the tools it finds
+  are attached on the next step of the same turn. `/mcp` learned
+  `restart <id>`, `stop` and `logs <id>`.
+- **MCP: resources and attachments instead of placeholders.** `image` blocks from results now
+  go to the model as attachments, `structuredContent` — as a JSON block, `resource_link` and
+  embedded resources — as text.
+- **Google Gemini: a key and (with a warning) an account login.** `/login gemini`
+  (or `/login google`) offers two paths. A key from AI Studio goes through the official
+  OpenAI-compatible shim `generativelanguage.googleapis.com/v1beta/openai`, the catalog
+  comes from the host. An account is the OAuth client of Gemini CLI against Code Assist
+  (`cloudcode-pa.googleapis.com/v1internal`, the `{model, project, request}` format),
+  the project is discovered by itself through `loadCodeAssist`/`onboardUser`; the
+  `~/.gemini/oauth_creds.json` session is reused. Before the browser a
+  warning is printed: Google considers such a login a ToS violation and has been banning accounts since February
+  2026 — the key remains the supported path.
+- **Muse Wonder and Muse Spark 1.3 in Meta.** `muse-wonder-1.0`, `muse-spark-1.3` and
+  `muse-spark-1.3-contributor` (1M windows, Responses) are added to the published roster.
+  `muse login` leaves the session in `~/.config/muse/auth.json` — `/login meta`
+  reuses it (or the key lying there) with a warning: the Muse Code subscription
+  is intended for the Meta CLI only, and such use may cost you it.
+- **OpenAI: a platform key and a ChatGPT subscription** — `/login openai`
+  offers "Subscription / API key". The subscription is a browser OAuth (PKCE) under
+  the official ChatGPT client; requests go to the ChatGPT backend with its service
+  headers (`originator`, `OpenAI-Beta`, `ChatGPT-Account-Id`), the account is read from
+  `id_token`. The key is the ordinary `api.openai.com/v1`. The session of a third-party CLI is deliberately
+  not reused: that server rotates the refresh token, and a refresh from here would log
+  its owner out. Responses only and streaming only — that is what
+  the backend requires; non-streaming calls (compaction, titles) are assembled from the stream.
+- **Logging into OpenCode Zen and OpenCode Go through an account** — `/login opencode-go` and
+  `/login opencode` offer "Subscription / API key"; the subscription is the OpenCode
+  Console device flow (the same one opencode itself uses), without copying a key. The token refreshes
+  by itself; `trc auth login --provider opencode-go --oauth` skips the choice.
 
 ### Changed
 
-- **Автосжатие стало лестницей.** Раньше компакция включалась только на 90% окна и сразу
-  теряла всё, кроме сводки и слов пользователя. Теперь по мере заполнения включаются три
-  ступени: на 25% (`autoCompactLightAt`) — лёгкая чистка без вызова модели (старые
-  результаты инструментов сжимаются до заголовка, старые размышления снимаются, последние
-  ходы не трогаются); на 50% (`autoCompactMediumAt`) — конспект старой истории с
-  сохранением рабочего хвоста (~12 сообщений) дословно; на 90% (`autoCompactAt`) — полная
-  сводка как раньше. Ступени квотируются на цикл: **3 лёгких и 2 средних**, дальше
-  лестница ждёт следующего порога вместо повтора ступени, иначе история, застрявшая чуть
-  выше 25%, чистилась бы каждый ход и до 50% не дошла. Тройка — из `1/(1−φ)`, где φ — доля
-  роста, приходящаяся на вывод инструментов: у кодовых ходов φ ≈ 2/3. Счётчики переживают
-  перезапуск (лежат в session-файле), полная сводка открывает новый цикл. Выключить всё
-  можно через `/compact auto off`, строку **Контекст** в `/settings` или `autoCompact: false`
-  в config.json; `/compact` руками работает в любом случае.
-- **MCP: схемы едут по бюджету, каталог остаётся живым.** `toolInputSchemaMaxBytes`
-  (по умолчанию 5000) сжимает схему в три прохода: описания → `$defs` → глубокие
-  объекты. `tools/list` читается по `nextCursor`, `notifications/tools/list_changed`
-  перечитывает каталог (при ошибке остаётся прежний). Появились `enabledTools` /
-  `disabledTools`, `approval` / `toolApprovals` (read-only тул с `auto` идёт как
+- **Auto-compaction became a ladder.** Compaction used to kick in only at 90% of the window and immediately
+  lose everything except the summary and the user's words. Now, as the window fills, three
+  steps turn on: at 25% (`autoCompactLightAt`) — a light cleanup without a model call (old
+  tool results are squeezed to their header, old reasoning is stripped, the last
+  turns are not touched); at 50% (`autoCompactMediumAt`) — a condensed outline of the old history keeping the working
+  tail (~12 messages) verbatim; at 90% (`autoCompactAt`) — the full
+  summary as before. The steps are quota'd per cycle: **3 light and 2 medium**, after which
+  the ladder waits for the next threshold instead of repeating a step, otherwise a history stuck slightly
+  above 25% would be cleaned every turn and never reach 50%. The three comes from `1/(1−φ)`, where φ is the share of
+  growth that falls on tool output: for code turns φ ≈ 2/3. The counters survive a
+  restart (they live in the session file), a full summary opens a new cycle. Everything can be
+  turned off through `/compact auto off`, the **Context** line in `/settings` or `autoCompact: false`
+  in config.json; a manual `/compact` works in any case.
+- **MCP: schemas travel by budget, the catalog stays live.** `toolInputSchemaMaxBytes`
+  (5000 by default) squeezes a schema in three passes: descriptions → `$defs` → deep
+  objects. `tools/list` is read by `nextCursor`, `notifications/tools/list_changed`
+  re-reads the catalog (on error the previous one stays). `enabledTools` /
+  `disabledTools`, `approval` / `toolApprovals` (a read-only tool with `auto` goes as
   `read`), `outputLimit`, `startupTimeoutSec` / `toolTimeoutSec`, `enabled` /
-  `required`.
-- **Компакция переделана: handoff-summary вместо дайджеста.** Вместо дайджеста всей
-  истории новая история — это handoff-summary плюс последние сообщения **пользователя**
-  дословно (до 20k токенов; слишком большое обрезается с пометкой), а assistant-тёры и
-  tool-трафик выпадают. Промпт — «CONTEXT CHECKPOINT COMPACTION», без
-  инструментов, транскрипт вписывается в окно суммаризатора. Компакция проверяется и
-  **между tool-раундами** внутри хода (не больше двух раз за ход); история при этом
-  меняется на месте, чтобы агентский цикл продолжал отправлять живую. `/compact`
-  использует те же правила.
-- **Временный 503 больше не сдаётся через три быстрые попытки.** Транзиентные
-  ответы хоста (503 «Endpoint is unavailable», 502/504/500) повторяются до
-  `upstreamRetries` раз (по умолчанию 10) с паузой `upstreamRetryDelayMs` (10 с), и
-  каждая пауза пишется в транскрипт с номером попытки — терминал сам досылает тот же
-  запрос вместо того, чтобы отдавать ошибку человеку. Esc прерывает ожидание.
+  `required` appeared.
+- **Compaction reworked: a handoff summary instead of a digest.** Instead of a digest of the whole
+  history, the new history is a handoff summary plus the last **user** messages
+  verbatim (up to 20k tokens; a too large one is trimmed with a note), while assistant turns and
+  tool traffic drop out. The prompt is "CONTEXT CHECKPOINT COMPACTION", without
+  tools, and the transcript fits into the summarizer's window. Compaction is also checked
+  **between tool rounds** inside a turn (no more than twice per turn); the history is
+  changed in place so that the agent loop keeps sending the live one. `/compact`
+  uses the same rules.
+- **A transient 503 no longer gives up after three quick attempts.** The host's transient
+  answers (503 "Endpoint is unavailable", 502/504/500) are retried up to
+  `upstreamRetries` times (10 by default) with a `upstreamRetryDelayMs` pause (10 s), and
+  every pause is written into the transcript with the attempt number — the terminal resends the same
+  request itself instead of handing the error to the human. Esc interrupts the wait.
 
 ### Fixed
 
-- **MCP: зомби-процессы, потерянные картинки, мёртвый каталог.** `stop()` убивал
-  только лаунчер (`npx.cmd` оставлял живой node), теперь дерево снимается через
-  `killTree`, а stderr дренируется после выхода. Блоки `image` больше не заменяются
-  на «[image content omitted]». 404 на установленной HTTP-сессии переинициализирует
-  её и повторяет вызов, Esc отправляет `notifications/cancelled`, рукопожатие и
-  каталог ретраятся трижды (250 мс, 1 с), а упавший сервер перезапускается с
-  backoff 1 с → 30 с.
-- **Пиксели инструмента больше не теряются на gRPC-шлюзе.** Отказ «tool message
-  content part 1 is not text; only text parts are supported on the gRPC path»
-  относится только к tool-сообщениям, а вставленный пользователем скриншот такой хост
-  принимает. Раньше первый откат выкидывал пиксели из результатов инструментов — ход
-  выживал, но модель не видела того скриншота, ради которого вызвала `read_image`
-  («не распознаёт скрин»). Теперь изображения инструмента переезжают в user-сообщение
-  сразу после результата, с подписью «Output of read_image»; снятие пикселей со всей
-  истории осталось вторым рубежом — на случай хоста, который не берёт картинки вовсе.
-- **Esc прерывает и там, где нет хода.** Спиннер печатал «esc to interrupt» во всех
-  местах подряд, но клавиатуру читал только TurnBar: браузерный вход (`/login openai`,
-  `/login gemini`) висел минутами, а Esc не делал ничего. Появился `escWatch()` —
-  подписка на Esc/Ctrl+C для ожиданий вне хода; им обвязаны оба OAuth-флоу (отмена
-  через `AbortSignal` доходит до `pollForToken`/`webLogin`), поиск проекта Code Assist
-  и обновление каталога моделей. Сам Spinner показывает подсказку только там, где её
-  кто-то обслуживает.
-- **400 «The `reasoning_content` in the thinking mode must be passed back» на
-  сохранённой истории.** Если assistant-тёрн с tool_calls пришёл без thinking (сессия
-  из версии до этого поля, смена модели посреди хода, синтезированная пара после
-  правки истории), клиент получает 400 один раз, запоминает модель и досылает
-  `reasoning_content: ""`, который хост принимает — вместо того чтобы отдавать ошибку
-  человеку. Проверено живьём на `opencode-go:deepseek-v4.1-flash`: 400 → автоматический
-  ресенд → 200.
+- **MCP: zombie processes, lost images, a dead catalog.** `stop()` killed
+  only the launcher (`npx.cmd` left node alive), now the tree is taken down through
+  `killTree`, and stderr is drained after exit. `image` blocks are no longer replaced
+  with "[image content omitted]". A 404 on an established HTTP session re-initialises
+  it and repeats the call, Esc sends `notifications/cancelled`, the handshake and the
+  catalog are retried three times (250 ms, 1 s), and a crashed server is restarted with
+  a backoff of 1 s → 30 s.
+- **Tool pixels are no longer lost on the gRPC gateway.** The refusal "tool message
+  content part 1 is not text; only text parts are supported on the gRPC path"
+  applies only to tool messages, while a screenshot pasted by the user is accepted by such a host.
+  The first fallback used to throw the pixels out of the tool results — the turn
+  survived, but the model did not see the screenshot it had called `read_image` for
+  ("does not recognise the screen"). Now the tool's images move into a user message
+  right after the result, with the caption "Output of read_image"; stripping pixels from the whole
+  history remains the second line of defence — for a host that takes no images at all.
+- **Esc interrupts where there is no turn too.** The spinner printed "esc to interrupt" everywhere in a row,
+  but only TurnBar read the keyboard: a browser login (`/login openai`,
+  `/login gemini`) hung for minutes while Esc did nothing. `escWatch()` appeared —
+  a subscription to Esc/Ctrl+C for waits outside a turn; both OAuth flows are wired to it (cancellation
+  through an `AbortSignal` reaches `pollForToken`/`webLogin`), as are the Code Assist project lookup
+  and the model catalog refresh. The Spinner itself shows the hint only where someone
+  serves it.
+- **400 "The `reasoning_content` in the thinking mode must be passed back" on a
+  saved history.** If an assistant turn with tool_calls arrived without thinking (a session
+  from a version before this field, a model switch in the middle of a turn, a synthesised pair after
+  a history repair), the client gets a 400 once, remembers the model and resends
+  `reasoning_content: ""`, which the host accepts — instead of handing the error to
+  the human. Verified live on `opencode-go:deepseek-v4.1-flash`: 400 → automatic
+  resend → 200.
 
 ## [0.1.8] — 2026-10-16
 
 ### Added
 
-- **`ask_user_question`** — модель собирает 1–4 связанных решения в одной модалке: ↑↓ и
-  Enter, Space для множественного выбора, свой ответ, «Назад», экран проверки и
-  «Отправить». Esc отменяет ход без частичных ответов; вопросы параллельных агентов и
-  запросы разрешений встают в очередь. В headless инструмент сообщает, что спросить
-  нельзя.
-- **`/orchestrate resume | status | replan`** — задача, план, результаты шагов и история
-  каждого исполнителя сохраняются по ходу работы. Прерванную или упавшую работу можно
-  продолжить, в том числе после `/resume`; `replan` пересматривает только незавершённые
-  шаги.
-- **`/subagents auto on|off`** — при выключенном auto запуск помощников спрашивает
-  «Да / Нет / Включить авто». Явная просьба «запусти субагентов» разрешает один ход,
-  явный запрет блокирует даже при auto. Если модели помощников не выбраны, после
-  одобрения открывается выбор модели.
-- **`resume_media`** — продолжает ожидание и загрузку существующего видео, восстанавливает
-  удержанные картинки и звук без повторной оплаты. Платные генерации учитываются в
-  стоимости сессии.
-- `read_image` декодирует картинку через Sharp: уменьшенный превью до 1,6 МБ, `crop`,
-  метаданные без пикселей; результат генерации сверяется с запрошенными размером,
-  пропорциями, форматом и прозрачностью.
+- **`ask_user_question`** — the model collects 1–4 related decisions in one modal: ↑↓ and
+  Enter, Space for multiple choice, a custom answer, "Back", a review screen and
+  "Submit". Esc cancels the turn without partial answers; questions from parallel agents and
+  permission requests are queued. In headless the tool reports that it cannot
+  ask.
+- **`/orchestrate resume | status | replan`** — the task, the plan, the step results and the history
+  of every executor are saved as the work goes. An interrupted or failed job can be
+  continued, including after `/resume`; `replan` reconsiders only unfinished
+  steps.
+- **`/subagents auto on|off`** — with auto off, starting helpers asks
+  "Yes / No / Enable auto". An explicit "start subagents" allows one turn,
+  an explicit refusal blocks even with auto. If helper models are not chosen, the model
+  chooser opens after the approval.
+- **`resume_media`** — continues waiting for and downloading an existing video, restores
+  held images and audio without paying again. Paid generations are counted in the
+  session cost.
+- `read_image` decodes the picture through Sharp: a preview reduced to 1.6 MB, `crop`,
+  metadata without pixels; the generation result is checked against the requested size,
+  aspect ratio, format and transparency.
 
 ### Changed
 
-- **Медиа больше не мусорит.** Результат сохраняется в каталог запуска
-  (`image-<время>.png`, `video-….mp4`, `audio-….wav`), временные файлы — в `.tmp/`.
-  Папка разовой генерации удаляется сразу после сохранения, рабочая область
-  `prepare_media_workspace` — при выходе. Остаётся только папка с оплаченным, но не
-  сохранённым результатом или незаконченным видео — до `resume_media`.
-- Платные генерации разрешаются отдельно (`permissions.paidMedia`), разрешение сети их
-  не покрывает. MCP-инструменты без пометки read-only требуют разрешения `write`.
-- `src/ui/commands.ts` (4600 строк) разнесён по `src/ui/commands/*`.
+- **Media no longer litters.** The result is saved to the launch directory
+  (`image-<time>.png`, `video-….mp4`, `audio-….wav`), temporary files — to `.tmp/`.
+  The one-off generation folder is deleted right after saving, the `prepare_media_workspace`
+  workspace — on exit. Only a folder with a paid but unsaved result or an unfinished
+  video remains — until `resume_media`.
+- Paid generations are permitted separately (`permissions.paidMedia`); a network permission does
+  not cover them. MCP tools without a read-only mark require the `write` permission.
+- `src/ui/commands.ts` (4600 lines) is split across `src/ui/commands/*`.
 
 ### Fixed
 
-- Исправлены все 25 воспроизведённых проблем аудита (`docs/audit/`): потеря файла при
-  `/rewind` после ошибки бэкапа, очередь инструментов после Esc, обход разрешений и
-  зависания в `run_code`, перезапись файла, изменённого во время подтверждения, выход за
-  cwd через junction, CRLF, обрыв SSE в звуке, PCM вместо MP3, HTML вместо MP4,
-  повторы polling, параметры xAI-видео, GIF-размеры, `~/` в путях и другие.
-- Сессии сохраняются атомарно с резервной копией; оркестрация не считает успехом шаг,
-  упёршийся в лимит или прерванный.
-- Полоса разделов в панелях (`/fav`, `/brain`, `/model`) переносится на следующие строки,
-  как и ряд кнопок: при десятке подключённых провайдеров хвост табов срезался рамкой и
-  раздел нельзя было выбрать. Тест — `test/picker-test.mjs`.
-- **Resume больше не читается кусками.** Восстановленная сессия прокручивается целиком:
-  промпты, ответы (без потолка в 24 строки) и каждый вызов инструмента с именем
-  цели и первыми строками вывода (`ctrl+o` — остальное). Раньше печатались только последние
-  четыре хода, вызовы шли строками `tool({"json"…})` без вывода, а всё старшее сворачивалось
-  в оглавление. Дайджест сжатия показывается первыми 20 строками с раскрытием. Тест —
+- All 25 reproduced audit problems are fixed (`docs/audit/`): a file lost by
+  `/rewind` after a backup error, the tool queue after Esc, permission bypass and
+  hangs in `run_code`, overwriting a file changed during confirmation, escaping
+  cwd through a junction, CRLF, an SSE break in audio, PCM instead of MP3, HTML instead of MP4,
+  polling repeats, xAI video parameters, GIF sizes, `~/` in paths and others.
+- Sessions are saved atomically with a backup; orchestration does not count a step that
+  hit a limit or was interrupted as a success.
+- The section strip in panels (`/fav`, `/brain`, `/model`) wraps onto the following lines,
+  like the button row: with a dozen connected providers the tail of the tabs was cut off by the frame and
+  a section could not be selected. Test — `test/picker-test.mjs`.
+- **Resume is no longer read in pieces.** A restored session is scrolled through in full:
+  prompts, answers (without a 24-line cap) and every tool call with the name of the
+  target and the first lines of output (`ctrl+o` — the rest). Only the last
+  four turns used to be printed, calls went as `tool({"json"…})` lines without output, and everything older was collapsed
+  into a table of contents. The compaction digest is shown with its first 20 lines and can be expanded. Test —
   `test/resume-test.mjs`.
 
 ## [0.1.7] — 2026-10-01
 
 ### Added
 
-- **Картинки, видео и звук прямо из чата.** Медиамодели не отвечают на
-  `/chat/completions`, поэтому они подключаются как инструменты: чат-модель сама пишет
-  промпт и вызывает `generate_image`, `generate_video` или `generate_audio`, а файл
-  сохраняется в папке проекта. Каждая генерация платная и спрашивает подтверждение, как
-  команда шелла; Esc прерывает ожидание.
-- **`/image`, `/audio`, `/video model` — выбор модели в той же панели, что `/model`**:
-  вкладки поставщиков, поиск, «Обновить», у картинок и звука ещё «Выключить». Там, где
-  `/model` показывает контекст и цену, здесь строка возможностей — пропорции, разрешения,
-  длительности, n, цена за секунду. Модель можно назвать и сразу: `/image seedream`,
-  `/audio off`, `/image status`. Пока модель картинок или звука не выбрана, инструмента
-  в чате нет и запросы не платят за его описание.
-- **Поставщики**: OpenRouter — картинки (`POST /images`, 55 моделей, параметры
-  сверяются с его каталогом), видео (`/videos`, 30 моделей) и звук (gpt-audio, Lyria);
-  TokenRouter — картинки, видео (задачи new-api `/video/generations`) и звук по типам
-  эндпоинтов из каталога; xAI по API-ключу — grok-imagine для картинок (с правкой по
-  исходнику) и видео; Z.AI — glm-image, cogview и cogvideox-3. Выбранная модель хранится
-  вместе с поставщиком (`tokenrouter:kling-v3`): от него зависит, какой API вызывается.
-- **`/video` — режим видео.** Каждое сообщение становится заказом ролика: модель
-  промптов (любая текстовая, `/video prompt_model`) смотрит вложенные картинки, пишет
-  описание кадра с раскадровкой по секундам и вызывает видеомодель; допустимые
-  длительности, разрешения и пропорции выбранной модели попадают в её системный промпт.
-  `/video off` возвращает прежнюю модель сессии. Режим живёт до выхода из программы —
-  после перезапуска он выключен, чтобы генерации не пошли сами.
-- **Звук**: речевая модель читает текст дословно выбранным голосом и с заданной подачей,
-  музыкальная получает бриф. Поток собирается из кусков base64, формат определяется по
-  сигнатуре, голый PCM оборачивается в WAV.
-- Ошибка поставщика разворачивается до его собственных слов: OpenRouter вкладывает
-  ответ апстрима строкой в свой JSON, и вместо «HTTP 400: {"error":{"message":"HTTP 400:
-  {\"error…» теперь видно `InvalidParameter: The parameter resolution is invalid`.
-- Тесты: `test/video-test.mjs` (26 проверок) и `test/media-test.mjs` (37 проверок —
-  все четыре поставщика на одном мок-сервере).
+- **Images, video and audio straight from the chat.** Media models do not answer
+  `/chat/completions`, so they are connected as tools: the chat model writes the
+  prompt itself and calls `generate_image`, `generate_video` or `generate_audio`, and the file
+  is saved in the project folder. Every generation is paid and asks for confirmation, like
+  a shell command; Esc interrupts the wait.
+- **`/image`, `/audio`, `/video model` — model choice in the same panel as `/model`**:
+  provider tabs, search, "Refresh", and "Turn off" for images and audio. Where
+  `/model` shows the context and the price, here there is a capabilities line — aspect ratios, resolutions,
+  durations, n, price per second. A model can also be named right away: `/image seedream`,
+  `/audio off`, `/image status`. Until an image or audio model is chosen, there is no tool
+  in the chat and requests do not pay for its description.
+- **Providers**: OpenRouter — images (`POST /images`, 55 models, parameters checked
+  against its catalog), video (`/videos`, 30 models) and audio (gpt-audio, Lyria);
+  TokenRouter — images, video (new-api `/video/generations` jobs) and audio by endpoint
+  types from the catalog; xAI by API key — grok-imagine for images (with an edit based on
+  the source) and video; Z.AI — glm-image, cogview and cogvideox-3. The chosen model is stored
+  together with the provider (`tokenrouter:kling-v3`): which API is called depends on it.
+- **`/video` — video mode.** Every message becomes a video order: the prompt
+  model (any text model, `/video prompt_model`) looks at attached images, writes
+  a frame description with a shot list by seconds and calls the video model; the allowed
+  durations, resolutions and aspect ratios of the chosen model go into its system prompt.
+  `/video off` returns the previous session model. The mode lives until the program exits —
+  after a restart it is off, so that generations do not start by themselves.
+- **Audio**: a speech model reads the text verbatim in the chosen voice and with a given delivery,
+  a music model gets a brief. The stream is assembled from base64 pieces, the format is determined by
+  signature, bare PCM is wrapped in WAV.
+- A provider error is unwrapped down to its own words: OpenRouter embeds the
+  upstream answer as a string in its JSON, and instead of "HTTP 400: {"error":{"message":"HTTP 400:
+  {\"error…" you now see `InvalidParameter: The parameter resolution is invalid`.
+- Tests: `test/video-test.mjs` (26 checks) and `test/media-test.mjs` (37 checks —
+  all four providers on one mock server).
 
 ## [0.1.6] — 2026-09-23
 
 ### Fixed
 
-- **OpenCode Zen и Go больше не отвечают 400 «Request is missing x-opencode-session».**
-  Шлюз просит клиента присылать стабильный id разговора в `x-opencode-session` — по нему
-  он держит один разговор на одном бэкенде и попадает в прогретый там кэш префикса — и
-  без заголовка отказывается маршрутизировать запрос. Заголовок объявляется в реестре
-  (`ProviderMode.sessionHeader`) и едет на каждом запросе к обоим режимам, включая
-  пробу ключа при логине. Значение — хеш, а не локальный id сессии: он несёт в себе
-  локальную дату, и вендору её знать незачем. Запросы без явного id (субагент, компакт,
-  генератор заголовка) различаются по собственному префиксу промпта — ровно по тому,
-  что шлюз и кэширует. Тесты в `test/provider-test.mjs` (8 проверок).
-- `User-Agent` стал `trcode/<версия>` вместо безверсионного `trcode-cli`: Go просит
-  клиента называть себя своим именем, а версия в нём — единственный способ для хоста
-  отличить трафик одного релиза от другого.
+- **OpenCode Zen and Go no longer answer 400 "Request is missing x-opencode-session".**
+  The gateway asks the client to send a stable conversation id in `x-opencode-session` — by it
+  it keeps one conversation on one backend and hits the prefix cache warmed there — and
+  without the header it refuses to route the request. The header is declared in the registry
+  (`ProviderMode.sessionHeader`) and travels on every request to both modes, including
+  the key probe at login. The value is a hash, not a local session id: it carries the
+  local date, and the vendor has no need to know it. Requests without an explicit id (a subagent, compaction,
+  the title generator) differ by their own prompt prefix — exactly the thing
+  the gateway caches. Tests in `test/provider-test.mjs` (8 checks).
+- `User-Agent` became `trcode/<version>` instead of a version-less `trcode-cli`: Go asks a
+  client to call itself by its own name, and the version in it is the only way for a host
+  to tell the traffic of one release from another.
 
 ## [0.1.5] — 2026-09-05
 
 ### Added
 
-- **`/goal` — a persistent objective the agent keeps working toward** (по образцу Qoder
-  CLI). `/goal <objective> [--turns <n>]` задаёт цель, и после каждого хода пользователя
-  агент сам берёт следующий: цель повторяется вербатимом в промпте каждого goal-хода,
-  модель объявляет завершение тегом `<goal-complete>`. Цель хранится в session-файле и
-  переживает resume; встроенный лимит 25 ходов ставит её на паузу автоматически (`--turns`
-  заменяет лимит, `/goal resume` выдаёт новый бюджет). Esc на goal-ходе — пауза, а не
-  пропуск раунда; упавший ход тоже ставит паузу вместо вечного ретрая. Модуль
-  `src/session/goal.ts`, команды `status | pause | resume | clear`.
-- `src/session/goal.ts` — состояние цели (`Goal`, turnGate/spendTurn/completeGoal,
-  goalPrompt/goalLine) и тесты `test/goal-test.mjs` (24 проверки) и
-  `test/goal-live-test.mjs` (17 проверок, живой REPL на сценарном SSE-сервере).
+- **`/goal` — a persistent objective the agent keeps working toward** (following Qoder
+  CLI). `/goal <objective> [--turns <n>]` sets a goal, and after every user turn the
+  agent takes the next one itself: the goal is repeated verbatim in the prompt of every goal turn,
+  the model declares completion with the `<goal-complete>` tag. The goal is stored in the session file and
+  survives a resume; the built-in limit of 25 turns pauses it automatically (`--turns`
+  replaces the limit, `/goal resume` grants a new budget). Esc on a goal turn is a pause, not a
+  skipped round; a failed turn also pauses instead of retrying forever. The module is
+  `src/session/goal.ts`, the commands `status | pause | resume | clear`.
+- `src/session/goal.ts` — the goal state (`Goal`, turnGate/spendTurn/completeGoal,
+  goalPrompt/goalLine) and the tests `test/goal-test.mjs` (24 checks) and
+  `test/goal-live-test.mjs` (17 checks, a live REPL against a scenario SSE server).
 
 ### Fixed
 
-- Модель сессии больше не подменяется при старте/фоновом обновлении каталога: если
-  каталог пришёл без листинга нужного провайдера (фетч упал/таймаут), `reconcileModel()`
-  теперь не трогает модель, а фолбэк предпочитает модель того же хоста — раньше сессия
-  уходила на чужой хост и каждый ход умирал с 503 «No available channel».
-  Тест `test/model-switch-test.mjs` (9 проверок).
+- The session model is no longer substituted at start or on a background catalog refresh: if
+  the catalog arrived without a listing of the needed provider (the fetch failed/timed out), `reconcileModel()`
+  now leaves the model alone, and the fallback prefers a model of the same host — previously the session
+  went to a foreign host and every turn died with 503 "No available channel".
+  The `test/model-switch-test.mjs` suite (9 checks).
 
 
 ### Added
@@ -987,3 +989,4 @@ All notable changes to TRCode are documented here. The format follows
 First tagged release: multi-provider routing (TokenRouter, Kimi, Anthropic, OpenRouter,
 OpenCode Zen, OpenCode Go, Alibaba Cloud), OAuth device flow, sessions with compaction
 and checkpoints, skills, subagents, `/brain`, `/orchestrate`, `/swarm`, Orca support.
+

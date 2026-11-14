@@ -1,48 +1,50 @@
-# TRCode v0.2.0 — интерфейс терминала и надёжное обновление
+# TRCode v0.2.0 — terminal interface and reliable updates
 
-## Интерфейс
+## Interface
 
-- Исправлены накопление пустых строк при многострочном вводе и листании истории,
-  отступы вокруг поля ввода, мерцание списков и перерисовка панелей.
-- Между рассуждением и ответом появился разделитель «Ответ» («Response» для
-  английского интерфейса) с одной пустой строкой под ним.
-- Список команд работает во время хода; Enter направляет текущий ход на ближайшей
-  границе шага, Tab ставит сообщение в очередь.
-- `!команда` выполняется в оболочке, а её результат доступен модели в истории.
-- Добавлены заставка TRCode, название сессии в статусе и отключаемые подсказки
-  о возможностях клиента: `/tips on|off|reset`.
+- Fixed the accumulation of blank lines during multi-line input and history
+  scrolling, the spacing around the input field, list flicker and panel
+  repainting.
+- A "Response" divider appeared between the reasoning and the answer ("Response"
+  in the English interface) with one blank line beneath it.
+- The command list works during a turn; Enter steers the current turn at the
+  nearest step boundary, Tab queues the message.
+- `!command` runs in the shell, and its output is available to the model in the
+  history.
+- Added the TRCode splash screen, the session name in the status bar, and tips
+  about client features that can be turned off: `/tips on|off|reset`.
 
-## Обновление
+## Updates
 
-- `/update --check` только проверяет наличие релиза.
-- Проверяются диапазоны версий зависимостей, включая уже установленные пакеты.
-- Зависимости устанавливаются в отдельном каталоге; ошибка npm всегда останавливает
-  обновление до замены рабочей сборки.
-- Сборка и зависимости заменяются переименованиями на одном диске. При ошибке
-  выполняется откат; если файлы заблокированы и восстановление невозможно,
-  резервные копии сохраняются, а сообщение указывает путь к ним.
-- `sharp` загружается при использовании инструментов изображений, чтобы его
-  отсутствие не мешало запустить CLI и восстановить установку.
+- `/update --check` only checks whether a release exists.
+- Dependency version ranges are checked, including already installed packages.
+- Dependencies are installed in a separate directory; an npm error always stops
+  the update before the working build is replaced.
+- The build and dependencies are replaced by renames on a single disk. On error a
+  rollback runs; if files are locked and recovery is impossible, the backups are
+  kept and the message points at their path.
+- `sharp` is loaded when image tools are used, so its absence does not prevent
+  starting the CLI and repairing the installation.
 
-## MCP и сессии
+## MCP and sessions
 
-- MCP-серверы из `.trcode/mcp.json` проекта ожидают `/mcp trust`; изменение
-  конфигурации требует нового одобрения.
-- Исправлены восстановление HTTP-сессий, декодирование UTF-8, экранирование
-  аргументов Windows, ответы на `ping` и `roots/list`, дублирование JSON-результатов.
-- Улучшены окна выбора сессий и восстановление OAuth-токенов при нескольких
-  одновременно запущенных клиентах.
+- MCP servers from the project's `.trcode/mcp.json` wait for `/mcp trust`;
+  changing the configuration requires a new approval.
+- Fixed HTTP session recovery, UTF-8 decoding, Windows argument escaping, `ping`
+  and `roots/list` responses, and duplicated JSON results.
+- Improved the session picker windows and OAuth token recovery with several
+  clients running at once.
 
-## Проверка
+## Verification
 
-Полный набор: 77 тестовых наборов. Дополнительно проверены отступ под разделителем,
-версия сборки и установка из публикуемого архива.
+Full suite: 77 test suites. Additionally checked: the spacing under the divider,
+the build version, and installation from the published archive.
 
-## Установка и обновление
+## Install and update
 
-В существующей установке: `trc update` или `/update`, затем перезапустите CLI.
+In an existing installation: `trc update` or `/update`, then restart the CLI.
 
-Для установки из архива релиза:
+To install from the release archive:
 
 ```sh
 npm install -g https://github.com/ivanvp91/TRCode/releases/download/v0.2.0/trcode-0.2.0.tgz

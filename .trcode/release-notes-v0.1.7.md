@@ -1,32 +1,33 @@
-# TRCode v0.1.7 — картинки, видео и звук
+# TRCode v0.1.7 — images, video and sound
 
 ## Added
 
-- **Картинки, видео и звук прямо из чата.** Медиамодели подключаются как инструменты:
-  чат-модель сама пишет промпт и вызывает `generate_image`, `generate_video` или
-  `generate_audio`, файл сохраняется в папке проекта. Каждая генерация платная и
-  спрашивает подтверждение; Esc прерывает ожидание.
-- **`/image`, `/audio`, `/video model`** — выбор модели в той же панели, что `/model`:
-  вкладки поставщиков, поиск, строка возможностей (пропорции, разрешения, длительности,
-  цена за секунду) вместо контекста и цены. Модель можно назвать сразу: `/image seedream`,
-  `/audio off`. Пока модель не выбрана, инструмента в чате нет.
-- **`/video` — режим видео**: каждое сообщение становится заказом ролика. Модель промптов
-  (любая текстовая) смотрит вложения, пишет описание кадра с раскадровкой по секундам и
-  зовёт видеомодель; допустимые значения этой модели попадают в её промпт. `/video off`
-  возвращает прежнюю модель; после перезапуска режим выключен.
-- **Поставщики:**
+- **Images, video and sound straight from the chat.** Media models are wired in as tools:
+  the chat model writes the prompt itself and calls `generate_image`, `generate_video` or
+  `generate_audio`, and the file is saved in the project folder. Every generation is paid
+  and asks for confirmation; Esc interrupts the wait.
+- **`/image`, `/audio`, `/video model`** — model selection in the same panel as `/model`:
+  provider tabs, search, a capabilities line (aspect ratios, resolutions, durations,
+  price per second) in place of context and price. The model can be named up front:
+  `/image seedream`, `/audio off`. Until a model is chosen, the tool is not in the chat.
+- **`/video` — video mode**: every message becomes an order for a clip. The prompt model
+  (any text model) looks at the attachments, writes a shot description with a
+  second-by-second storyboard and calls the video model; that model's allowed values go
+  into its prompt. `/video off` restores the previous model; after a restart the mode is
+  off.
+- **Providers:**
 
-  | | Картинки | Видео | Звук |
+  | | Images | Video | Audio |
   |---|---|---|---|
-  | OpenRouter | 55 моделей, `/images` | 30 моделей, `/videos` | gpt-audio, Lyria |
+  | OpenRouter | 55 models, `/images` | 30 models, `/videos` | gpt-audio, Lyria |
   | TokenRouter | `image-generation` | `video-generation` | `audio-chat` |
-  | xAI (API-ключ) | grok-imagine, правка по исходнику | grok-imagine-video | — |
+  | xAI (API key) | grok-imagine, edit from a source image | grok-imagine-video | — |
   | Z.AI | glm-image, cogview | cogvideox-3 | — |
 
-- **Звук**: речь читается дословно выбранным голосом и подачей, музыка — по брифу;
-  формат определяется по байтам, голый PCM сохраняется как WAV.
-- Ошибки поставщика показываются его собственными словами — вложенный JSON OpenRouter
-  разворачивается до `InvalidParameter: …`.
+- **Audio**: speech is read verbatim in the chosen voice and delivery, music follows a
+  brief; the format is detected from the bytes, and raw PCM is saved as WAV.
+- Provider errors are shown in the provider's own words — OpenRouter's nested JSON is
+  unwrapped down to `InvalidParameter: …`.
 
 ## Install
 

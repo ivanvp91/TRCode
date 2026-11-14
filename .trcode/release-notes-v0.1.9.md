@@ -1,63 +1,69 @@
-# TRCode v0.1.9 — двенадцать поставщиков, умное автосжатие, надёжный MCP
+# TRCode v0.1.9 — twelve providers, smart auto-compaction, solid MCP
 
-Крупный релиз: три новых поставщика (OpenAI, Google Gemini, Meta Muse), полноценный
-MCP-клиент, компакция с тремя ступенями, автоповторы 503 и пачка исправлений, из-за
-которых терминал «висел» или не видел скриншот.
+A large release: three new providers (OpenAI, Google Gemini, Meta Muse), a full
+MCP client, three-step compaction, automatic 503 retries, and a batch of fixes
+that made the terminal hang or miss a screenshot.
 
 ## Added
 
-- **OpenAI двумя путями** — `/login openai` предлагает «Подписка / Ключ API».
-  Подписка — браузерный OAuth (PKCE) под официальным клиентом ChatGPT: служебные
-  заголовки бэкенда (`originator`, `OpenAI-Beta`, `ChatGPT-Account-Id`, три
-  session-заголовка), аккаунт читается из `id_token`. Бэкенд принимает только
-  `/responses` и только стрим, не берёт `max_output_tokens`
-  и требует `store: false` — это выражено флагами режима, а нестримовые вызовы
-  (компакция, заголовки) собираются из стрима. Ключ — обычный `api.openai.com/v1`.
-  Сессию стороннего CLI намеренно не переиспользуем: тот сервер ротирует refresh-токен.
-- **Google Gemini** — `/login gemini` (или `/login google`). Ключ из AI Studio идёт через
-  официальный OpenAI-совместимый шим. Вход по аккаунту — OAuth-клиент Gemini CLI против
-  Code Assist (`{model, project, request}`, проект сам через `loadCodeAssist`/`onboardUser`,
-  возобновляемая сессия `~/.gemini/oauth_creds.json`) с предупреждением: Google считает
-  такое использование нарушением ToS. Ключ остаётся поддерживаемым путём.
+- **OpenAI, two ways** — `/login openai` offers "Subscription / API key".
+  Subscription is browser OAuth (PKCE) under the official ChatGPT client: the
+  backend's service headers (`originator`, `OpenAI-Beta`, `ChatGPT-Account-Id`,
+  three session headers), the account is read from `id_token`. The backend accepts
+  only `/responses` and only streaming, does not take `max_output_tokens`
+  and requires `store: false` — this is expressed by mode flags, so non-streaming
+  calls (compaction, titles) are assembled from the stream. The key is plain
+  `api.openai.com/v1`. We deliberately do not reuse another CLI's session: that
+  server rotates the refresh token.
+- **Google Gemini** — `/login gemini` (or `/login google`). An AI Studio key goes
+  through the official OpenAI-compatible shim. Account login is the Gemini CLI
+  OAuth client against Code Assist (`{model, project, request}`, the project
+  discovered via `loadCodeAssist`/`onboardUser`, resumable session
+  `~/.gemini/oauth_creds.json`) with a warning: Google treats such use as a ToS
+  violation. The key remains the supported path.
 - **Meta Muse** — `muse-wonder-1.0`, `muse-spark-1.3`, `muse-spark-1.3-contributor`
-  (1M окна, Responses); `/login meta` переиспользует сессию `~/.config/muse/auth.json`.
-- **OpenCode Zen и OpenCode Go через аккаунт** — device flow OpenCode Console, без
-  копирования ключа; `trc auth login --provider opencode-go --oauth` пропускает выбор.
-- **MCP стал полноценным**: Streamable HTTP рядом со stdio, протокол 2026-07-28
-  (`legacy` / `auto` / `2026-07-28`), ресурсы тремя инструментами
+  (1M windows, Responses); `/login meta` reuses the `~/.config/muse/auth.json`
+  session.
+- **OpenCode Zen and OpenCode Go through an account** — OpenCode Console device
+  flow, no key copying; `trc auth login --provider opencode-go --oauth` skips the
+  choice.
+- **MCP is now complete**: Streamable HTTP alongside stdio, protocol 2026-07-28
+  (`legacy` / `auto` / `2026-07-28`), resources through three tools
   (`list_mcp_resources`, `read_mcp_resource`, `list_mcp_resource_templates`),
-  `mcpToolSearch` с `find_mcp_tools` для жирных серверов, `/mcp restart|stop|logs`.
+  `mcpToolSearch` with `find_mcp_tools` for fat servers, `/mcp restart|stop|logs`.
 
 ## Changed
 
-- **Компакция — handoff-summary плюс последние сообщения пользователя** дословно,
-  между tool-раундами внутри одного хода, история меняется на месте.
-- **Автосжатие стало лестницей.** 25% окна — лёгкая чистка без вызова модели (старые
-  результаты инструментов и размышления), 50% — конспект с сохранением рабочего хвоста,
-  90% — полная сводка. Ступени квотируются на цикл: **3 лёгких и 2 средних**, чтобы
-  история, застрявшая чуть выше порога, не чистилась каждый ход и дошла до следующей
-  ступени; полная сводка открывает новый цикл, счётчики лежат в сессии.
-  Выключатель: `/compact auto off`, строка **Контекст** в `/settings` или
-  `autoCompact: false` в config.json.
-- **Временный 503 больше не сдаётся** — до 10 повторов с паузой 10 с
-  (`upstreamRetries`, `upstreamRetryDelayMs`), каждая пауза с номером попытки в
-  транскрипте; Esc прерывает ожидание.
-- **MCP: схемы едут по бюджету** (`toolInputSchemaMaxBytes`), каталог обновляется по
-  `list_changed`, появились `enabledTools` / `disabledTools`, `approval`, `outputLimit`,
-  `startupTimeoutSec` / `toolTimeoutSec`.
+- **Compaction is a handoff summary plus the last user messages** verbatim,
+  between tool rounds inside one turn, the history is changed in place.
+- **Auto-compaction became a ladder.** 25% of the window is light cleanup without
+  a model call (old tool results and reasoning), 50% is a digest that keeps the
+  working tail, 90% is a full summary. The steps are quota'd per cycle: **3 light
+  and 2 medium**, so a history stuck just above the threshold is not cleaned on
+  every turn and still reaches the next step; a full summary opens a new cycle,
+  and the counters live in the session. Switches: `/compact auto off`, the
+  **Context** row in `/settings`, or `autoCompact: false` in config.json.
+- **A transient 503 no longer gives up** — up to 10 retries with a 10 s pause
+  (`upstreamRetries`, `upstreamRetryDelayMs`), each pause with its attempt number
+  in the transcript; Esc interrupts the wait.
+- **MCP: schemas travel by budget** (`toolInputSchemaMaxBytes`), the catalog
+  refreshes on `list_changed`, `enabledTools` / `disabledTools`, `approval`,
+  `outputLimit`, `startupTimeoutSec` / `toolTimeoutSec` appeared.
 
 ## Fixed
 
-- **Пиксели инструмента на gRPC-шлюзе.** Отказ «only text parts are supported on the gRPC
-  path» относится только к tool-сообщениям: картинки инструмента теперь переезжают в
-  user-сообщение с подписью, и модель видит скриншот, ради которого вызвала `read_image`.
-- **Esc прерывает и вне хода** — `escWatch()` для OAuth-входа, поиска проекта Code Assist
-  и обновления каталога; Spinner обещает клавишу только там, где её кто-то слушает.
-- **400 «The `reasoning_content` … must be passed back»** — клиент ловит его один раз на
-  модель и досылает пустое поле вместо падения хода.
-- **MCP: зомби-процессы, потерянные картинки, мёртвый каталог** — дерево процессов через
-  `killTree`, image-блоки доходят до модели, 404 сессии переинициализируется и повторяет
-  вызов, упавший сервер перезапускается с backoff.
+- **Tool pixels on the gRPC gateway.** The "only text parts are supported on the
+  gRPC path" rejection applies only to tool messages: tool images now move into a
+  user message with a caption, and the model sees the screenshot it called
+  `read_image` for.
+- **Esc interrupts outside a turn too** — `escWatch()` for OAuth login, Code Assist
+  project discovery and catalog refresh; the Spinner promises the key only where
+  someone listens for it.
+- **400 "The `reasoning_content` … must be passed back"** — the client catches it
+  once per model and sends the empty field instead of failing the turn.
+- **MCP: zombie processes, lost images, dead catalog** — the process tree via
+  `killTree`, image blocks reach the model, a session 404 is reinitialized and the
+  call retried, a crashed server restarts with backoff.
 
 ## Install
 
